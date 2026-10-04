@@ -42,7 +42,7 @@
  */
 
 import {
-  pushAction, beginActionCapture, endActionCapture, runOnStepChain, keepsRecords,
+  pushAction, beginActionCapture, endActionCapture, runOnStepChain,
   type UndoAction,
 } from './undoManager';
 import { UndoRefusedError } from './undoFailure';
@@ -212,6 +212,17 @@ async function runSequential(subs: UndoAction[], run: (a: UndoAction) => void | 
  *  silently never saved. The per-action skip condition is applied per SUB (a selection or
  *  file-direct sub contributes nothing), mirroring what each would have done unbatched.
  */
+/** `action`, with `after` run once each of its directions has run: every other field kept, so what the stack reads off
+ *  the action (its check, its kind, the scenes it dirties) is the action's own. A panel's Create Prefab re-wrapped its
+ *  action as `{ label, undo, redo }` to refresh its listing, which dropped them (#2001 S8b). */
+export function followedBy(action: UndoAction, after: () => void): UndoAction {
+  return {
+    ...action,
+    undo: async () => { await action.undo(); after(); },
+    redo: async () => { await action.redo(); after(); },
+  };
+}
+
 export function composeUndoActions(
   subActions: UndoAction[],
   opts: CompositeActionOptions,
@@ -236,8 +247,6 @@ export function composeUndoActions(
   };
   if (opts.coalesceKey != null) action.coalesceKey = opts.coalesceKey;
   if (subs.every((a) => a._isSelection)) action._isSelection = true;
-  // Each sub puts back its own records, in order (#2001 S8): the batch does when every sub does.
-  if (subs.every(keepsRecords)) action.maintainsRecords = true;
   if (subs.every((a) => a._isFileDirect)) action._isFileDirect = true;
   // One sub that rebuilt the live world makes the batch one that did (#1857).
   if (action._isFileDirect && subs.some((a) => a._rebasesLiveFrames)) action._rebasesLiveFrames = true;

@@ -11,7 +11,7 @@ import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
 import { makeSortOrderRenumberAction } from '../undo/overrideMarkWrites';
-import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, moveEntityToScene, planReparent, sceneReparentTargets, applyReparent, planSceneDrop, sceneDropTarget, SCENE_MOVE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT, pasteEntityCopy, clipEntity, cutSourceId, reportWriteRefusal, siblingDropRefusal, siblingsKeepingTheirPlace, stuckDropText, type EntityClipboard } from '../undo/entityActions';
+import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, moveEntityToScene, planReparent, sceneReparentTargets, applyReparent, planSceneDrop, sceneDropTarget, SCENE_MOVE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT, MOVED_MEMBER_REFUSAL_TEXT, pasteEntityCopy, clipEntity, cutSourceId, reportWriteRefusal, siblingDropRefusal, siblingsKeepingTheirPlace, stuckDropText, type EntityClipboard } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
 import { placePrefabFromPath } from '../scene/prefabPlace';
@@ -1049,6 +1049,8 @@ export default function Hierarchy() {
       if (plan.reason === 'instance-member' || plan.reason === 'restructure') useEditorStore.getState().showToast(SCENE_MOVE_REFUSAL_TEXT[plan.reason], 'warn');
       // A zero-scale parent says why too (#1848): the drop is refused, not a silent no-op.
       else if (plan.reason === 'collapsed-parent') useEditorStore.getState().showToast(COLLAPSED_PARENT_REFUSAL_TEXT, 'warn');
+      // …and a move that would unpack around a member an older version moved out of its instance (#2001 S8b).
+      else if (plan.reason === 'moved-member') useEditorStore.getState().showToast(`Not moved: ${MOVED_MEMBER_REFUSAL_TEXT}`, 'warn');
       // A prefab-edit refusal says why too (#1836): moving the root, or an entity out of it, is not a silent no-op.
       else toastIfPrefabEditReason(plan.reason);
       return false;
@@ -1108,7 +1110,7 @@ export default function Hierarchy() {
       void requestReparent(sourceId, parentId).then((moved) => { if (moved) setEntityClipboard(null); });
       return;
     }
-    withPrefabEditRefusalToast(() => pasteEntityCopy(entityClipboard.snapshot, parentId, selectEntity, entityClipboard.records));
+    withPrefabEditRefusalToast(() => pasteEntityCopy(entityClipboard, parentId, selectEntity));
   }, [entityClipboard, selectEntity, requestReparent]);
 
   // ── Focus (frame in SceneView orbit camera — see SceneView F-key) ──

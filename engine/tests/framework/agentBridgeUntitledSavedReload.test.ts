@@ -18,10 +18,13 @@
  *  the world after `serializeScene` instead of before — only the SERIALIZES case goes red (close-out review: the reload adopted under
  *  the file's key while the stacks were still under the untitled '', and Cmd+Z came back empty). */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { sceneManager, setRunMode, registerAsset, unregisterAsset, getTraitByName, getCurrentWorld, normScenePath } from '@modoki/engine/runtime';
+import { sceneManager, setRunMode, registerAsset, unregisterAsset, getCurrentWorld, normScenePath } from '@modoki/engine/runtime';
 import { newScene, saveScene, getCurrentScenePath, setCurrentScenePath, adoptWorldReloadedFromDisk, pushAction, canUndo, undoLabel, hasUnsavedChanges } from '@modoki/engine/editor';
 import { _resetHistoryContexts, activeHistoryKey } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { whyWorldNotAuthored } from '../../packages/modoki/src/editor/scene/authoredWorld';
 
 const written: string[] = [];
 /** Runs INSIDE the next file write's await — where a Create Scene can land. */
@@ -78,11 +81,15 @@ async function settle(): Promise<void> {
   for (let i = 0; i < 10; i++) await Promise.resolve();
   await new Promise((r) => setTimeout(r, 0));
 }
-/** Two live instances of the prefab, as the win clone's scene held after `modoki_prefab instantiate`. */
-function instantiate(): void {
-  const { trait } = getTraitByName('PrefabInstance')!;
-  getCurrentWorld().spawn(trait({ source: PREFAB_GUID }));
-  getCurrentWorld().spawn(trait({ source: PREFAB_GUID }));
+/** Two live instances of the prefab, as the win clone's scene held after `modoki_prefab instantiate`: through the
+ *  editor's instantiate, which records what it makes (a bare `PrefabInstance` spawn holds no record, and the save refuses
+ *  a tree with none). */
+const PREFAB_DOC = { id: PREFAB_GUID, version: 5, name: 'Box', rootLocalId: 1, entities: [
+  { localId: 1, nodeGuid: 'c0ffee00-0000-4000-8000-00000000d713', traits: { EntityAttributes: { name: 'Box', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+] };
+async function instantiate(): Promise<void> {
+  setPrefabCache(PREFAB_GUID, PREFAB_DOC as never);
+  for (let i = 0; i < 2; i++) expect(await instantiatePrefabInstance(PREFAB_DOC as never, PREFAB_PATH)).toBeTruthy();
 }
 
 beforeEach(async () => {
@@ -127,7 +134,7 @@ describe('#1712: a newScene() world saved to a file is bound to that file', () =
   });
 
   it('an outside change to a prefab it uses reloads the scene from its file', async () => {
-    instantiate();
+    await instantiate();
     await saveScene({ path: SCENE_PATH, allowDialog: false });
     emit(PREFAB_PATH, 'prefab');
     await settle();
@@ -149,7 +156,7 @@ describe('#1712: a newScene() world saved to a file is bound to that file', () =
   });
 
   it('the reload keeps the undo stack of a clean scene — as it does for a loaded one', async () => {
-    instantiate();
+    await instantiate();
     pushAction({ label: 'Move Box', undo: () => {}, redo: () => {} });
     await saveScene({ path: SCENE_PATH, allowDialog: false });
     expect(activeHistoryKey(), 'the untitled world\'s stacks moved to its file').toBe(normScenePath(SCENE_PATH));
@@ -163,7 +170,7 @@ describe('#1712: a newScene() world saved to a file is bound to that file', () =
   // A PREFAB reload proves the stacks moved: it adopts under the file's key and keeps a clean stack. A scene-file reload
   // would drop the stack whichever key it sat under (#1744), so it cannot tell a moved stack from a stranded one.
   it("a human's first Cmd+S (the Save-As panel) moves the stacks to the file too", async () => {
-    instantiate();
+    await instantiate();
     pushAction({ label: 'Move Box', undo: () => {}, redo: () => {} });
     const r = await saveScene();
     expect(r).toMatchObject({ saved: true, path: SCENE_PATH });
@@ -175,7 +182,7 @@ describe('#1712: a newScene() world saved to a file is bound to that file', () =
   });
 
   it('a reload that discards unsaved edits still keeps the asset-file edits (#1409), under the file', async () => {
-    instantiate();
+    await instantiate();
     await saveScene({ path: SCENE_PATH, allowDialog: false });
     pushAction({ label: 'Edit material', undo: () => {}, redo: () => {}, _isFileDirect: true });
     pushAction({ label: 'Move Box', undo: () => {}, redo: () => {} }); // unsaved: the reload discards it
@@ -196,11 +203,23 @@ describe('#1712: a newScene() world saved to a file is bound to that file', () =
     expect(hasUnsavedChanges(), 'the new starter world ends clean').toBe(false); // (a markSceneSaved before the guard is a no-op here: same edit version)
   });
 
-  it('…and one landing while the save SERIALIZES (a prefab instance\'s source is awaited there)', async () => {
-    instantiate();
+  // The world the bytes would come from is destroyed by the New Scene, and the serialize read every entity after its await
+  // from the NEW one: one world's entity list written with another's data (#2001 S8b: the save's instance entries then
+  // named the new world's entities, refused, and marked the NEW world unsavable). It stops instead, writing nothing.
+  // Mutation: drop `sameWorld()` after the preload in `serializeSceneScoped`.
+  it('…and one landing while the save SERIALIZES (a prefab instance\'s source is awaited there): nothing is written', async () => {
+    await instantiate();
     serializeHook.during = () => newScene();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const r = await saveScene({ path: SCENE_PATH, allowDialog: false });
-    expect(r).toMatchObject({ saved: true, path: SCENE_PATH });
+    warn.mockRestore();
+    expect(r).toMatchObject({ saved: false, reason: 'superseded' });
+    expect(written).toEqual([]);
+    expect(whyWorldNotAuthored(), 'the new world is not marked by the old one\'s save').toBeNull();
+    expect((await saveScene({ path: SCENE_PATH, allowDialog: false })).saved, 'and saves').toBe(true);
+    written.length = 0;
+    setCurrentScenePath(null);
+    await newScene();
     expect(getCurrentScenePath()).toBeNull();
     expect(activeHistoryKey()).toBe('');
     expect(hasUnsavedChanges()).toBe(false);
@@ -216,7 +235,7 @@ describe('#1712: a newScene() world saved to a file is bound to that file', () =
   });
 
   it('OTHER SIDE: an untitled scene that was never saved has no file to reload from', async () => {
-    instantiate();
+    await instantiate();
     emit(PREFAB_PATH, 'prefab');
     await settle();
     expect(loadScene).not.toHaveBeenCalled();

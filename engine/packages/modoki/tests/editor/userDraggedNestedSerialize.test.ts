@@ -39,7 +39,8 @@ function readTraitDataImpl(id: number, meta: any) {
   return out;
 }
 
-vi.mock('../../src/runtime/core/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); index.set(e.id(), e); return e; },
@@ -59,7 +60,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   },
   rebuildGuidIndexSync: () => {},
 }));
-vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
   getAllEntities: () => getAllEntitiesImpl(),
   findEntity: (id: number) => index.get(id),
   markStructureDirty: vi.fn(),
@@ -79,7 +81,11 @@ vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
     for (const k of keys) out[k] = data[k];
     return out;
   },
-  writeTraitField: vi.fn(),
+  // A field write lands on the fake entity: a guid the drop mints (`ensureGuid`) is read back by its record.
+  writeTraitField: (id: number, meta: any, field: string, value: unknown) => {
+    const e: any = index.get(id);
+    if (e?.has(meta.trait)) e.set(meta.trait, { ...e.get(meta.trait), [field]: value });
+  },
 }));
 vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (n: string) => TRAITS.find((t) => t.name === n),
@@ -88,7 +94,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
 vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(), getCachedPrefab: vi.fn(() => null) }));
 let guidN = 0;
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
-  newGuid: () => `guid-${++guidN}`,
+  newGuid: () => `aaaaaaaa-0000-4000-8000-${String(++guidN).padStart(12, '0')}`, // a durable guid's form: a root keyed by one holds a record
   registerAsset: vi.fn(),
   getGuidForPath: () => undefined,
   getAssetType: () => 'prefab',
@@ -104,8 +110,6 @@ vi.mock('../../src/editor/undo/undoManager', () => ({ clearHistory: vi.fn() }));
 
 beforeEach(async () => {
   testWorld = createWorld(); index.clear(); guidN = 0;
-  const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
-  clearAllOverrideMarks();
 });
 
 const P = 'ffffffff-0000-4000-8000-00000000000p';
@@ -140,12 +144,14 @@ describe('user-dragged nested instance (no parentLocalId) round-trips under its 
     setPrefabCache(Q, qPrefab as any);
 
     const pRoot = instantiatePrefab(pPrefab as any); setPrefabSource(pRoot, { id: P });
+    await placed(pRoot);
     const p2 = findByName('P2');
 
     // User drags Q under P2 (a member of P). instantiatePrefab does NOT stamp
     // parentLocalId, so Q's root has parentLocalId === 0 (user-added).
     const qRoot = instantiatePrefab(qPrefab as any); setPrefabSource(qRoot, { id: Q });
     reparent(qRoot, p2);
+    await placed(qRoot); // the drop's door: P2's row links it
     expect((index.get(qRoot).get(PrefabInstance) as any).parentLocalId).toBe(0);
 
     const scene = await serializeScene();
@@ -168,7 +174,10 @@ describe('user-dragged nested instance (no parentLocalId) round-trips under its 
     setPrefabCache(Q, qPrefab as any);
 
     const pRoot = instantiatePrefab(pPrefab as any); setPrefabSource(pRoot, { id: P });
-    reparent(instantiatePrefabSetSource(instantiatePrefab, setPrefabSource, qPrefab, Q), findByName('P2'));
+    await placed(pRoot);
+    const qRoot = instantiatePrefabSetSource(instantiatePrefab, setPrefabSource, qPrefab, Q);
+    reparent(qRoot, findByName('P2'));
+    await placed(qRoot);
 
     const scene = await serializeScene();
     const pEntry = scene.entities.find((e) => e.prefab === P)!;
@@ -200,9 +209,17 @@ describe('user-dragged nested instance (no parentLocalId) round-trips under its 
     const root = await instantiatePrefabAsync(pPrefab as any);
     const rootGuid = (index.get(root).get(EntityAttributes) as any).guid;
     expect(rootGuid).toBeTruthy();
-    expect(rootGuid).toMatch(/^guid-/); // from the mocked newGuid()
+    expect(rootGuid).toMatch(/^aaaaaaaa-0000-4000-8000-/); // from the mocked newGuid()
   });
 });
+
+/** As the editor's drop makes an instance (#2001 S8b): a durable root guid, and its record (`place`), linked on the row of
+ *  the member it lands under. A bare spawn holds no record, and the save refuses a tree with none. */
+async function placed(root: number): Promise<void> {
+  const { ensureGuid } = await import('../../src/editor/undo/entityRef');
+  const { place } = await import('../../src/editor/instance/instanceEdits');
+  ensureGuid(root); place(root);
+}
 
 /** tiny helper: instantiate Q and stamp its source, returning the root id. */
 function instantiatePrefabSetSource(inst: any, setSrc: any, prefab: any, src: string): number {

@@ -40,18 +40,16 @@ function under(k: number, name: string): number {
   expect(hits).toHaveLength(1);
   return hits[0].id;
 }
-/** Every stored instance outside Plain's tree: its stale mark and its exact list. */
-function othersState(plainGuids: ReadonlySet<string>): Record<string, { stale: string | null; record: string }> {
+/** Every stored instance outside Plain's tree: its exact list. */
+function othersState(plainGuids: ReadonlySet<string>): Record<string, { record: string }> {
   const json = (v: unknown) => JSON.stringify(v, (_k, x: unknown) => x instanceof Map ? [...x.entries()] : x instanceof Set ? [...x] : x);
-  const out: Record<string, { stale: string | null; record: string }> = {};
-  for (const [g, s] of storedInstances(getCurrentWorld())) if (!plainGuids.has(g)) out[g] = { stale: s.stale ?? null, record: json(s.record) };
+  const out: Record<string, { record: string }> = {};
+  for (const [g, s] of storedInstances(getCurrentWorld())) if (!plainGuids.has(g)) out[g] = { record: json(s.record) };
   return out;
 }
 
-describe('Create Prefab marks only its own tree\'s records stale (#2046 S7.5)', () => {
-  // Mutations: the tag's export back to `staleAround('createPrefab', …)` — every other record is stale after the create;
-  // the create's commit without `maintainsRecords` — the same, from the commit's own mark.
-  it('every other instance keeps its exact, fresh list through the create, its undo and its redo', async () => {
+describe('Create Prefab changes only its own tree\'s records (#2046 S7.5)', () => {
+  it('every other instance keeps its exact list through the create, its undo and its redo', async () => {
     const f = await startRun(be, async () => {}, 'scoped-stale');
     expect(writeTraitFieldWithUndo(under(2, 'A'), getTraitByName('Transform')!, 'x', 5)).toBeNull();
     await settle();
@@ -59,7 +57,6 @@ describe('Create Prefab marks only its own tree\'s records stale (#2046 S7.5)', 
     const before = othersState(plainGuids);
     // Premise: the other trees are stored, fresh, and P1's list states the override.
     expect(Object.keys(before).length).toBeGreaterThanOrEqual(3);
-    for (const [g, s] of Object.entries(before)) expect(s.stale, g).toBeNull();
     expect(Object.values(before).some((s) => /"x":5\b/.test(s.record))).toBe(true);
 
     const r = await createPrefabFromEntity(byName('Plain').id, `${f.root}/prefabs/NewPlain.prefab.json`, 'Save prefab "Plain"', async () => false);

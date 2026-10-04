@@ -49,6 +49,7 @@ function readTraitDataImpl(id: number, meta: any) {
 }
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),
@@ -91,6 +92,7 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab
  *  return the prefab directly — the warmer's whole job is to perform this fetch, so a
  *  mock that skipped it would make the tests pass with the warmer deleted. */
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
+  onFontInvalidated: () => () => {},
   newGuid: () => 'g-minted',
   registerAsset: vi.fn(),
   getGuidForPath: () => undefined,

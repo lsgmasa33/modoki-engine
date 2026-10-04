@@ -31,7 +31,8 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
     return { failed: [] };
   },
 }));
-import { getTraitByName } from '@modoki/engine/runtime';
+import { getTraitByName, getCurrentWorld } from '@modoki/engine/runtime';
+import { storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { makeFuzzBackend } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, startRun, settle, authored, type Fixture } from './prefabFuzz/harness';
 import { checkWorld } from './prefabFuzz/checks';
@@ -189,10 +190,32 @@ describe('Detach strips the template keys of the nodes it unpacks (#1874)', () =
     expect(keyOf(extra), 'the redo stripped it again').toBe('');
   });
 
+  // #2001 S8b: the undo seats the records the Detach took, so every node whose template key it puts back must still be
+  // there, asked with the links before anything changes. Put back on nothing, the tree was unlike the records it seated
+  // (the old path marked them stale for the re-seed). Mutation: drop the key loop from `requireDetachedLinks` — the undo
+  // is not refused (the reattach then misses the key and throws, and the step rolls back instead).
+  it("Detach's undo is refused, changing nothing, when a node whose key it puts back is gone", async () => {
+    await startRun(be, async () => {}, 'detach-keys-gone');
+    const o1 = fixture('OR', 1);
+    const extra = extraOf(o1.id);
+    detachPrefabInstanceWithUndo(o1.id, 'Detach prefab', '[test]');
+    await settle();
+    // Another identity, given where no step records it: the key's ref (by guid) names nothing now.
+    const ea = getTraitByName('EntityAttributes')!;
+    const e = findEntity(extra.id)!;
+    e.set(ea.trait, { ...(e.get(ea.trait) as object), guid: 'eeeeeeee-0000-4000-8000-000000002001' });
+    const store = () => JSON.stringify([...storedInstances(getCurrentWorld())], (_k, v: unknown) => (v instanceof Map ? [...v] : v));
+    const before = store();
+    const step = await undoStep('undo');
+    expect(step.failed?.refused, 'the undo refused').toBe(true);
+    expect(readTraitData(o1.id, getTraitByName('PrefabInstance')!), 'OR is still detached').toBeFalsy();
+    expect(store()).toBe(before);
+  });
+
   // #1914 R3a: a template's plain node records its own edits, and the save writes only what it records. Detach's undo must
   // give the record back with the key: after a reload in between, the plain node it became holds none, so the node came
-  // back the template's with z 2 unrecorded and the next save dropped it (hunt seed 1032). Mutation: drop the
-  // `restoreMarks` in `reattachPrefabInstance`'s key loop — the reload shows the template's z 0.
+  // back the template's with z 2 unrecorded and the next save dropped it (hunt seed 1032). Mutation: drop `seat()` from
+  // `reattachDetachedInstanceSeating` (the records the Detach dropped) — red.
   it("Detach's undo across a reload gives the node its record back with its key", async () => {
     const f = await startRun(be, async () => {}, 'detach-keys-record');
     const o1 = fixture('OR', 1);
@@ -217,7 +240,7 @@ describe('Detach strips the template keys of the nodes it unpacks (#1874)', () =
       const f = await startRun(be, async () => {}, `detach-keys-recover-${where}`);
       const root = where === 'scene'
         ? fixture('OR', 1).id
-        : pasteEntityCopy(clipEntity(fixture('OR', 1).id, 'copy')!.snapshot, kid('A', fixture('R', 2).id).id, () => {});
+        : pasteEntityCopy(clipEntity(fixture('OR', 1).id, 'copy')!, kid('A', fixture('R', 2).id).id, () => {})!;
       await settle();
       const extra = extraOf(root).guid!;
       expect(keyOf(extra), `${where}: precondition, keyed`).toBe('k-extra');
@@ -241,7 +264,7 @@ describe('Detach strips the template keys of the nodes it unpacks (#1874)', () =
       await authorZUnderReference(f);
       const root = where === 'scene'
         ? fixture('OR', 1).id
-        : pasteEntityCopy(clipEntity(fixture('OR', 1).id, 'copy')!.snapshot, kid('A', fixture('R', 2).id).id, () => {});
+        : pasteEntityCopy(clipEntity(fixture('OR', 1).id, 'copy')!, kid('A', fixture('R', 2).id).id, () => {})!;
       await settle();
       const z = zOf(root).guid!;
       expect(keyOf(z), `${where}: precondition, keyed`).not.toBe('');

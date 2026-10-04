@@ -55,7 +55,7 @@ import { placePrefabFromPath } from '../../packages/modoki/src/editor/scene/pref
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { createEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { findEntity, readTraitData } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
-import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
 
 const be = makeFuzzBackend();
@@ -72,7 +72,7 @@ const kid = (name: string, parentId: number) => authored().find((e) => e.name ==
 /** The deep M of the O instance rooted at `orId`: OR → R (the N row) → QR (P's C row) → M, which O's member row sets. */
 const deepM = (orId: number) => kid('M', kid('QR', kid('R', orId).id).id);
 const transformY = (id: number) => (readTraitData(id, getTraitByName('Transform')!) as { y: number }).y;
-const marks = (id: number) => [...(getOverrideMarkSet(findEntity(id) as never) ?? [])].sort();
+const marks = (id: number) => [...(overrideKeysOf(findEntity(id) as never) ?? [])].sort();
 /** The guids from the entity holding `guid` up to its scene root: where it sits, by identity. */
 const ancestry = (guid: string): string[] => {
   const out: string[] = [];
@@ -92,11 +92,11 @@ async function moveLeafUnderP1(): Promise<void> {
  *  Returns the M's guid, which every rebuild keeps. */
 async function pasteCopy(hostId: number, opts: { edit?: boolean; second?: boolean }): Promise<string> {
   const clip = clipEntity(o1().id, 'copy')!;
-  const first = pasteEntityCopy(clip.snapshot, hostId, () => {});
+  const first = pasteEntityCopy(clip, hostId, () => {})!;
   await settle();
   const m = deepM(first);
   if (opts.edit) { expect(writeTraitFieldWithUndo(m.id, getTraitByName('Transform')!, 'y', 3)).toBeFalsy(); await settle(); }
-  if (opts.second) { pasteEntityCopy(clip.snapshot, m.id, () => {}); await settle(); }
+  if (opts.second) { pasteEntityCopy(clip, m.id, () => {}); await settle(); }
   placedAt.set(m.guid!, ancestry(m.guid!));
   return m.guid!;
 }
@@ -210,7 +210,7 @@ describe('a rebuild respawns a pasted reference node as the save writes it (#182
 
   it("Apply promotes a pasted reference node into O with its members' edits (the close-out review's F1)", async () => {
     const f = await startRun(be, async () => {}, 'pasted-ref-promote');
-    const copy = pasteEntityCopy(clipEntity(p1().id, 'copy')!.snapshot, o1().id, () => {});
+    const copy = pasteEntityCopy(clipEntity(p1().id, 'copy')!, o1().id, () => {})!;
     await settle();
     const copyGuid = authored().find((e) => e.id === copy)!.guid!;
     expect(writeTraitFieldWithUndo(kid('A', copy).id, getTraitByName('Transform')!, 'x', 9)).toBeFalsy();

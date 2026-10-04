@@ -5,7 +5,7 @@
  *  file that holds the instance and reads no other scene's (`MergedAsMissingWithSceneBackup`).
  *
  *  Owner ruling B (#2001 S5, #2028): no copy expands anything — the instance shows the Missing Prefab placeholder either
- *  way. Until S6 stops writing them, the save still writes the scene's own copy back, so the per-scene store stays. */
+ *  way, and no save writes a copy (#2001 S6). */
 import { describe, it, expect, vi } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -16,7 +16,6 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
 }));
 
 import { getCurrentWorld, setCurrentWorld, getAllEntities, loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData } from '@modoki/engine/runtime';
-import { embeddedPrefabDoc } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
@@ -38,7 +37,7 @@ const instanceOfP = (guid: string) => ({ id: 1, prefab: P, guid, traits: { Entit
 /** Load `data` into the current world, beside what it holds, as one scene of a chain. */
 async function loadInto(data: object): Promise<void> {
   await loadSceneFile(JSON.parse(JSON.stringify(data)) as SceneData, {
-    loadModels: false, clearMarks: false,
+    loadModels: false,
     fetchPrefab: async () => null,
     onDeletePlaceholder: (id: number) => { const w = getCurrentWorld(); for (const e of w.entities) if (e.id() === id) { destroyEntity(e, w); break; } },
     onInstantiatePrefab: async (source, parentId, rootTf, _o, _x, overrides, structure, nested, _g, _f, nestedStructure, load) => {
@@ -52,15 +51,11 @@ async function loadInto(data: object): Promise<void> {
 const names = () => getAllEntities().map((e) => e.name).sort();
 
 describe('a load reads its own scene\'s copies (#1934 close-out F1)', () => {
-  it('the level\'s instance is a placeholder (ruling B), and the level keeps its own copy for its save, not its base\'s', async () => {
-    // Mutation: key the copy store by one scene for every load (`noteEmbeddedPrefabs`' `scene`) — the level reads
-    // back the base's version, R_base.
+  it('the level\'s instance is a placeholder (ruling B), though both files carry a copy', async () => {
     setCurrentWorld(createWorld());
     await loadInto({ id: BASE, version: SCENE_FORMAT_VERSION, resources: [], entities: [], embeddedPrefabs: { [P]: pDoc('base') } });
     await loadInto({ id: LEVEL, version: SCENE_FORMAT_VERSION, resources: [], embeddedPrefabs: { [P]: pDoc('level') }, entities: [instanceOfP('dddddddd-0000-4000-8000-000000000001')] });
     expect(names()).toEqual(['P1']);
-    const rootName = (scene: string) => (embeddedPrefabDoc(getCurrentWorld(), scene, P) as { entities?: { name?: string }[] } | undefined)?.entities?.[0]?.name;
-    expect([rootName(LEVEL), rootName(BASE)]).toEqual(['R_level', 'R_base']);
   });
 
   it('a level with no copy of its own does not expand from its base\'s: its instance stays a placeholder', async () => {

@@ -66,7 +66,7 @@ export interface SerializeContext {
    *  a reference node with its own record (review "held up": at any depth). Its inline form is the caller's adapter
    *  (S6): `prefab` plus that record's list, NOT a whole `serializeInstanceRecord` entry, whose placement `parentId`
    *  would restate the anchor this row already names. */
-  sceneOwned: (guid: string) => SceneOwnedNode | undefined;
+  sceneOwned: (guid: string, anchorKey: RowKey) => SceneOwnedNode | undefined;
 }
 
 /** A value the writer did not write, because the written form states something else at its place. */
@@ -216,7 +216,7 @@ function ownNodes(
   const out: AddedEntity[] = [];
   const written = new Set<string>();
   for (const { guid } of r?.own ?? []) {
-    const node = ctx.sceneOwned(guid) ?? held.find((n) => n.guid === guid);
+    const node = ctx.sceneOwned(guid, key) ?? held.find((n) => n.guid === guid);
     if (!node) {
       report.danglingOwn.push({ key, guid });
       continue;
@@ -291,6 +291,14 @@ function cloneTraits(traits: RecordTraits): RecordTraits {
 /** An owner's held values back into what the writer states for it: `pendingLegacy` first, then `unparsed`. Each goes
  *  where the written form states nothing (today's `restoreMalformed` rule, owner ruling F-CB1(a)); where it does state
  *  something, a later record superseded the value, and the caller reports it. */
+/** `node` with `held` put back on it as {@link serializeInstanceRecord} puts an entry's back: where it states nothing
+ *  there; a held value it states something else in place of goes to `superseded`. */
+export function withHeldBack<T extends object>(node: T, held: TemplateHeldData, superseded: SupersededValue[]): T {
+  const out = structuredClone(node) as Record<string, unknown>;
+  putHeld(out, held, [], superseded);
+  return out as T;
+}
+
 function putHeld(target: Record<string, unknown>, held: TemplateHeldData, at: string[], superseded: SupersededValue[]): void {
   if (held.pendingLegacy) putBack(target, held.pendingLegacy, at, superseded);
   if (held.unparsed) putBack(target, held.unparsed, at, superseded);
@@ -323,4 +331,21 @@ function sortedByKey(o: Record<string, unknown>): Record<string, unknown> {
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** Reference node `node` (inline: `prefab` plus its guid) with its list stated by `entry` — its own record, written —
+ *  in place of whatever list it stated before (an old form's row channels, or rows), and its sibling order on its `"/"`
+ *  row: a node has no entry `traits.EntityAttributes` the parser reads its order from (that is the entry's v20 home), so
+ *  it goes where the parser reads a node's order first. Its parent is the anchor that links it; its name is the template
+ *  root's (a node's own name is not one, #2028). The one conversion of a scene-owned reference node into the written
+ *  form: a live node's (`writtenEntryOf`) and a held one's (`holdUnspawnedOwn`). */
+export function withWrittenList(node: SceneOwnedNode, entry: InstanceEntryJson, sortOrder: number): SceneOwnedNode {
+  const { overrides: _o, added: _a, removed: _r, removedTraits: _rt, moved: _m, templateMoved: _tm, nestedOverrides: _no, nestedStructure: _ns, members: _mb, ...kept } = node as unknown as Record<string, unknown>;
+  const rows = Object.fromEntries(Object.entries(entry).filter(([k]) => !['name', 'traits', 'prefab', 'guid'].includes(k)));
+  const members = { ...(rows.members as Record<string, Record<string, unknown>> | undefined) };
+  const rootRow = { ...members[ROOT_ROW_KEY] };
+  const rootTraits = { ...(rootRow.traits as Record<string, unknown> | undefined) };
+  rootTraits.EntityAttributes = { ...(rootTraits.EntityAttributes as Record<string, unknown> | undefined), sortOrder };
+  members[ROOT_ROW_KEY] = { ...rootRow, traits: rootTraits };
+  return { ...kept, ...rows, members } as unknown as SceneOwnedNode;
 }

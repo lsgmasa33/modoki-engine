@@ -655,52 +655,34 @@ describe('duplicateEntity', () => {
   const piOf = (id: number) => entityIndex.get(id)?.get(PrefabInstance) as
     { source: string; localId: number; rootInstanceId: number } | undefined;
 
-  it('duplicating an instance ROOT re-roots the copy into its OWN linked instance', async () => {
+  // #2001 S8b: a copy carries its instances' records or is refused (part 22). These instances are spawned raw, with no
+  // record and no prefab document to state one from, so every copy of them is refused before anything spawns; the copy
+  // on records (re-rooted, members promoted, marks and nested roots carried) is covered on loaded scenes in
+  // engine/tests/editor (duplicateCarriesRefs, copyLinksByIdentity, promotedCopyRecords).
+  const expectCopyRefused = (duplicate: (id: number, sel: () => void) => number | null, id: number) => {
+    const before = [...testWorld.query(EntityAttributes)].length;
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(duplicate(id, vi.fn())).toBeNull();
+      expect(err.mock.calls.some(([m]) => String(m).includes('was not copied'))).toBe(true);
+    } finally { err.mockRestore(); }
+    expect([...testWorld.query(EntityAttributes)].length).toBe(before);
+    expect(pushedActions).toHaveLength(0);
+  };
+
+  it('refuses a copy of an instance ROOT it holds no records for, and spawns nothing (#2001 S8b)', async () => {
     const { duplicateEntity } = await getModule();
     const { a, b } = spawnInstance();
-
-    const newRootId = duplicateEntity(a.id(), vi.fn())!;
-    // Collect the copy's two members (skip the source A/B by guid).
-    const copyIds: number[] = [];
-    testWorld.query(EntityAttributes).updateEach(([ea], e) => {
-      if (ea.guid === 'src-A' || ea.guid === 'src-B') return;
-      copyIds.push(e.id());
-    });
-    expect(copyIds).toHaveLength(2);
-
-    // Copy is still a linked instance of the same prefab, but rooted at ITSELF.
-    for (const id of copyIds) {
-      const pi = piOf(id)!;
-      expect(pi.source).toBe('prefabs/p.prefab.json');     // same prefab
-      expect(pi.rootInstanceId).toBe(newRootId);            // re-rooted to the copy
-    }
-    // localIds preserved (a second instance shares the prefab-local ids).
-    expect(new Set(copyIds.map(id => piOf(id)!.localId))).toEqual(new Set([1, 2]));
-    // Source instance untouched — disjoint rootInstanceId group keyed on its own A.
+    expectCopyRefused(duplicateEntity, a.id());
+    // Source instance untouched.
     expect(piOf(a.id())!.rootInstanceId).toBe(a.id());
     expect(piOf(b.id())!.rootInstanceId).toBe(a.id());
-    expect(newRootId).not.toBe(a.id());
-
-    // Redo must re-root again (fresh ids) — no stale rootInstanceId from the source.
-    pushedActions[0].undo();
-    pushedActions[0].redo();
-    let redoRoot = -1;
-    testWorld.query(EntityAttributes).updateEach(([ea], e) => { if (ea.name === 'A' && e.id() !== a.id()) redoRoot = e.id(); });
-    expect(piOf(redoRoot)!.rootInstanceId).toBe(redoRoot);
   });
 
-  it('duplicating a child MEMBER strips PrefabInstance → an added plain child', async () => {
+  it('refuses a copy of a child MEMBER of an instance it holds no records for (#2001 S8b)', async () => {
     const { duplicateEntity } = await getModule();
     const { a, b } = spawnInstance();
-
-    const newId = duplicateEntity(b.id(), vi.fn())!;
-    // The copy carries NO PrefabInstance (it's an added child, like a hand-added entity).
-    expect(entityIndex.get(newId)?.has(PrefabInstance)).toBe(false);
-    // It's parented under B's parent (A, a member) so captureInstanceStructure sees it as added.
-    let copyParent = -1;
-    testWorld.query(EntityAttributes).updateEach(([ea], e) => { if (e.id() === newId) copyParent = ea.parentId; });
-    expect(copyParent).toBe(a.id());
-    // Source member B untouched.
+    expectCopyRefused(duplicateEntity, b.id());
     expect(piOf(b.id())!.rootInstanceId).toBe(a.id());
     expect(piOf(b.id())!.localId).toBe(2);
   });
@@ -1499,99 +1481,6 @@ describe('filterToTraitSchema', () => {
   });
 });
 
-// #868 — prefab override marks and koota's recycled entity index. A mark says "this field is a
-// deliberate per-instance override" and was keyed by the bare `entity.id()`, cleared only on the
-// instantiate paths. So an editor duplicate/paste/undo that respawned an instance member onto a dead
-// member's index inherited the dead member's marks (a spurious override frozen at save), while a
-// deleted member restored onto a DIFFERENT index lost its own. Marks are keyed by the packed entity
-// and travel in the snapshot.
-describe('override marks across respawn (#868)', () => {
-  afterEach(async () => { (await import('../../src/runtime/loaders/overrideMarks')).clearAllOverrideMarks(); });
-  const spawnMember = (name: string, rootInstanceId = 0) => {
-    const e = testWorld.spawn(
-      Transform({}), EntityAttributes({ name }),
-      PrefabInstance({ source: 'p.prefab.json', localId: 1, rootInstanceId, parentLocalId: 0 }),
-    );
-    entityIndex.set(e.id(), e);
-    return e;
-  };
-
-  it('a respawn onto a dead member\'s index does not inherit that member\'s marks', async () => {
-    const { snapshotEntity, respawnFromSnapshot } = await getModule();
-    const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
-    const source = spawnMember('Unmarked');
-    const dead = spawnMember('Marked');
-    markOverride(dead, 'Transform', 'x');
-    const snapshot = snapshotEntity(source.id())!;
-
-    entityIndex.delete(dead.id());
-    dead.destroy();
-    const newId = respawnFromSnapshot(snapshot);
-    expect(newId).toBe(dead.id());
-
-    expect(getOverrideMarkSet(entityIndex.get(newId))).toBeUndefined();
-  });
-
-  it('a respawn whose packed value wrapped around to a dead member\'s gets no marks (8-bit generation)', async () => {
-    const { snapshotEntity, respawnFromSnapshot } = await getModule();
-    const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
-    const source = spawnMember('Unmarked');
-    const snapshot = snapshotEntity(source.id())!;
-    entityIndex.delete(source.id()); source.destroy();
-    const dead = spawnMember('Marked');
-    const deadPacked = dead.valueOf();
-    markOverride(dead, 'Transform', 'x');
-    entityIndex.delete(dead.id()); dead.destroy();
-
-    // koota's generation is 8 bits: 255 more spawn/destroy cycles on the index bring the next spawn
-    // back to the dead member's exact packed value.
-    for (let i = 0; i < 255; i++) testWorld.spawn().destroy();
-    const newId = respawnFromSnapshot(snapshot);
-    expect(entityIndex.get(newId).valueOf()).toBe(deadPacked);
-
-    expect(getOverrideMarkSet(entityIndex.get(newId))).toBeUndefined();
-  });
-
-  it('duplicating a marked instance root gives the copy the same marks', async () => {
-    const { duplicateEntity } = await getModule();
-    const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
-    const root = testWorld.spawn(
-      Transform({}), EntityAttributes({ name: 'Root' }),
-      PrefabInstance({ source: 'p.prefab.json', localId: 1, rootInstanceId: 0, parentLocalId: 0 }),
-    );
-    entityIndex.set(root.id(), root);
-    root.set(PrefabInstance, { rootInstanceId: root.id() });
-    markOverride(root, 'Transform', 'x');
-
-    const newId = duplicateEntity(root.id(), vi.fn())!;
-    expect(newId).not.toBe(root.id());
-
-    // The source's mark is carried. The copy's own sortOrder is marked too: Duplicate places it last among its
-    // siblings, and a copied instance root saves that only when marked (#1709; the template is not cached here, so
-    // the by-value check cannot read a base and keeps the mark).
-    expect([...(getOverrideMarkSet(entityIndex.get(newId)) ?? [])].sort()).toEqual(['EntityAttributes.sortOrder', 'Transform.x']);
-  });
-
-  it('delete + undo restores a member\'s marks even when another spawn took its index meanwhile', async () => {
-    const { deleteEntityWithUndo } = await getModule();
-    const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
-    const member = spawnMember('Member');
-    const memberId = member.id();
-    markOverride(member, 'Transform', 'x');
-
-    deleteEntityWithUndo(memberId);
-    const squatter = spawnEntity('Squatter');
-    expect(squatter.id()).toBe(memberId);
-    pushedActions[0].undo();
-
-    let restored: any;
-    testWorld.query(EntityAttributes).updateEach(([ea], e) => { if (ea.name === 'Member') restored = e; });
-    expect(restored).toBeDefined();
-    expect([...(getOverrideMarkSet(restored) ?? [])]).toEqual(['Transform.x']);
-    expect(getOverrideMarkSet(squatter)).toBeUndefined();
-  });
-});
-
 describe('duplicate carries references INSIDE the copied subtree (#1338)', () => {
   const put = (...traits: any[]) => { const e = testWorld.spawn(...traits); entityIndex.set(e.id(), e); return e; };
   const byName = (name: string, not?: number) => {
@@ -1669,31 +1558,21 @@ describe('duplicate carries references INSIDE the copied subtree (#1338)', () =>
   };
   const rootOf = (e: any) => e.get(PrefabInstance).rootInstanceId as number;
 
-  it('a copied instance points its rootInstanceIds into the COPY — the nested one at its own root — for a plain parent and for the root itself', async () => {
+  it('refuses a copy of an instance it holds no records for, from a plain parent and from the root itself (#2001 S8b)', async () => {
+    // The copy into the COPY's own roots, on records, is covered on loaded scenes (engine/tests/editor/duplicateCarriesRefs).
     const { duplicateEntity } = await getModule();
     const holder = put(Transform(), EntityAttributes({ name: 'Holder', guid: 'g-holder' }));
     const src = instance(holder.id());
-    for (const target of [holder.id(), src.root.id()]) {
-      const copyId = duplicateEntity(target, vi.fn())!;
-      const seen = new Set([src.root.id(), src.member.id(), src.nest.id(), src.leaf.id()]);
-      const fresh = (name: string) => {
-        let found: any;
-        testWorld.query(EntityAttributes).updateEach(([ea]: any[], e: any) => { if (ea.name === name && !seen.has(e.id())) found = e; });
-        seen.add(found.id());
-        return found;
-      };
-      const [root, member, nest, leaf] = ['Root', 'Member', 'NestRoot', 'NestLeaf'].map(fresh);
-      // The copy's Root: under the holder's copy, or the copy itself.
-      expect(target === holder.id() ? root.get(EntityAttributes).parentId : root.id()).toBe(copyId);
-      expect(rootOf(root)).toBe(root.id());
-      expect(rootOf(member)).toBe(root.id());
-      expect(rootOf(nest)).toBe(nest.id());
-      expect(rootOf(leaf)).toBe(nest.id());
-      // The source is untouched.
-      expect([rootOf(src.root), rootOf(src.member), rootOf(src.nest), rootOf(src.leaf)])
-        .toEqual([src.root.id(), src.root.id(), src.nest.id(), src.nest.id()]);
-      for (const e of [root, member, nest, leaf]) seen.add(e.id());
-    }
+    const count = () => [...testWorld.query(EntityAttributes)].length;
+    const before = count();
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const target of [holder.id(), src.root.id()]) expect(duplicateEntity(target, vi.fn())).toBeNull();
+      expect(err.mock.calls.filter(([m]) => String(m).includes('was not copied'))).toHaveLength(2);
+    } finally { err.mockRestore(); }
+    expect(count()).toBe(before);
+    expect([rootOf(src.root), rootOf(src.member), rootOf(src.nest), rootOf(src.leaf)])
+      .toEqual([src.root.id(), src.root.id(), src.nest.id(), src.nest.id()]);
   });
 
   it('delete + undo of an instance restores rootInstanceIds that name the RESTORED entities', async () => {

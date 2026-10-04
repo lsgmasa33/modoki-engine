@@ -100,9 +100,11 @@ import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/app
 import { undo, redo, swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { freshInstanceRecord, setInstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { storedRecord, setInstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { recordForWrite } from '../../packages/modoki/src/editor/instance/instanceSync';
 import { clearDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
+import { place as seatInstance } from '../../packages/modoki/src/editor/instance/instanceEdits';
+import { deriveInstanceMemberGuids } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -195,6 +197,7 @@ beforeEach(() => {
   const eaMeta = getTraitByName('EntityAttributes')!;
   const id = instantiatePrefabIntoWorld(getCurrentWorld(), pDoc() as never, 0, undefined, P);
   for (const e of getCurrentWorld().entities) if (e.id() === id) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), guid: ROOT });
+  deriveInstanceMemberGuids(getCurrentWorld()); seatInstance(id!); // placed as a drop places it (#2001 S8b)
 });
 
 
@@ -203,6 +206,7 @@ function place(guid: string, scene = ''): void {
   const eaMeta = getTraitByName('EntityAttributes')!;
   const id = instantiatePrefabIntoWorld(getCurrentWorld(), getCachedPrefabSync(P) as never, 0, undefined, P);
   for (const e of getCurrentWorld().entities) if (e.id() === id) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), guid, sourceScene: scene });
+  deriveInstanceMemberGuids(getCurrentWorld()); seatInstance(id!); // placed as a drop places it (#2001 S8b)
 }
 const rootOf = (guid: string) => all().find((e) => e.guid === guid)!.id;
 const boxOf = (guid: string) => { const r = rootOf(guid); return all().find((e) => e.name === 'Box' && parentOf(e.id) === r)!.id; };
@@ -216,7 +220,7 @@ function mark(guid: string): void {
   rows.set(`/${G(2)}` as never, { ...(rows.get(`/${G(2)}` as never) ?? {}), name: 'Marker' });
   setInstanceRecord(getCurrentWorld(), { ...rec, list: { ...rec.list, rows } });
 }
-const marked = (guid: string) => (freshInstanceRecord(getCurrentWorld(), guid)?.list.rows.get(`/${G(2)}` as never) as { name?: string } | undefined)?.name === 'Marker';
+const marked = (guid: string) => (storedRecord(getCurrentWorld(), guid)?.list.rows.get(`/${G(2)}` as never) as { name?: string } | undefined)?.name === 'Marker';
 
 describe('an Apply undo restores the trees its fan-out reached, and only those (#2046 S7.3)', () => {
   it('the fanned instance takes its pre-Apply record; one placed after the Apply, and one of another scene, keep theirs', async () => {
@@ -231,7 +235,7 @@ describe('an Apply undo restores the trees its fan-out reached, and only those (
 
     await quietly(() => undo());
     expect(sm.loads, 'the record path, not the snapshot reload').toBe(0);
-    expect(freshInstanceRecord(getCurrentWorld(), ROOT2)).toEqual(before2);
+    expect(storedRecord(getCurrentWorld(), ROOT2)).toEqual(before2);
     expect(tfOf(ROOT2).x).toBe(0);
     expect(marked(ROOT3), 'placed after the Apply: not in its set').toBe(true);
     expect(marked(ROOT4), 'another scene: not in its set').toBe(true);
@@ -248,11 +252,11 @@ describe('an Apply undo restores the trees its fan-out reached, and only those (
     await quietly(() => undo()); // the y edit
     await quietly(() => undo()); // the Apply
     expect(tfOf(ROOT2)).toMatchObject({ x: 0, y: 0 });
-    expect(freshInstanceRecord(getCurrentWorld(), ROOT2)).toEqual(before2);
+    expect(storedRecord(getCurrentWorld(), ROOT2)).toEqual(before2);
 
     await quietly(() => redo()); // the Apply
     await quietly(() => redo()); // the y edit
     expect(tfOf(ROOT2)).toMatchObject({ x: 5, y: 7 });
-    expect(freshInstanceRecord(getCurrentWorld(), ROOT2)).toEqual(after2);
+    expect(storedRecord(getCurrentWorld(), ROOT2)).toEqual(after2);
   });
 });

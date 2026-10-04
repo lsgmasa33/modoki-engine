@@ -7,8 +7,10 @@
  *  objects where it places them, as Unity's does, and applying a move re-pathed the member in every other file. This is the representative set for that path; the
  *  authoring-path tests went with the gesture.
  *
- *  The file is made the way the old editor made it: the member's parent is written raw (what a move left in the live
- *  world), then the real save writes it. Every assertion then runs on the world RELOADED from that file. */
+ *  The file is the real save's, with the move the old editor wrote added to its member row: the member's row names its
+ *  new parent (#1437). (Written raw into the live world before the save, a move reached no record, and since #2001 S8b a
+ *  save writes the records the load parsed, not a capture of the world.) Every assertion runs on the world RELOADED from
+ *  that file. */
 
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
@@ -32,9 +34,7 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
-import { setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, deleteEntitiesWithUndo, reparentEntity } from '@modoki/engine/editor';
-import { spawnEntity, Transform, EntityAttributes } from '@modoki/engine/runtime';
+import { setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, deleteEntitiesWithUndo, reparentEntity, createEntityWithUndo } from '@modoki/engine/editor';
 import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { restructureRefusal } from '../../packages/modoki/src/editor/scene/restructureRefusal';
@@ -45,7 +45,6 @@ import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { planReparent } from '../../packages/modoki/src/editor/undo/entityActions';
-import { writeTraitField, markStructureDirty } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -102,7 +101,14 @@ const parentName = (name: string) => getAllEntities().find((e) => e.id === named
 const linkedTo = (name: string) => (readTraitData(named(name).id, meta('PrefabInstance')) as { rootInstanceId?: number } | null)?.rootInstanceId;
 const saved = async () => serializeScene() as unknown as Promise<SceneData>;
 
-/** The pre-#1869 file: C moved under A, written by the real save. */
+/** `file` with C's member row moved under `parent`, as the editor before #1869 wrote a member move (#1437). */
+const movedIn = (file: SceneData, parent: string): SceneData => {
+  const rows = (file.entities as unknown as Array<{ guid?: string; members?: Record<string, Record<string, unknown>> }>).find((e) => e.guid === ROOT1)!.members!;
+  rows[`/${g(4)}`] = { ...rows[`/${g(4)}`], parent };
+  return file;
+};
+
+/** The pre-#1869 file: C moved under A. */
 let legacy: SceneData;
 /** C's guid while it sat in the world that wrote the file. */
 let movedGuid: string;
@@ -112,13 +118,10 @@ beforeEach(async () => {
   clearHistory();
   prefabs.clear();
   writes.length = 0;
-  clearKeptMemberOrphans();
   install(pDoc());
   await load(scene());
-  writeTraitField(named('C').id, meta('EntityAttributes'), 'parentId', named('A').id);
-  markStructureDirty();
   movedGuid = named('C').guid!;
-  legacy = await saved();
+  legacy = movedIn(await saved(), named('A').guid!);
   // Precondition: the file really holds the move, as a member row naming its new parent (#1437) — or every case below
   // would pass on a file with no move in it.
   expect(JSON.stringify(legacy)).toContain(`"parent":"${named('A').guid}"`);
@@ -221,10 +224,8 @@ describe('a member a file moved under a node the scene added (#1869 close-out re
   // inside its instance — but not out of it. Mutation: require C's supplier to move WITH the subtree (drop `landsUnder`)
   // — the move within the instance is refused.
   it('the node moves within its instance, with the member, and not out of it', async () => {
-    const n = spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'N', parentId: rootId(), guid: 'eeeeeeee-0000-4000-8000-0000000018a1' })).id();
-    writeTraitField(named('C').id, meta('EntityAttributes'), 'parentId', n);
-    markStructureDirty();
-    const file = await saved();
+    createEntityWithUndo('Create', rootId(), [{ name: 'EntityAttributes', data: { name: 'N', parentId: rootId(), guid: 'eeeeeeee-0000-4000-8000-0000000018a1' } }, { name: 'Transform' }], () => {});
+    const file = movedIn(await saved(), 'eeeeeeee-0000-4000-8000-0000000018a1');
     expect(JSON.stringify(file)).toContain('"parent":"eeeeeeee-0000-4000-8000-0000000018a1"'); // precondition: the move is in the file
     await load(file);
     const node = named('N').id;

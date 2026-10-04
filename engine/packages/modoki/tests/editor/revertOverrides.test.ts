@@ -59,6 +59,7 @@ function deleteEntitiesImpl(ids: number[]) {
 }
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: () => () => {},
   // #1880 F7c: a Revert names its scene entry's root by durable guid, minting one (`ensureGuid`) where the root has none,
   // and finds it again by it after the rebuild. This mock is an explicit list, so each reachable export is named here.
   indexEntityGuid: () => {},
@@ -101,8 +102,6 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab
 beforeEach(async () => {
   testWorld = createWorld();
   index.clear();
-  const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
-  clearAllOverrideMarks();
 });
 
 const SRC = 'cccccccc-0000-4000-8000-00000000c0e8';
@@ -141,18 +140,21 @@ async function setup() {
   m.setPrefabCache(SRC, shipPrefab as any);
   const root = m.instantiatePrefab(shipPrefab as any);
   m.setPrefabSource(root, { id: SRC });
+  // Placed as a placement places it (#2001 S8b): a durable root guid (the spawn mints one in the editor) and its record,
+  // through the door. The edits below go through the door too.
+  index.get(root).set(EntityAttributes, { ...index.get(root).get(EntityAttributes), guid: 'aaaaaaaa-0000-4000-8000-00000000f001' });
+  (await import('../../src/editor/instance/instanceEdits')).place(root);
   return { m, root };
 }
 
 describe('revertOverridesSelective', () => {
   it('reverts the selected field to base; leaves the unselected override intact', async () => {
     const { m, root } = await setup();
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
 
     // Two overrides on the Flame member (localId 2): idleScale and Transform.x.
     const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
-    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
-    writeTraitFieldImpl(flameId, TRAITS[0], 'x', 4.1); markOverride(index.get(flameId), 'Transform', 'x');
+    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); (await import('../../src/editor/instance/instanceEdits')).setFields(flameId, 'EngineFlame', ['idleScale']);
+    writeTraitFieldImpl(flameId, TRAITS[0], 'x', 4.1); (await import('../../src/editor/instance/instanceEdits')).setFields(flameId, 'Transform', ['x']);
 
     // Revert ONLY idleScale.
     const result = await m.revertOverridesSelective(root, new Set(['2.EngineFlame.idleScale']));
@@ -165,12 +167,11 @@ describe('revertOverridesSelective', () => {
 
   it('reverting an added trait removes it from the instance', async () => {
     const { m, root } = await setup();
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
 
     // Add a Spin trait the prefab doesn't define at the root (localId 1).
     const rootEntity = index.get(root);
     rootEntity.add(Spin({ speed: 9 }));
-    markOverride(index.get(root), 'Spin', 'speed');
+    (await import('../../src/editor/instance/instanceEdits')).addComponent(root, 'Spin');
     expect(memberData(root, 1, 'Spin')).toBeDefined();
 
     const result = await m.revertOverridesSelective(root, new Set(['1.Spin.speed']));
@@ -185,11 +186,10 @@ describe('revertOverridesSelective', () => {
   // Mutation for this case: `revertOverridesSelective` returns the after side as its `before` (`prefabRevert.ts`).
   it('the Revert\'s result carries both states: restoring the before records puts the edit back, the after ones revert it', async () => {
     const { m, root } = await setup();
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     const { restoreSide } = await import('../../src/editor/instance/instanceHistory');
 
     const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
-    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
+    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); (await import('../../src/editor/instance/instanceEdits')).setFields(flameId, 'EngineFlame', ['idleScale']);
 
     const result = await m.revertOverridesSelective(root, new Set(['2.EngineFlame.idleScale']));
     expect(result).not.toBeNull();
@@ -214,8 +214,9 @@ describe('revertOverridesSelective', () => {
     // situation F5 describes. The old code keyed its teardown off a frozen id set, so it leaked the Antenna beside the
     // respawn. Since #1880 F7d a rebuild is the load of the entry, whose statement names the Antenna (a scene-added
     // node): the teardown walks the live subtree, and the load respawns it — once.
-    const antenna = testWorld.spawn(EntityAttributes({ name: 'Antenna', parentId: root, guid: 'antenna-guid' }), Transform({ x: 1, y: 0, z: 0 }));
+    const antenna = testWorld.spawn(EntityAttributes({ name: 'Antenna', parentId: root, guid: 'aaaaaaaa-0000-4000-8000-00000000f002' }), Transform({ x: 1, y: 0, z: 0 }));
     index.set(antenna.id(), antenna);
+    (await import('../../src/editor/instance/instanceEdits')).addChild(antenna.id()); // linked as an Add Child links it (#2001 S8b)
     expect(countAntennas()).toBe(1);
 
     expect(m.refreshInstances(SRC, [root], shipPrefab as any, shipPrefab as any)).toBe(1);

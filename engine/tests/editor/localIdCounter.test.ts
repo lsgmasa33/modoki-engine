@@ -45,7 +45,6 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction, clearHistory, createEntityWithUndo } from '@modoki/engine/editor';
 import { PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 // What a mark raise stamps: the version the mark ARRIVED in, not today's format (`contentFor`, #1797) — equal to
@@ -126,7 +125,6 @@ beforeEach(() => {
   setRunMode('stopped');
   clearHistory();
   prefabs.clear();
-  clearKeptMemberOrphans();
   _resetPrefabEditSessionRows();
   onDisk.clear();
   failWrite.clear();

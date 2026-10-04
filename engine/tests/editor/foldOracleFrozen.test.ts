@@ -23,7 +23,14 @@
  *  after. Measured with `MODOKI_FOLD_ORACLE_DUMP` on both files at one build: those two labels are the whole difference
  *  (the nodes are the same), and the file as it was before the re-save still gives the old form. The other 40 corpus
  *  instances give their frozen form from the re-saved files, unchanged. The replacement is kept by owner ruling (relayed
- *  by the hub, 2026-10-03). */
+ *  by the hub, 2026-10-03).
+ *
+ *  ⚠️ The forms no longer hold the stores the load kept for the save (`kept`, #2001 S8b step 6): the load fills none any
+ *  more, and the save writes the record's unused part itself. Removed from every frozen form MECHANICALLY, not by a
+ *  re-freeze (hub ruling, 2026-10-05): each fuzz form had its `kept` deleted from its stored text, and each corpus form
+ *  was dumped at 62967e2f6 (the last load that kept them, where this file was green), checked to hash to its frozen value,
+ *  and re-hashed without `kept`. 75 forms in 25 cases; the case and instance keys did not change, and nothing else in a
+ *  form did. */
 
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { createWorld } from 'koota';
@@ -45,7 +52,7 @@ import {
   getCurrentWorld, setCurrentWorld, getTraitByName, setRunMode, loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { clearKeptMemberOrphans, type SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { type SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import type { PrefabDoc, PrefabReader } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 import { parseInstanceRecord } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { checkInstance, frozenForm, liveTree, seen, translatedLive } from './foldOracle';
@@ -92,7 +99,6 @@ async function load(data: SceneData): Promise<void> {
   const prev = getCurrentWorld();
   setCurrentWorld(createWorld());
   prev?.destroy();
-  clearKeptMemberOrphans();
   const eaMeta = getTraitByName('EntityAttributes')!;
   await loadSceneFile(JSON.parse(JSON.stringify(data)) as SceneData, {
     loadModels: false,
@@ -147,8 +153,8 @@ async function formsOf(scene: Record<string, unknown>, dumpAs: string): Promise<
       sceneVersion: version, sceneHadCopies: !!scene.embeddedPrefabs, held: (g) => held.has(g),
       parentGuid: (r) => (typeof r === 'number' ? idToGuid.get(r) ?? '' : typeof r === 'string' ? r : ''),
     }).record;
-    if (DUMP) dump[entry.guid] = { untranslated: JSON.parse(frozenForm({ live: liveTree(root.id()), ruledKept: [] }, entry.guid)) };
-    const form = frozenForm(translatedLive(rec, reader, root.id(), copies), entry.guid);
+    if (DUMP) dump[entry.guid] = { untranslated: JSON.parse(frozenForm({ live: liveTree(root.id()), ruledKept: [] })) };
+    const form = frozenForm(translatedLive(rec, reader, root.id(), copies));
     if (DUMP) (dump[entry.guid] as Record<string, unknown>).translated = JSON.parse(form);
     out.set(entry.guid, form);
   }
@@ -170,23 +176,15 @@ function settle(caseKey: string, forms: Map<string, string>, hashed: boolean): v
   }
 }
 
-/** A form as the rules' visible changes leave it comparable (design § 10.4b), applied to both sides alike:
- *  - no node AT a placeholder: a placeholder entity's own fields are not compared (the frozen side's translation removed
- *    today's expansion there and had no placeholder entity to show). Its existence is: `placeholders` is compared whole;
- *  - no kept leaf at or under a placeholder: the placeholder keeps every record under it verbatim (rule 9), where today
- *    expanded a copy and kept the unused ones in its stores (ruling B);
- *  - `ruledKept`, the own links today kept unshown that the rules show (#2018 (i)), is the frozen side's note: each takes
- *    its kept `own` leaf with it, and the shown link is compared in `anchors`. */
+/** A form as the rules' visible changes leave it comparable (design § 10.4b), applied to both sides alike: no node AT a
+ *  placeholder. A placeholder entity's own fields are not compared (the frozen side's translation removed today's
+ *  expansion there and had no placeholder entity to show); its existence is: `placeholders` is compared whole. `ruledKept`
+ *  (the own links today kept unshown that the rules show, #2018 (i)) is the frozen side's note, and the shown link is
+ *  compared in `anchors`. */
 function withoutPlaceholderNodes(form: string): unknown {
-  const f = JSON.parse(form) as { nodes: [string, ...unknown[]][]; placeholders: string[]; kept: string[]; ruledKept: string[] };
+  const f = JSON.parse(form) as { nodes: [string, ...unknown[]][]; placeholders: string[]; ruledKept: string[] };
   const at = new Set(f.placeholders);
-  const under = (k: string) => [...at].some((p) => k === p || k.startsWith(p === '/' ? '/' : `${p}/`));
-  const kept = [...f.kept];
-  for (const k of f.ruledKept) { const i = kept.indexOf(`${k} own`); if (i >= 0) kept.splice(i, 1); }
-  return {
-    ...f, nodes: f.nodes.filter((n) => !at.has(n[0])), ruledKept: undefined,
-    kept: kept.filter((l) => l.startsWith('(legacy)') || !under(l.slice(0, l.indexOf(' ')))),
-  };
+  return { ...f, nodes: f.nodes.filter((n) => !at.has(n[0])), ruledKept: undefined };
 }
 
 const fuzzCases = existsSync(FIXTURES) ? readdirSync(FIXTURES).filter((f) => f.endsWith('.json')).sort() : [];

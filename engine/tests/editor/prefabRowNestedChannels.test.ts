@@ -214,14 +214,15 @@ describe('a prefab row\'s own nestedStructure expands in both loaders (#1381)', 
     expect(namePaths()).toContain(LEAF_UNDER_MID);
   });
 
-  // A non-empty baseline means the scene restates the interior it sees (`captureNestedChannels`'
-  // documented rule — the same one a row's OWN `removed` list already gets). What must hold is that
-  // the restatement is the row's value, so an untouched save + reload changes nothing.
+  // An untouched save + reload changes nothing. The record states only what the instance changes (#2001 S8b: every load
+  // records), so the prefab row's own deletion is not restated into the scene; the capture used to restate the interior
+  // it saw (`captureNestedChannels`' rule for a non-empty baseline).
   it('an untouched instance of such a prefab round-trips unchanged', async () => {
     install(outerDoc({ nestedStructure: DELETE_LEAF }));
     await load(sceneWith());
+    expect(namePaths()).not.toContain(LEAF_UNDER_MID);
     const saved = await serializeScene() as unknown as { entities: Array<Record<string, unknown>> };
-    expect(leafRows(saved.entities.find((e) => e.prefab === OUTER)!)).toEqual([{ removed: true }]);
+    expect(leafRows(saved.entities.find((e) => e.prefab === OUTER)!)).toEqual([]);
     await load(saved as unknown as SceneData);
     expect(namePaths()).not.toContain(LEAF_UNDER_MID);
     const again = await serializeScene();

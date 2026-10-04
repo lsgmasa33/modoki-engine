@@ -36,7 +36,7 @@ import {
   HELD_REMAINDER, ROOT_ROW_KEY,
   type AddedNodeRef, type DesiredNode, type FoldedInstance, type FrameOpening, type InstanceRecord, type Placeholder, type PrefabDoc,
   type PrefabDocRow, type PrefabReader, type RecordPart, type RowKey, type TargetRecordOf, type TemplateAddedNode,
-  type UnusedCause, type UnusedRecord,
+  type TemplateHeldData, type UnusedCause, type UnusedRecord,
 } from './instanceRecord';
 import { componentOf, frameOf, identityToKey, keylessNodeKey, memberIdentities, parseTemplateLists, type Frame } from './parseInstanceRecord';
 
@@ -52,7 +52,23 @@ const registrySchema: FoldSchema = {
   field: (trait, field) => { const meta = getTraitByName(trait); return !!meta && fieldFate(meta, field) === 'applies'; },
 };
 
-export interface FoldOptions { schema?: FoldSchema }
+/** One layer of records as the fold hands it to a frame: keyed relative to that frame (`/` = its root), the instance's
+ *  own list last (`scene`). See {@link FoldOptions.layersAt}. */
+export interface HandedLayer {
+  rows: ReadonlyMap<RowKey, TargetRecordOf<unknown>>;
+  scene: boolean;
+  /** A template list's held data (`TemplateOverrideList.held`: what its parse could not name, kept verbatim), on the
+   *  layer the row expanding THIS frame states only: its localIds are this frame's. A layer handed further down has
+   *  none here (its held data names the frame it was stated for). */
+  held?: TemplateHeldData;
+}
+
+export interface FoldOptions {
+  schema?: FoldSchema;
+  /** Filled with the layers the fold hands each frame it folds, by the frame root's key, inner first (#2001 S8b): what a
+   *  copy that makes a nested frame an instance of its own leaves behind, and so states in that instance's list. */
+  layersAt?: Map<RowKey, readonly HandedLayer[]>;
+}
 
 type AnyRecord = TargetRecordOf<unknown>;
 /** One layer's records, keyed RELATIVE to the frame it is handed to (`/` = that frame's root). `scene`: the instance's
@@ -66,6 +82,8 @@ interface Layer {
   /** The documents containing the frame whose document STATES this layer, outermost first (its own included): what a
    *  template-added reference node it carries is nested in, for the cycle check. Empty for the scene's. */
   home: readonly string[];
+  /** {@link HandedLayer.held}: a template list's, at depth 0 only. */
+  held?: TemplateHeldData;
 }
 
 type Parent = DesiredNode['parent'];
@@ -113,7 +131,8 @@ interface State {
   placeholderRemovedBy: Map<RowKey, 'inner' | 'scene' | 'none'>;
   /** Keys a frame repeats (two template nodes, one key): they name neither (`frameKeyIndex`). */
   ambiguous: Set<RowKey>;
-  templateLists: Map<string, Map<number, ReadonlyMap<RowKey, AnyRecord>>>;
+  templateLists: Map<string, Map<number, { rows: ReadonlyMap<RowKey, AnyRecord>; held?: TemplateHeldData }>>;
+  layersAt?: Map<RowKey, readonly HandedLayer[]>;
 }
 
 const absKey = (prefix: string, rel: RowKey): RowKey => (rel === ROOT_ROW_KEY ? (prefix || ROOT_ROW_KEY) : prefix + rel);
@@ -143,11 +162,13 @@ function cleanTraits(traits: Record<string, unknown> | undefined): Record<string
 }
 
 /** The template list of every reference row of document `guid`, by localId (parsed once per document). */
-function templateListsOf(st: State, doc: PrefabDoc, guid: string): Map<number, ReadonlyMap<RowKey, AnyRecord>> {
+function templateListsOf(st: State, doc: PrefabDoc, guid: string): Map<number, { rows: ReadonlyMap<RowKey, AnyRecord>; held?: TemplateHeldData }> {
   let lists = st.templateLists.get(guid);
   if (!lists) {
     lists = new Map();
-    for (const [lid, r] of parseTemplateLists(doc, guid, st.read).rows) lists.set(lid, r.list.rows as ReadonlyMap<RowKey, AnyRecord>);
+    for (const [lid, r] of parseTemplateLists(doc, guid, st.read).rows) {
+      lists.set(lid, { rows: r.list.rows as ReadonlyMap<RowKey, AnyRecord>, ...(r.list.held ? { held: r.list.held } : {}) });
+    }
     st.templateLists.set(guid, lists);
   }
   return lists;
@@ -200,6 +221,7 @@ function foldFrame(
   };
   const lists = templateListsOf(st, doc, docGuid);
   const frameRef = { source: docGuid, rootKey: absKey(prefix, ROOT_ROW_KEY) };
+  st.layersAt?.set(frameRef.rootKey, layers);
 
   // 1. The document's rows: plain ones as nodes, nested reference rows as frames of their own.
   for (const row of doc.entities ?? []) {
@@ -217,7 +239,11 @@ function foldFrame(
         st.placeholders.set(key, { ...child, parent: placeOf(row, lid), opens, ...(name !== undefined ? { name } : {}), ...(sortOrder !== undefined ? { sortOrder } : {}) });
         continue;
       }
-      const childLayers: Layer[] = [{ rows: lists.get(lid) ?? new Map(), scene: false, depth: 0, home: chain }, ...layers.map((l) => descend(l, component))];
+      const list = lists.get(lid);
+      const childLayers: Layer[] = [
+        { rows: list?.rows ?? new Map(), scene: false, depth: 0, home: chain, ...(list?.held ? { held: list.held } : {}) },
+        ...layers.map((l) => descend(l, component)),
+      ];
       foldFrame(st, frameOf(key, child.doc, row.prefab), childLayers, [...segments, rowPathInPrefab(doc as never, lid)], { parent: placeOf(row, lid), opens }, [...outer, f], [...chain, row.prefab]);
       continue;
     }
@@ -348,6 +374,7 @@ export function foldInstance(read: PrefabReader, rec: InstanceRecord, opts: Fold
   const st: State = {
     read, schema: opts.schema ?? registrySchema,
     nodes: new Map(), placeholders: new Map(), links: new Map(), docMoves: new Map(), placeholderRemovedBy: new Map(), ambiguous: new Set(), templateLists: new Map(),
+    ...(opts.layersAt ? { layersAt: opts.layersAt } : {}),
   };
   const unused: UnusedRecord[] = [];
   const top = readDoc(st, rec.source);

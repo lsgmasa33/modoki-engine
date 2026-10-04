@@ -66,6 +66,7 @@ import { createEntityWithUndo } from '@modoki/engine/editor';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
+import { dropInstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -281,6 +282,27 @@ describe('an outside change to a prefab the open scene uses re-imports it in pla
     expect(eaOf(rootOf(I1)).sourceScene, 'a primary one stays primary').toBe('');
     expect(tfOf(rootOf(HOLDER)).x).toBe(3);
     expect(canUndo()).toBe(true);
+  });
+
+  // #2001 S8b: an entry placeholder's records come back from the record it holds. One holding none stays a placeholder
+  // and is reported, its way out the reload; before, it was re-expanded and every record under it marked stale.
+  it('a put-back leaves a placeholder that holds no record a placeholder, reported, and marks no record stale', async () => {
+    route.disk.delete(X_PATH);
+    for (const k of [X, X_PATH]) setPrefabCache(k, null);
+    await quietly(() => load(emptyScene()));
+    await quietly(() => load(scene()));
+    markSceneSaved();
+    expect(placeholders(), 'premise: I1, I2 and H\'s X row are placeholders').toBe(3);
+    dropInstanceRecord(getCurrentWorld(), I1);
+    route.disk.set(X_PATH, jsonFileBody(parkDoc()));
+
+    const report = await quietly(() => reimportPrefabsInPlace([X_PATH]));
+
+    // MUTATION TARGET: re-expand it anyway (the old re-seed branch) and I1 is an instance with its records marked.
+    expect(report.placeholders.map((p) => p.guid), 'I1 is reported').toEqual([I1]);
+    expect(placeholders(), 'I1 alone is left').toBe(1);
+    expect(tf(I2, 'XA').y, 'the others re-expand').toBe(5);
+    expect(getAllEntities().find((e) => e.guid === KID)!.parentId, 'its child stays under it').toBe(rootOf(I1));
   });
 
   // R1 review F1: a prefab a loaded scene OWNS with no live frame (a timeline clip, an empty pool, a game trait's ref) —

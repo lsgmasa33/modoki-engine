@@ -11,7 +11,7 @@
  *
  *  Mutation (measured in #1914 R0, again in R3c): write a recorded field only where its value differs from the base
  *  (in `recordedOverrides`), and the scenes whose files restate a base value go red on the record comparison.
- *  Mutations of the FILE comparison (#1933): keep no unused record (`withKeptLegacy`/`withKeptLocalRecords` return their
+ *  Mutations of the FILE comparison (#1933, before #2001 S8b deleted the kept stores): keep no unused record (`withKeptLegacy`/`withKeptLocalRecords` return their
  *  channels) — Base and the space-console scenes go red on `statementsLost`, which the marks cannot see; and the floor
  *  counts file statements, not F7's implied root order, which every instance now records. The "nothing GAINED" half
  *  (`statementsGained`, #1933 N1, landed with #1938 C-B step 1): without `absenceIsRemoval` in the capture's removal diff,
@@ -37,9 +37,9 @@ import {
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { buildPrefabEditScene, serializePrefabEditWorld, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
-import { getOverrideMarkSet, ROTATION_MARKS } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { ROTATION_MARKS } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import type { PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 
@@ -76,7 +76,6 @@ async function load(data: SceneData): Promise<void> {
   const prev = getCurrentWorld();
   setCurrentWorld(createWorld());
   prev?.destroy();
-  clearKeptMemberOrphans();
   const eaMeta = getTraitByName('EntityAttributes')!;
   await loadSceneFile(JSON.parse(JSON.stringify(data)) as SceneData, {
     loadModels: false,
@@ -85,14 +84,16 @@ async function load(data: SceneData): Promise<void> {
       const world = getCurrentWorld();
       for (const e of world.entities) if (e.id() === id) { destroyEntity(e, world); break; }
     },
-    onInstantiatePrefab: async (source, parentId, rootTf, _o, _x, overrides, structure, nested, rootGuid, _f, nestedStructure, expansion) => {
+    onInstantiatePrefab: async (source, parentId, rootTf, _o, _x, overrides, structure, nested, rootGuid, folder, nestedStructure, expansion) => {
       const id = instantiatePrefabIntoWorld(
         getCurrentWorld(), prefabs.get(source) as never, parentId, rootTf, source, overrides, structure, undefined, nested, nestedStructure,
         { frame: expansion?.frame, sceneVersion: expansion?.sceneVersion },
       );
-      if (id && rootGuid) {
+      // The root's guid and Hierarchy folder, as `SceneManager` sets them (its record states the folder, so a stub that
+      // left it out read as a save dropping it).
+      if (id && (rootGuid || folder)) {
         for (const e of getCurrentWorld().entities) {
-          if (e.id() === id) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as Record<string, unknown>), guid: rootGuid });
+          if (e.id() === id) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as Record<string, unknown>), ...(rootGuid ? { guid: rootGuid } : {}), ...(folder ? { editorFolder: folder } : {}) });
         }
       }
       return id ?? undefined;
@@ -116,7 +117,7 @@ const records = (): Record<string, string[]> => {
   const out: Record<string, string[]> = {};
   for (const e of getAllEntities()) {
     const ent = findEntity(e.id);
-    const set = ent ? getOverrideMarkSet(ent) : undefined;
+    const set = ent ? overrideKeysOf(ent) : undefined;
     if (set && set.size) out[e.guid ?? `#${e.id}`] = [...set].sort();
   }
   return out;

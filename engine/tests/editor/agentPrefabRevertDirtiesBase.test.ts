@@ -14,18 +14,22 @@ import {
 import { clearHistory, markSceneSaved, undo, redo } from '@modoki/engine/editor';
 import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
-import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+
 import { isSceneDirty, clearSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
+import { place, setFields } from '../../packages/modoki/src/editor/instance/instanceEdits';
+import { deriveInstanceMemberGuids } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { getCurrentWorld } from '../../packages/modoki/src/runtime/core/ecs/world';
 
 registerAllTraits();
 registerEditorAgentOps();
 
 const KIT = 'dddddddd-0000-4000-8000-00000000c431';
 const BASE = 'cccccccc-0000-4000-8000-00000000c431';
+const ROOT = 'dddddddd-0000-4000-8000-00000001c431';
 const kit = {
   id: KIT, version: 3 as const, name: 'Kit', rootLocalId: 1,
   entities: [
@@ -52,11 +56,15 @@ function instanceIn(scene: string): string {
   setPrefabSource(root, { id: KIT });
   const ea = getTraitByName('EntityAttributes')!;
   for (const e of getAllEntities()) writeTraitField(e.id, ea, 'sourceScene', scene);
+  // Placed as a drop places it (#2001 S8b), under a durable root guid: its members' derived guids and the door's record.
+  writeTraitField(root, ea, 'guid', ROOT);
+  deriveInstanceMemberGuids(getCurrentWorld());
+  place(root);
   const slot = getAllEntities().find((e) => e.name === 'Slot')!.id;
   writeTraitField(slot, getTraitByName('Transform')!, 'x', 5);
-  markOverride(findEntity(slot)!, 'Transform', 'x');
-  writeTraitField(root, ea, 'guid', 'g-kit-root');
-  return 'g-kit-root';
+  setFields(findEntity(slot)!.id(), 'Transform', ['x']);
+  setFields(slot, 'Transform', ['x']); // through the door, as the Inspector's write goes
+  return ROOT;
 }
 
 describe('agent prefab revert on a base\'s instance (#1431)', () => {

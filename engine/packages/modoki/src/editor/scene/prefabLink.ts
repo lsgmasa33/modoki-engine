@@ -1,29 +1,27 @@
 /** The instance link: tagging a tree as an instance (Create Prefab), untagging, and Detach / Reattach.
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
-import { keptStateOf, restoreKeptState } from '../../runtime/core/ecs/keptOrphanRows';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { templateKeyOf, setTemplateKey, TemplateAddedKey } from '../../runtime/core/templateIdentity';
 import { templateKeysOf } from '../../runtime/loaders/templateKeyRecovery';
-import { endFrames, stampDerivedMemberGuids, applyGuidRemap, reloadDerivedGuids, identityTree, type DetachedMember } from '../../runtime/core/ecs/memberHome';
+import { endFrames, relinkDetachedMembers, hasOrphansOf, stampDerivedMemberGuids, applyGuidRemap, reloadDerivedGuids, identityTree, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { identitySubtree, noteFrameDoc, frameRootDoc, noteFrameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, markStructureDirty, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getGuidForPath, isGuid, resolveRef, lastKnownPathOf } from '../../runtime/loaders/assetManifest';
 import { UndoRefusedError } from '../undo/undoFailure';
+import { MOVED_MEMBER_REFUSAL_TEXT } from './restructureRefusal';
 import { rowPlaceholderOf, unresolvedRefOf, markRowPlaceholder, markUnresolved, type RowPlaceholder } from '../../runtime/core/unresolvedPrefabRef';
 import { durableGuid, isStoredRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { entityRef, type EntityRef } from '../undo/entityRef';
-import { clearOverrideMarks, restoreOverrideMarks, unmarkOverride, getStoredOverrideMarks } from '../../runtime/loaders/overrideMarks';
-import { captureMarks, restoreMarks, recordDetachedMarks, relinkDetachedMembersMarked, recordsOffBase, type MarkCapture } from '../undo/overrideMarkWrites';
 import { authoringEntitiesFor, collectTree, type PrefabFile } from './prefab';
-import { settleSwallowedKeptState } from './prefabTokens';
 import { rebaseStaleInstances } from './prefabRebuild';
 import { planMatchesFile, planMismatch, planPrefabRows } from './prefabSerialize';
 import { unkeyedNodes, stripCreatedKeys, stripKeysNow } from './capturedKeys';
-import { markStale, staleAround } from '../../runtime/prefab/instanceStore';
-import { guidOfEntity, instanceKeyMap, storedRootsAbove, storedRootsUnder } from '../instance/instanceKeys';
+import { rollBack, takeStore } from '../instance/instanceRollback';
+import { guidOfEntity, instanceKeyMap, storedRootsAbove } from '../instance/instanceKeys';
 import { recordForWrite } from '../instance/instanceSync';
+import { beginCreatePrefab, beginDetach } from '../instance/instanceEdits';
 import { serializeInstanceRecord } from '../../runtime/prefab/serializeInstanceRecord';
 import { ROOT_ROW_KEY, type InstanceRecord } from '../../runtime/prefab/instanceRecord';
 import { INSTANCE_MODEL_SCENE_VERSION } from '../../runtime/core/version';
@@ -64,7 +62,9 @@ function instanceSourceRef(source: string, doc?: Pick<PrefabFile, 'id'> | null):
  *  overrides — it is simply gone on the next load. So the plan is checked against the file and a
  *  mismatch REFUSES to tag: an untagged entity round-trips as an `added` node, which is the
  *  degradation that loses nothing. */
-function tagEntityTreeAsInstanceUnmarked(rootEcsId: number, source: string, writtenPrefab?: PrefabFile): Map<string, string> {
+// ⚠️ The tag alone keeps no instance record: Create Prefab tags through the door ({@link tagCreatedPrefab}), which states
+// the new instance's record and drops the ones it swallows (#2001 S8b).
+export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writtenPrefab?: PrefabFile): Map<string, string> {
   return tagTree(rootEcsId, source, writtenPrefab).guidRemap;
 }
 
@@ -238,7 +238,9 @@ export function rederiveUntaggedTree(rootEcsId: number, restored: ReadonlyMap<st
  *  keeps the stamp this Create Prefab wrote (its ancestor was not stripped), and one owned by an
  *  OUTER prefab is zeroed rather than returned to that prefab's row id. Both need the pre-create
  *  value, which only the snapshot has — and reattach cannot reach it once the guid re-derives. */
-function untagEntityTreeAsInstanceUnmarked(rootEcsId: number, source: string, doc?: Pick<PrefabFile, 'id'> | null): void {
+// ⚠️ Keeps no instance record: Create Prefab's undo seats the records the create replaced once the links are back
+// (`assetOps.ts`, #2001 S8b).
+export function untagEntityTreeAsInstance(rootEcsId: number, source: string, doc?: Pick<PrefabFile, 'id'> | null): void {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return;
 
@@ -293,7 +295,7 @@ function untagEntityTreeAsInstanceUnmarked(rootEcsId: number, source: string, do
  *  unrecorded, and without the record put back nothing could tell the restored frame is older than the cache.
  *  `marks`: the entity's override marks, for the same reason (#1794): the reload has nothing to mark a plain tree
  *  from, and the save keeps only marked fields, so relinked without them the instance's overrides were not saved. */
-export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: EntityRef; data: Record<string, unknown>; frame?: NonNullable<ReturnType<typeof frameRootDoc>>; marks: MarkCapture; }
+export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: EntityRef; data: Record<string, unknown>; frame?: NonNullable<ReturnType<typeof frameRootDoc>>; }
 
 /** What a detach undoes: the links it stripped off the tree, the members OUTSIDE the tree it promoted or unlinked
  *  because their frame ended with it (#1453), and the template keys it stripped (#1874) — each by the node's guid, as
@@ -303,7 +305,7 @@ export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: En
  *  reload in between, the plain node it became holds none). */
 /** `placeholders`: each Missing Prefab ROW placeholder the detach turned into a reference placeholder (#2099), with the
  *  row it stood for, so the undo makes it the row's again. */
-export interface DetachSnapshot { links: DetachedInstanceTrait[]; orphans: DetachedMember[]; keys?: { ref: EntityRef; key: string; marks?: MarkCapture }[]; placeholders?: { ref: EntityRef; row: RowPlaceholder }[]; }
+export interface DetachSnapshot { links: DetachedInstanceTrait[]; orphans: DetachedMember[]; keys?: { ref: EntityRef; key: string }[]; placeholders?: { ref: EntityRef; row: RowPlaceholder }[]; }
 
 /**
  * The reference a Missing Prefab ROW placeholder keeps once its instance is detached (#2099; owner 2026-10-03, option (a):
@@ -375,6 +377,12 @@ function detachedRowRecord(id: number, row: RowPlaceholder): Record<string, unkn
  *  the same. The strip runs `endFrames` first, as a delete does: an owned nested root moved out becomes a
  *  standalone instance, and anything else is unlinked where it stands. Left linked to a frame that no
  *  longer exists, it was written nowhere and vanished on reload (#1453). Those go in `orphans`. */
+function detachTree(rootEcsId: number, strip: boolean): ReturnType<typeof collectTree> {
+  const live = collectTree(rootEcsId, getAllEntities());
+  const own = strip ? new Set(identitySubtree(getCurrentWorld(), [rootEcsId])) : null;
+  return own ? live.filter((e) => own.has(e.id)) : live;
+}
+
 function detachPrefabInstanceUnmarked(rootEcsId: number, opts?: { strip?: boolean }): DetachSnapshot {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return { links: [], orphans: [] };
@@ -383,9 +391,7 @@ function detachPrefabInstanceUnmarked(rootEcsId: number, opts?: { strip?: boolea
   // (#1437) is that frame's, and stripping it unlinked it from an instance nothing detached. The walk only answers
   // which entities; that every nested frame among them is stripped too is this function's policy (Unpack Completely,
   // U17), not the walk's. A snapshot-only caller keeps the live tree: it is about to overwrite every link in it.
-  const live = collectTree(rootEcsId, getAllEntities());
-  const own = strip ? new Set(identitySubtree(getCurrentWorld(), [rootEcsId])) : null;
-  const tree = own ? live.filter((e) => own.has(e.id)) : live;
+  const tree = detachTree(rootEcsId, strip);
   const snapshot: DetachedInstanceTrait[] = [];
   for (const info of tree) {
     const entity = findEntity(info.id);
@@ -398,11 +404,11 @@ function detachPrefabInstanceUnmarked(rootEcsId: number, opts?: { strip?: boolea
     snapshot.push({
       ...(frame ? { frame } : {}),
       id: info.id, ref: entityRef(info.id), rootRef: entityRef(pi.rootInstanceId as number),
-      data: { ...pi }, marks: captureMarks(info.id),
+      data: { ...pi },
     });
   }
   let orphans: DetachedMember[] = [];
-  const keys: { ref: EntityRef; key: string; marks?: MarkCapture }[] = [];
+  const keys: { ref: EntityRef; key: string }[] = [];
   const placeholders: { ref: EntityRef; row: RowPlaceholder }[] = [];
   if (strip) {
     // A missing nested row's placeholder keeps its reference (#2099), read while its instance's keys still stand.
@@ -410,7 +416,7 @@ function detachPrefabInstanceUnmarked(rootEcsId: number, opts?: { strip?: boolea
       const row = rowPlaceholderOf(findEntity(info.id) as never);
       return row ? [{ id: info.id, row, record: detachedRowRecord(info.id, row) }] : [];
     });
-    orphans = recordDetachedMarks(endFrames(new Set(snapshot.map((s) => s.id)))); // BEFORE the strip: the owner walk reads these links
+    orphans = endFrames(new Set(snapshot.map((s) => s.id))); // BEFORE the strip: the owner walk reads these links
     for (const s of snapshot) findEntity(s.id)?.remove(PrefabInstanceMeta.trait);
     // …and every TEMPLATE KEY in the tree (#1874): the key is template identity too, on a node the template added — a plain
     // one carries no link, so the strip above never visits it. Left on, the unpacked node read as its template's node
@@ -424,7 +430,7 @@ function detachPrefabInstanceUnmarked(rootEcsId: number, opts?: { strip?: boolea
       const e = findEntity(info.id);
       const key = templateKeyOf(e);
       if (!e || !key) continue;
-      keys.push({ ref: entityRef(info.id), key, marks: captureMarks(info.id) });
+      keys.push({ ref: entityRef(info.id), key });
       e.remove(TemplateAddedKey);
     }
     for (const { id, row, record } of kept) {
@@ -438,7 +444,9 @@ function detachPrefabInstanceUnmarked(rootEcsId: number, opts?: { strip?: boolea
 
 /** Inverse of detachPrefabInstance — re-add the captured PrefabInstance traits
  *  (undo of a detach), and relink the members outside the tree it promoted or unlinked (#1453). */
-function reattachPrefabInstanceUnmarked(
+// ⚠️ Keeps no instance record: its callers seat the records the links belong with (Create Prefab's undo, Detach's
+// undo through the door) or mark them (Detach's undo off it, below).
+export function reattachPrefabInstance(
   detached: DetachSnapshot,
   /** The subtree undo is restoring. Given, an unresolved ref is only counted as LOST once the link
    *  is confirmed absent from the world. Omit it and every unresolved ref counts, which is right
@@ -457,15 +465,14 @@ function reattachPrefabInstanceUnmarked(
   // The template keys the detach stripped (#1874), before the links: a rebase after this reads a node's key to know it for
   // the template's. One whose node no longer resolves counts with the links below.
   let missedKeys = 0;
-  for (const { ref, key, marks } of keys) {
+  for (const { ref, key } of keys) {
     const live = ref.resolve();
     const entity = live == null ? undefined : findEntity(live);
     if (!entity) { missedKeys++; continue; }
     setTemplateKey(entity, key);
-    if (marks) restoreMarks(entity.id(), marks);
   }
   // Orphans first: relinking reverses a promotion's member rename, and the refs below resolve by guid.
-  relinkDetachedMembersMarked(orphans);
+  relinkDetachedMembers(orphans);
   const unresolvedEntries: DetachedInstanceTrait[] = [];
   for (const entry of snapshot) {
     const live = entry.ref.resolve();
@@ -480,8 +487,6 @@ function reattachPrefabInstanceUnmarked(
     const restored = { ...entry.data, rootInstanceId: root };
     if (entity.has(PrefabInstanceMeta.trait)) entity.set(PrefabInstanceMeta.trait, restored);
     else entity.add(PrefabInstanceMeta.trait(restored));
-    // Its marks with its links, before any rebase reads them through the save's gate (#1794).
-    restoreMarks(entity.id(), entry.marks);
     // The frame's record goes back with its links (#1665 close-out): the restored localIds index the document the
     // snapshot recorded, so any other record is wrong for them — none after a plain reload, another prefab's after a
     // retag, or the SAME prefab's newer document after Create Prefab's Replace (re-review: kept, it read v1 links
@@ -521,11 +526,16 @@ function reattachPrefabInstanceUnmarked(
  *  whose prefab still EXISTS is #1272's own case — a held nested frame whose guid a reload re-derived keeps its link on
  *  the entity that holds it now — and is not refused. Unity refuses an undo before it changes anything, and brings no
  *  deleted asset back. Detach's undo asks the stricter {@link requireDetachedLinks}-style question first (every entity
- *  live and plain), since a detach stripped every link it will put back. `what` names the step. */
-export async function requireLinks(detached: DetachSnapshot, what: string): Promise<void> {
+ *  live and plain), since a detach stripped every link it will put back. `what` names the step.
+ *
+ *  `everyLink`: ask of every link, resolved or not — Detach's undo (#2001 S8b, hunt seed 8032). Its entities stay live
+ *  and plain through a trash of their prefab, so every link resolves, and the undo put `PrefabInstance` back on them: an
+ *  instance of a prefab that does not load, not a Missing Prefab placeholder. Its records were seated back with it, so a
+ *  later Apply's undo took that tree as projectable and threw rebuilding it from a document nobody could read. */
+export async function requireLinks(detached: DetachSnapshot, what: string, opts: { everyLink?: boolean } = {}): Promise<void> {
   const unresolved = new Map<string, number>();
   for (const l of detached.links) {
-    const id = l.ref.resolve();
+    const id = opts.everyLink ? null : l.ref.resolve();
     // The entity resolves but is a Missing Prefab placeholder now (a reload since: rule 9, rulings B and D — #2001 S5): it
     // holds no frame, so its link cannot be put back either.
     const placeholder = id != null && (unresolvedRefOf(findEntity(id)) || rowPlaceholderOf(findEntity(id) as never));
@@ -552,11 +562,19 @@ export async function requireLinks(detached: DetachSnapshot, what: string): Prom
  *  change while it is detached — in practice across a world reload (a prefab-edit save and Exit, an external write),
  *  which also leaves the tree plain and unrecorded. Left so, the next save captured a member the template had gained
  *  as REMOVED by this instance (#1665's sibling, observed). The reattach puts each frame's record back from the
- *  snapshot, so the rebase sees it. Returns the unresolved count, as the reattach. */
-async function reattachDetachedInstanceUnmarked(detached: DetachSnapshot): Promise<number> {
+ *  snapshot, so the rebase sees it.
+ *
+ *  On records (#2001 S8b): the links go back, then `seat` puts the records the
+ *  Detach dropped back exactly, BEFORE the rebase, which brings a tree whose template changed meanwhile onto it from them.
+ *  A link it could not put back would leave the tree unlike the records: it THROWS, and the undo step rolls back
+ *  (`undoManager.ts`). Its caller refuses every ref that does not resolve first (`requireDetachedLinks`), so this is a
+ *  route that check does not see, and it is loud. */
+async function reattachDetachedInstanceSeating(detached: DetachSnapshot, seat: () => void): Promise<number> {
   const unresolved = reattachPrefabInstance(detached);
+  if (unresolved) throw new Error(`Detach's undo could not put back ${unresolved} prefab link(s) or template key(s), so the records it would seat do not state the tree`);
+  seat();
   await rebaseStaleInstances();
-  return unresolved;
+  return 0;
 }
 
 /** Create Prefab's tag (#1790, owner ruling D), for both callers: `tagEntityTreeAsInstance`, then the scene half of the
@@ -578,12 +596,6 @@ async function reattachDetachedInstanceUnmarked(detached: DetachSnapshot): Promi
  *    template, say). The caller refuses the step; nothing was written. Without it the tag logged, left the tree unlinked,
  *    and the step reported success.
  *
- *  It also clears the override marks on every entity it links, and its undo puts them back: the tree is written as it
- *  stands, so nothing in it overrides the document just written from it (Unity: a prefab made from an unpacked object
- *  has no overrides). The entities it does not write — a nested frame's members, a stamped nested root, a plain node a
- *  layer added — lose each record the new document's rows now carry (`clearCarriedRecords`, #1932). A Detach leaves its marks on the plain tree until a reload, and linked with them they were saved
- *  as overrides equal to the template's values, which pinned them against every later edit of the prefab.
- *
  *  And its undo takes off every template key the create put on (#1884): a node that had none before it (`unkeyed`) and
  *  has one now. The CAPTURE stamps them, not this tag — `serializePrefab` writes a scene-added node under a nested
  *  instance as that row's added node, and keys it (`addedNodeIdentity`) — so the caller passes the tree's unkeyed nodes
@@ -604,8 +616,6 @@ function tagCreatedPrefabUnmarked(
   const redo = opts?.keys;
   const unkeyed = opts?.unkeyed ?? unkeyedNodes(rootEcsId);
   if (redo) seatTemplateKeys(rootEcsId, redo);
-  const piMeta = getTraitByName('PrefabInstance');
-  const before = piMeta ? (readTraitData(rootEcsId, piMeta) as { source?: string } | null)?.source : undefined;
   // Taken without stripping (#1278), before the tag, then kept to what the tag wrote (`writes`).
   const snapshot = detachPrefabInstanceUnmarked(rootEcsId, { strip: false });
   const { guidRemap, writes, refused } = tagTree(rootEcsId, source, writtenPrefab, { refuseQuietly: !!redo, onLinked: opts?.onLinked });
@@ -617,70 +627,10 @@ function tagCreatedPrefabUnmarked(
     links: snapshot.links.filter((l) => writes.has(l.id)).map(({ frame, ...l }) => (writes.get(l.id) === 'link' && frame ? { ...l, frame } : l)),
     orphans: snapshot.orphans,
   };
-  const undoMarks = clearLinkedMarks(rootEcsId, writes, [...unkeyed].filter((id) => templateKeyOf(findEntity(id))));
-  const undoUnpack = dropUnpackedRootKeptState(rootEcsId, before, writtenPrefab);
-  const undoSettle = settleSwallowedKeptState(rootEcsId);
   const undoKeys = stripCreatedKeys(unkeyed);
   return {
-    guidRemap, undoKept: () => { undoSettle(); undoUnpack(); undoMarks(); undoKeys(); }, priorLinks,
+    guidRemap, undoKept: undoKeys, priorLinks,
     keys: writtenKeys(rootEcsId, guidRemap, writtenPrefab),
-  };
-}
-
-/** Clear the override marks of every entity the tag linked, and return their undo. Addressed by the guid each holds AFTER
- *  the stamp, which is the one it holds when the undo runs: `undoKept` runs before the rename is reversed. The marks
- *  alone, not `restoreMarks`: that one also brings the unmarked fields onto the template (#1800), and neither half of
- *  the tag changes a value.
- *
- *  A STAMPED nested reference root, and a node the create KEYED (a scene-added node under a nested instance, which the
- *  capture wrote as that row's added node: `keyed`), lose the sibling order here: the new template states the node's
- *  place now, so a reload reads no record of it. Their other records, and every nested member's, are then taken by
- *  `clearCarriedRecords` where the new document gives their value (#1932 R4-L1 finding 1). A scene-added reference node's root records that order
- *  always (F7, #1914 R6), so every one carried the mark into the copy (hunt seed 3297); a reorder made before the create
- *  did the same before F7. */
-function clearLinkedMarks(rootEcsId: number, writes: TagWrites, keyed: readonly number[]): () => void {
-  const held = [...writes].filter(([, w]) => w === 'link').map(([id]) => ({ id, marks: captureMarks(id).keys }))
-    .filter((h) => h.marks.length).map(({ id, marks }) => ({ ref: entityRef(id), marks }));
-  const handle = (ref: EntityRef) => { const id = ref.resolve(); return id == null ? null : findEntity(id); };
-  const ordered = [...new Set([...[...writes].filter(([, w]) => w === 'stamp').map(([id]) => id), ...keyed])]
-    .filter((id) => { const e = findEntity(id); return !!e && !!getStoredOverrideMarks(e)?.has('EntityAttributes.sortOrder'); })
-    .map((id) => entityRef(id));
-  for (const h of held) { const e = handle(h.ref); if (e) clearOverrideMarks(e); }
-  for (const ref of ordered) { const e = handle(ref); if (e) unmarkOverride(e, 'EntityAttributes', 'sortOrder'); }
-  const undoCarried = clearCarriedRecords(rootEcsId, writes);
-  return () => {
-    undoCarried();
-    for (const h of held) { const e = handle(h.ref); if (e) { clearOverrideMarks(e); restoreOverrideMarks(e, h.marks); } }
-    for (const ref of ordered) { const e = handle(ref); if (e) restoreOverrideMarks(e, ['EntityAttributes.sortOrder']); }
-  };
-}
-
-/** The records the NEW document now carries, off every entity of the tree the tag did not relink — a nested frame's
- *  members, a stamped nested root, a plain node a layer added (#1932, R4-L1 finding 1) — and their undo. The capture
- *  wrote each of those records into the new document's rows, so what the scene instance stated is now its prefab's
- *  statement, and Unity's connected instance starts with an EMPTY modification list (`SaveAsPrefabAssetAndConnect`, which
- *  the outermost instance owns). Left on, the scene restated every one of them on save, and a later edit of the new
- *  prefab's nested copy never reached the instance (#1914 R3 removed the save's depth ≥ 2 subtraction, which had dropped
- *  them as equal to the row, and gave Create nothing in its place).
- *
- *  Per record: one whose live value still DIFFERS from the base the new document gives (`recordsOffBase`) did not reach a
- *  row, so it stays the scene's — kept, never dropped. An entity whose base cannot be read keeps every record. The undo
- *  puts each entity's STORED set back exactly. */
-function clearCarriedRecords(rootEcsId: number, writes: TagWrites): () => void {
-  const changed: { ref: EntityRef; marks: string[] }[] = [];
-  for (const info of collectTree(rootEcsId, getAllEntities())) {
-    if (info.id === rootEcsId || writes.get(info.id) === 'link') continue;
-    const e = findEntity(info.id);
-    const marks = e ? [...(getStoredOverrideMarks(e) ?? [])] : [];
-    if (!e || !marks.length) continue;
-    const off = recordsOffBase(info.id);
-    if (!off || marks.every((k) => off.has(k))) continue;
-    changed.push({ ref: entityRef(info.id), marks });
-    clearOverrideMarks(e);
-    restoreOverrideMarks(e, marks.filter((k) => off.has(k)));
-  }
-  return () => {
-    for (const c of changed) { const id = c.ref.resolve(); const e = id == null ? null : findEntity(id); if (e) { clearOverrideMarks(e); restoreOverrideMarks(e, c.marks); } }
   };
 }
 
@@ -713,62 +663,82 @@ function seatTemplateKeys(rootEcsId: number, keys: ReadonlyMap<string, string>):
   }
 }
 
-/** Create Prefab from an instance ROOT unpacks it (#1814, hub ruling under "prefab behaviour copies Unity"): the root was an
- *  instance of another prefab and is now the root of an original, so what R2 kept for its OWN old frame — orphan member
- *  rows, legacy channels, all in the old prefab's identity space — names nothing the new prefab has, and never can. Unity
- *  drops an unpacked instance's unused overrides; so does this. Not owner ruling D (#1790), which bakes the unused overrides
- *  of the roots the new instance SWALLOWS: those stay nested. Run after the tag and before the settle, which then moves the
- *  swallowed roots' identity rows onto a clean root. Left alone: a root that was no instance (`before` empty), a Replace of
- *  the root's OWN prefab (still an instance of the same document — nothing was unpacked, and Unity keeps a connected
- *  instance's unused overrides), and a tag that refused (the root is still linked to the old prefab). By document id
- *  (`instanceSourceRef`, #1807), not a path through the manifest. Returns the undo. */
-function dropUnpackedRootKeptState(rootId: number, before: string | undefined, writtenPrefab: PrefabFile): () => void {
-  const piMeta = getTraitByName('PrefabInstance');
-  const eaMeta = getTraitByName('EntityAttributes');
-  if (!before || !piMeta || !eaMeta) return () => {};
-  const now = (readTraitData(rootId, piMeta) as { source?: string } | null)?.source;
-  const written = instanceSourceRef('', writtenPrefab);
-  if (!now || instanceSourceRef(now) !== written || instanceSourceRef(before) === written) return () => {};
-  const rootGuid = durableGuid((readTraitData(rootId, eaMeta) as { guid?: string } | null)?.guid);
-  const kept = rootGuid ? keptStateOf(rootGuid) : undefined;
-  if (!kept) return () => {};
-  restoreKeptState(rootGuid, {});
-  return () => restoreKeptState(rootGuid, kept);
+/** Why a Detach of `rootEcsId` is refused before it unpacks anything: the records of its tree cannot be had (#2001 S8b). */
+export function detachRecordsRefusal(rootEcsId: number): UndoRefusedError {
+  const name = getAllEntities().find((e) => e.id === rootEcsId)?.name ?? 'the instance';
+  return new UndoRefusedError(
+    `"${name}" was not detached: the records of its prefab instances could not be read, so nothing was changed. Save the scene, reopen it, and detach again.`,
+    `"${name}" was not detached — its prefab records could not be read`,
+  );
 }
 
-/** The records an op on the tree at `rootEcsId` reaches: every record-owning root above it, at it and under it. */
-function treeRootGuids(rootEcsId: number | undefined): string[] {
-  if (rootEcsId == null || !findEntity(rootEcsId)) return [];
-  return [...storedRootsAbove(rootEcsId), ...storedRootsUnder(rootEcsId)].map(guidOfEntity).filter(Boolean);
+/** Why a Detach of `rootEcsId` is refused before it unpacks anything: its frames hold a member an older version moved out
+ *  of the instance (#2001 S8b, owner ruling 2026-10-04, superseding the 2026-09-19 unpack for that state): the unpack
+ *  would promote or unlink it where it stands, which the records cannot follow. */
+export function detachMovedMemberRefusal(rootEcsId: number): UndoRefusedError {
+  const name = getAllEntities().find((e) => e.id === rootEcsId)?.name ?? 'the instance';
+  return new UndoRefusedError(`"${name}" was not detached: ${MOVED_MEMBER_REFUSAL_TEXT}`, `"${name}" was not detached — an older version moved a member out of it`);
 }
 
-/**
- * #2046 S7.5: mark stale, before the op and after it, only the records of the tree it acts on ({@link treeRootGuids}, read
- * both times: the op can make the root a stored root, or unmake it) and every guid it renames, old and new — not the whole
- * store. Every other tree keeps its exact list (rule 8), and a fan-out inside the op (a Replace's rebase) reprojects that
- * tree from it (rule 7). Without a root (`rootOf` gives none) the whole store, as `staleAround`.
- */
-function staleTreeAround<A extends unknown[], R>(by: string, fn: (...args: A) => R, rootOf: (...args: NoInfer<A>) => number | undefined,
-  renamed: (out: NoInfer<R>) => ReadonlyMap<string, string> | undefined = () => undefined): (...args: A) => R {
-  return (...args: A): R => {
-    const root = rootOf(...args);
-    if (root == null) return staleAround(by, fn)(...args);
-    const before = treeRootGuids(root);
-    markStale(getCurrentWorld(), by, before);
-    let out: R;
-    try { out = fn(...args); } catch (err) { markStale(getCurrentWorld(), by, [...before, ...treeRootGuids(root)]); throw err; }
-    const names = renamed(out);
-    markStale(getCurrentWorld(), by, [...before, ...treeRootGuids(root), ...(names ? [...names.keys(), ...names.values()] : [])]);
-    return out;
-  };
+/** Detach (Unpack Completely) of instance root `rootEcsId`, through the door (#2001 S8b, `beginDetach`): the records of
+ *  the instances it unpacks go, and every other record stays exact. Refused before anything is unpacked when its frames
+ *  hold a member an older version moved out of the instance ({@link detachMovedMemberRefusal}) or when the tree's records
+ *  cannot be had ({@link detachRecordsRefusal}); one whose unpack the records cannot state (a placeholder it left whose
+ *  record cannot be read) is taken back out and refused the same way. `strip: false` (a snapshot that leaves the tree
+ *  linked) changes nothing, so every record stays as it is. */
+export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean }): DetachSnapshot {
+  if (opts?.strip === false) return detachPrefabInstanceUnmarked(rootEcsId, opts);
+  const pi = getTraitByName('PrefabInstance');
+  if (pi && hasOrphansOf(new Set(detachTree(rootEcsId, true).filter((e) => findEntity(e.id)?.has(pi.trait)).map((e) => e.id)))) {
+    throw detachMovedMemberRefusal(rootEcsId);
+  }
+  const taken = takeStore();
+  const commit = beginDetach(rootEcsId);
+  if (!commit) throw detachRecordsRefusal(rootEcsId);
+  let out: DetachSnapshot;
+  try { out = detachPrefabInstanceUnmarked(rootEcsId, opts); } catch (err) { rollBack(taken, 'Detach', err); throw err; }
+  const kept = commit(out);
+  if (kept === true) return out;
+  // The records cannot state what the unpack left: it is taken back out, as the step's undo takes it, and the store put
+  // back, each tree rebuilt from it.
+  try { reattachPrefabInstance(out); } finally { rollBack(taken, 'Detach', new Error(`the unpack was taken back out: ${kept}`)); }
+  throw detachRecordsRefusal(rootEcsId);
 }
 
-// #2001 S4 (#2014): detach does not maintain the instance list yet, so it marks the store stale once it finishes —
-// wrapped here, at the export, so no return path can skip it (`instanceStore.ts`). Create Prefab's tag and untag, and the
-// relink its undo makes, mark the tree they act on only (#2046 S7.5).
-export const detachPrefabInstance = staleAround('detach', detachPrefabInstanceUnmarked);
-export const reattachPrefabInstance = staleTreeAround('detach', reattachPrefabInstanceUnmarked, (...a) => a[1]?.rootEcsId);
-export const reattachDetachedInstance = staleAround('detach', reattachDetachedInstanceUnmarked);
-export const tagCreatedPrefab = staleTreeAround('createPrefab', tagCreatedPrefabUnmarked, (...a) => a[0], (out) => out.guidRemap);
-export const tagEntityTreeAsInstance = staleTreeAround('createPrefab', tagEntityTreeAsInstanceUnmarked, (...a) => a[0], (out) => out);
-export const untagEntityTreeAsInstance = staleTreeAround('createPrefab', untagEntityTreeAsInstanceUnmarked, (...a) => a[0]);
+/** Detach's undo: `seat` puts back the records the Detach dropped ({@link reattachDetachedInstanceSeating}). */
+export function reattachDetachedInstance(detached: DetachSnapshot, seat: () => void): Promise<number> {
+  return reattachDetachedInstanceSeating(detached, seat);
+}
+/** Create Prefab's tag through the door (#2001 S8b, `beginCreatePrefab`): the tree's new record states its members'
+ *  identity and links the scene's own nodes, and the records of the instances it swallowed go — or it does not tag.
+ *  `refused`, with nothing changed: the records of the trees it touches cannot be had (asked before the tag), or the new
+ *  record cannot state the tree it linked (asked after it: the tag is taken back out, as the step's undo takes it, and the
+ *  store put back). A tag that lands nothing (a plan that no longer matches the file) changed no record. Never a stale
+ *  mark: every record is exact after it. */
+export function tagCreatedPrefab(...args: Parameters<typeof tagCreatedPrefabUnmarked>): ReturnType<typeof tagCreatedPrefabUnmarked> {
+  const [root, source, doc] = args;
+  const nothing = (refused: string) => ({ guidRemap: new Map<string, string>(), undoKept: () => {}, priorLinks: { links: [], orphans: [] }, keys: new Map<string, string>(), refused });
+  const taken = takeStore();
+  const commit = beginCreatePrefab(root);
+  if (!commit) return nothing('the records of the prefab instances in it could not be read');
+  let out: ReturnType<typeof tagCreatedPrefabUnmarked>;
+  try { out = tagCreatedPrefabUnmarked(...args); } catch (err) { rollBack(taken, 'Create Prefab', err); throw err; }
+  // Linked only when the tree IS an instance of the written document now: a tag can land nothing without refusing.
+  const pi = getTraitByName('PrefabInstance');
+  const now = pi ? (readTraitData(root, pi) as { source?: string } | null)?.source : undefined;
+  const linked = !out.refused && !!now && instanceSourceRef(now) === instanceSourceRef('', doc);
+  const kept = commit(linked, out.guidRemap);
+  if (kept === true) return out;
+  // Taken back out in the undo's order (`assetOps.ts`): the kept state, the rename, the links, the derived guids — then
+  // the records as they stood, each tree rebuilt from them.
+  try {
+    out.undoKept();
+    unstampMemberGuids(out.guidRemap);
+    untagEntityTreeAsInstance(root, source, doc);
+    reattachPrefabInstance(out.priorLinks, { rootEcsId: root });
+    rederiveUntaggedTree(root, out.guidRemap);
+  } finally {
+    rollBack(taken, 'Create Prefab', new Error(`the tag was taken back out: ${kept}`));
+  }
+  return nothing(kept);
+}

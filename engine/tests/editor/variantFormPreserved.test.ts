@@ -20,7 +20,6 @@ import {
   getCurrentWorld, setCurrentWorld, getTraitByName, setRunMode, loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -48,7 +47,6 @@ async function load(data: SceneData): Promise<void> {
   const prev = getCurrentWorld();
   setCurrentWorld(createWorld());
   prev?.destroy();
-  clearKeptMemberOrphans();
   const eaMeta = getTraitByName('EntityAttributes')!;
   await loadSceneFile(JSON.parse(JSON.stringify(data)) as SceneData, {
     loadModels: false,

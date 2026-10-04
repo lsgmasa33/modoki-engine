@@ -18,6 +18,7 @@ import { documentContentKey } from '../../runtime/core/localIdCounter';
 import { levelDoc, captureDoc } from './prefabBase';
 import { type PrefabEntity, type PrefabFile } from './prefab';
 import { getCachedPrefabSync, getPrefabSource, prefabCache } from './prefabCache';
+import { getCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
 import { foreignRow, type RowDoc, rowsMeanTheSame, unexpandedRowsOf } from './prefabMembers';
 
 /** A frame {@link rebuildTeardown} KEEPS because its prefab cannot be expanded (#1862): `owned` for a template row's frame,
@@ -467,4 +468,25 @@ export function staleFramesInTreeRefusal(rootId: number): string | null {
   if (!stale.length) return null;
   return `a prefab instance in the selection was built from a different version of ${stale.map((s) => `"${(isGuid(s) ? resolveRef(s) : undefined) ?? s}"`).join(', ')} ` +
     'than the editor now holds, so its members would be matched with the wrong rows of that prefab';
+}
+
+/** The refusal Create Prefab gives a tree holding a live instance whose prefab the editor no longer holds (#2001 S8b), or
+ *  null: one expanded from a prefab that went away since (trashed or evicted mid-session, not yet reloaded as a Missing
+ *  Prefab). The save writes such a frame from its frame record (#1738), but the new prefab names it as a nested row, and the
+ *  instance record the tag states folds that row from the prefab: a placeholder, not the members the tree holds. So the
+ *  record could not state the tree it was made from, and Create Prefab keeps the records exact or does not run.
+ *  ⚠️ Asked AFTER the caller's nested warm, like {@link staleFramesInTreeRefusal}: only a key still cold after it is a
+ *  prefab that cannot be read. A Missing Prefab placeholder is the caller's own refusal (`missingPrefabPlaceholders`). */
+export function unreadFramesInTreeRefusal(rootId: number): string | null {
+  const piMeta = getTraitByName('PrefabInstance'), eaMeta = getTraitByName('EntityAttributes');
+  if (!piMeta || !eaMeta) return null;
+  for (const id of subtreeIds(getAllEntities(), rootId)) {
+    const pi = readTraitData(id, piMeta) as { source?: string; rootInstanceId?: number } | null;
+    if (!pi?.source || pi.rootInstanceId !== id || unresolvedRefOf(findEntity(id))) continue;
+    if (getCachedPrefab(pi.source) || getCachedPrefabSync(pi.source)) continue;
+    const name = (readTraitData(id, eaMeta) as { name?: string } | null)?.name ?? 'an instance';
+    const at = (isGuid(pi.source) ? resolveRef(pi.source) ?? lastKnownPathOf(pi.source) : undefined) ?? pi.source;
+    return `"${name}" is an instance of ${at}, which the editor can no longer read, so it cannot be written into a template until that prefab resolves`;
+  }
+  return null;
 }

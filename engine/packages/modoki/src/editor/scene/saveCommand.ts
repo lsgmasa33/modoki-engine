@@ -442,6 +442,10 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
       : whyBlocked(o.mode);
     return { text: `${savedPart || 'The scene was not saved: '}${why}${failSuffix}`, kind: 'warn' };
   }
+  if (r.reason === 'unsavable') {
+    // A mark only a reload clears (#2001 S8b review L2): Stop or a retry, the run-mode advice, does nothing here.
+    return { text: `${savedPart || 'The scene was not saved: '}${r.error ?? 'the world cannot be saved'}${failSuffix}`, kind: 'warn' };
+  }
   if (r.reason === 'switching') {
     // Refused, not queued (#1750; owner, 2026-09-28): the outgoing scene was already saved or discarded when the switch
     // was chosen, so nothing is lost by pressing it again.

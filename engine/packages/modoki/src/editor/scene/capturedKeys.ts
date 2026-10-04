@@ -34,7 +34,7 @@ export function stripKeysNow(ids: Iterable<number>): void {
 
 /** The undo of the keys a landed capture put on: of `unkeyed`, the nodes that carry one now. Addressed by the guid each
  *  holds NOW — after Create's tag has stamped the member guids, the one each holds when its `undoKept` runs (before the
- *  rename is reversed), as `clearLinkedMarks`. Taken by a step that LANDED, which may write identity: the ref must find
+ *  rename is reversed). Taken by a step that LANDED, which may write identity: the ref must find
  *  its node after a world rebuild (Play→Stop), so a node with no guid gets one (`entityRef`). An exit that lands
  *  nothing strips at once instead (`stripKeysNow`). */
 export function stripCreatedKeys(unkeyed: ReadonlySet<number>): () => void {

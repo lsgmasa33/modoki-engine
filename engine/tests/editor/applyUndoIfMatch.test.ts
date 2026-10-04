@@ -114,6 +114,8 @@ import { undo, redo, peekUndo, canRedo, swapHistory, _resetHistoryContexts, getE
 import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { clearDirtyAssets, peekDirtyAsset, flushDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
+import { place as seatInstance } from '../../packages/modoki/src/editor/instance/instanceEdits';
+import { deriveInstanceMemberGuids } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -217,6 +219,7 @@ beforeEach(() => {
   const eaMeta = getTraitByName('EntityAttributes')!;
   const id = instantiatePrefabIntoWorld(getCurrentWorld(), pDoc() as never, 0, undefined, P);
   for (const e of getCurrentWorld().entities) if (e.id() === id) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), guid: ROOT });
+  deriveInstanceMemberGuids(getCurrentWorld()); seatInstance(id!); // placed as a drop places it (#2001 S8b)
 });
 
 /** What is parked for P (#1868): the document Save will write, or null. */

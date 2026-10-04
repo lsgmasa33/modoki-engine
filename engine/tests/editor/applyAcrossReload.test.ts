@@ -139,9 +139,12 @@ const pDoc = () => ({ id: P, version: 6, name: 'P', rootLocalId: 1, entities: [r
 const install = (doc: { id: string }) => { prefabs.set(doc.id, doc); setPrefabCache(doc.id, doc as never); };
 const inst = (id: number, guid: string, name: string, x: number) =>
   ({ id, prefab: P, guid, traits: { EntityAttributes: { name, parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } }, overrides: { 2: { Transform: { x } } } });
+/** The scene files below state their instances in the form before v20 (`overrides` by localId, `added`), so they say so:
+ *  read as v20, the load's records state none of it (#2001 S8b: the records are the load's, not a capture's). */
+const LEGACY_FORM = SCENE_FORMAT_VERSION - 1;
 /** IA sets A.x = 5, IB sets A.x = 9; `order` is the order the FILE lists them. */
 const scene = (order: 'AB' | 'BA'): SceneData => ({
-  id: 'h1750', version: SCENE_FORMAT_VERSION, name: 'S', resources: [],
+  id: 'h1750', version: 19, name: 'S', resources: [],
   entities: order === 'AB' ? [inst(1, ROOT_A, 'IA', 5), inst(2, ROOT_B, 'IB', 9)] : [inst(1, ROOT_B, 'IB', 9), inst(2, ROOT_A, 'IA', 5)],
 } as unknown as SceneData);
 
@@ -181,7 +184,8 @@ const rootIdOf = (guid: string) => all().find((e) => e.guid === guid)!.id;
 const guidOfId = (id: number) => all().find((e) => e.id === id)?.guid;
 const diskAx = () => ((JSON.parse(fs.disk.get(P)!) as PrefabFile).entities.find((e) => e.name === 'A')!.traits.Transform as { x: number }).x;
 const postsTo = (guid: string) => fs.posts.filter((p) => p.path.includes(guid));
-const keyOf = (rootId: number) => collectInstanceOverrideKeys(rootId, getCachedPrefabSync(P) as PrefabFile).fields.find((k) => k.endsWith('.Transform.x'))!;
+/** A.x's key: the root's own Transform, which the file states too, is an override of its own. */
+const keyOf = (rootId: number) => collectInstanceOverrideKeys(rootId, getCachedPrefabSync(P) as PrefabFile).fields.find((k) => k === `${G(2)}.Transform.x`)!;
 const quietly = async <T,>(fn: () => Promise<T>): Promise<T> => {
   const spies = (['log', 'warn', 'info', 'error'] as const).map((k) => vi.spyOn(console, k).mockImplementation(() => {}));
   try { return await fn(); } finally { for (const s of spies) s.mockRestore(); }
@@ -259,7 +263,7 @@ const sceneQ = (order: 'AB' | 'BA'): SceneData => {
   const ib = { ...inst(0, ROOT_B, 'IB', 9), added: [{ parentLocalId: 1, key: KQ, guid: G(950), name: 'QRef', prefab: Q, traits: { EntityAttributes: { name: 'QRef' }, Transform: { x: 0, y: 0, z: 0 } }, children: [] }] };
   const ia = inst(0, ROOT_A, 'IA', 5);
   const list = order === 'AB' ? [ia, ib] : [ib, ia];
-  return { id: 'f5', version: SCENE_FORMAT_VERSION, name: 'S', resources: [], entities: list.map((e, i) => ({ ...e, id: i + 1 })) } as unknown as SceneData;
+  return { id: 'f5', version: LEGACY_FORM, name: 'S', resources: [], entities: list.map((e, i) => ({ ...e, id: i + 1 })) } as unknown as SceneData;
 };
 
 describe('#1750 H1, window 2: nothing pending at the click; the reload lands while `sceneBefore` fetches a cold prefab', () => {
@@ -414,7 +418,7 @@ describe('#1750 close-out re-review: an unrelated Apply during an Apply undo doe
     fs.disk.set(P2, jsonFileBody(p2Doc()));
     const ROOT_C = G(903);
     await loadAdopted({
-      id: 'u1750', version: SCENE_FORMAT_VERSION, name: 'S', resources: [],
+      id: 'u1750', version: LEGACY_FORM, name: 'S', resources: [],
       entities: [inst(1, ROOT_A, 'IA', 5), { id: 2, prefab: P2, guid: ROOT_C, traits: { EntityAttributes: { name: 'IC', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } }, overrides: { 2: { Transform: { x: 7 } } } }],
     } as unknown as SceneData);
     const rootA = rootIdOf(ROOT_A);
@@ -428,7 +432,7 @@ describe('#1750 close-out re-review: an unrelated Apply during an Apply undo doe
     const undoing = quietly(() => undo());
     await atWrite; // the undo's restore is in flight
     const rootC = rootIdOf(ROOT_C);
-    const keyC = collectInstanceOverrideKeys(rootC, getCachedPrefabSync(P2) as PrefabFile).fields.find((k) => k.endsWith('.Transform.x'))!;
+    const keyC = collectInstanceOverrideKeys(rootC, getCachedPrefabSync(P2) as PrefabFile).fields.find((k) => k === `${G(32)}.Transform.x`)!;
     const applyC = quietly(() => applyToPrefabWithUndo(rootC, new Set([keyC])));
     release();
     expect(await undoing, 'the undo applied').toBe(true);

@@ -291,6 +291,8 @@ describe('#1939 hunts 1031 and 3081: the editor meets a copy-restored frame by t
     // template's value, as it does with P present. (A reload shows P1's placeholder: ruling B, #2028.)
     // On member A, not the root: a v20 `/` row states the root's position, so that field is never unmarked (#2001 S6).
     // Mutation: `takeUnmarkedFromBase` reads `getCachedPrefabSync(source)` again → A keeps the undo's restored 0.
+    // The row still goes back into P1's record, which stays exact, so no record is marked stale (#2001 S8b). Mutation: mark
+    // the store stale again in `putFieldRows` when the row has no fold to show → every record reads stale 'undo'.
     const f = await startRun(be, noNest, 'lf-unmarked-from-record');
     const a = () => getAllEntities().find((e) => e.name === 'A' && piOf(e.id)?.rootInstanceId === topRoot(f, 'P').id)!;
     const y = () => readTraitData(a().id, TF())!.y as number;

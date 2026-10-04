@@ -29,12 +29,12 @@
  *
  *  - an EXCEPTION after the serialize keyed the tree (a throw right after it, before the write) takes the keys off like a
  *    refusal, and Extra keeps k-extra (`dropOnThrow`, the #1884 close-out's un-killed candidate (a)); the ACCEPT side, a
- *    throw after the tag linked the tree (in the commit's rebase), leaves Z the key the written file declares, live and
- *    reloaded (`keep()`) — with Z guid-less, the one node the snapshot still names after the tag (by identity; a guid is
- *    renamed by the tag's derivation); and so does a throw INSIDE the tag once it linked (its guid stamp, its settle),
+ *    throw after the tag linked the tree (in the commit's rebase), leaves Z the key the written file declares, live
+ *    (`keep()`; the world is then unsavable, #2001 S8b's rollback: the tag's tree has no record to be put back to) — with Z guid-less, the one node the snapshot still names after the tag (by identity; a guid is
+ *    renamed by the tag's derivation); and so does a throw INSIDE the tag once it linked (its guid stamp),
  *    which is why `keep()` runs from `tagTree`'s tag loop (`onLinked`), not after the tag. Mutations: drop `held?.drop()`
- *    in `dropOnThrow` — the first red; drop the `onLinked` call — all three accept cases red; call it after `tagTree`
- *    returns — the stamp case red; after `tagCreatedPrefab` returns — the stamp and settle cases red.
+ *    in `dropOnThrow` — the first red; drop the `onLinked` call — both accept cases red; call it after `tagTree`
+ *    returns — the stamp case red.
  *  - the strip of a Create that lands nothing writes no identity: a Z with NO durable guid keeps none (candidate (b):
  *    the strip addressed nodes by `entityRef`, which mints one). Mutation: strip through `stripCreatedKeys(ids())()` in
  *    `drop()` again — red.
@@ -54,9 +54,8 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 }));
 // A throw at two seams of the door, armed per test: right after the serialize (its inert-size warning), and after the tag
 // (the commit's rebase of the other instances).
-const thrown = vi.hoisted(() => ({ at: '' as '' | 'serialize' | 'rebase' | 'settle' | 'stamp' }));
-// …and inside the tag once it linked the tree: its guid stamp (inside `tagTree`, after its tag loop) and its kept-state
-// settle (after `tagTree`).
+const thrown = vi.hoisted(() => ({ at: '' as '' | 'serialize' | 'rebase' | 'stamp' }));
+// …and inside the tag once it linked the tree: its guid stamp (inside `tagTree`, after its tag loop).
 vi.mock('../../packages/modoki/src/runtime/core/ecs/memberHome', async (orig) => {
   const m = await orig<typeof import('../../packages/modoki/src/runtime/core/ecs/memberHome')>();
   return { ...m, stampDerivedMemberGuids: (...a: Parameters<typeof m.stampDerivedMemberGuids>) => {
@@ -71,10 +70,6 @@ vi.mock('../../packages/modoki/src/editor/scene/prefabTokens', async (orig) => {
     ...m,
     // A live binding, not the spread's frozen copy: the serialize reads it inside `withKeptStateBake`.
     get bakingKeptState() { return m.bakingKeptState; },
-    settleSwallowedKeptState: (...a: Parameters<typeof m.settleSwallowedKeptState>) => {
-      if (thrown.at === 'settle') throw new Error('threw inside the tag (armed)');
-      return m.settleSwallowedKeptState(...a);
-    },
   };
 });
 vi.mock('../../packages/modoki/src/editor/scene/prefab', async (orig) => {
@@ -108,6 +103,7 @@ import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabR
 import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { piOf } from './prefabFuzz/harness';
 import { saveScene, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
+import { isUnsavableAfterRollback } from '../../packages/modoki/src/editor/instance/instanceRollback';
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
@@ -379,11 +375,15 @@ describe("Create Prefab's undo takes off the keys the create put on (#1884)", ()
 
   // Z with no durable guid: the snapshot then names it by its identity, which the tag keeps (a node with a guid is renamed
   // by the tag's derivation, so a drop after it would not find that node anyway).
-  for (const at of ['rebase', 'settle', 'stamp'] as const) it(`a Create that throws AFTER its tag linked the tree (${at === 'rebase' ? 'in the commit\'s rebase' : `inside the tag, its ${at}`}) keeps the keys: they are the written file's (accept side)`, async () => {
+  // #2001 S8b: such a throw rolls back (`instanceRollback.ts`), and Plain — a tree the tag made an instance, which no
+  // record from before states — cannot be put back without the create's own undo: the rollback leaves it, fails loud,
+  // and marks the world unsavable (hub edge 4), re-seeding nothing. The keys are still the written file's, live.
+  for (const at of ['rebase', 'stamp'] as const) it(`a Create that throws AFTER its tag linked the tree (${at === 'rebase' ? 'in the commit\'s rebase' : `inside the tag, its ${at}`}) keeps the keys: they are the written file's (accept side)`, async () => {
     const f = await startRun(be, async () => {}, `createKeys-throwLanded-${at}`);
     const plain = await holder(f);
     writeTraitField(byName('Z').id, getTraitByName('EntityAttributes')!, 'guid', '');
     const path = `${f.root}/prefabs/NewPlain.prefab.json`;
+    const errors = vi.spyOn(console, 'error');
     thrown.at = at;
     try {
       await expect(createPrefabFromEntity(plain, path, 'Save prefab "Plain"', async () => false)).rejects.toThrow(at === 'rebase' ? /after the tag/ : /inside the tag/);
@@ -391,14 +391,19 @@ describe("Create Prefab's undo takes off the keys the create put on (#1884)", ()
       thrown.at = '';
     }
     await settle();
+    scope = authored().find((e) => e.name === 'Plain')!.id; // a rebuild respawned Plain under a new id
     const key = keyOf('Z');
     expect(key, 'Z keeps the key its landing wrote').toBeTruthy();
     expect(be.read(path), 'premise: the file landed, and declares that key').toContain(key!);
     expect(extraKeys()).toEqual(['k-extra']);
-    await saveScene({ allowDialog: false });
+    const said = errors.mock.calls.map((c) => c.join(' ')).filter((m) => m.includes('[instanceRollback]'));
+    errors.mockRestore();
+    expect(said.some((m) => /no record states it/.test(m) && /unsavable/.test(m)), said.join(' | ')).toBe(true);
+    expect(isUnsavableAfterRollback(), 'the world is marked unsavable').toBe(true);
+    expect(await saveScene({ allowDialog: false }), 'a save refuses').toMatchObject({ saved: false });
     await loadSceneReporting(f.scenePath);
     await settle();
-    expect(keyOf('Z'), 'the reload agrees').toBe(key);
+    expect(isUnsavableAfterRollback(), 'a load replaces the world').toBe(false);
   });
 
   it('the strip of a Create that lands nothing writes no identity: a Z with no durable guid still has none', async () => {

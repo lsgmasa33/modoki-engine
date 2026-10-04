@@ -19,7 +19,7 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData, writeTraitField,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearHistory, setActionCallback, pushAction, undo, redo, writeTraitFieldWithUndo } from '@modoki/engine/editor';
+import { clearHistory, setActionCallback, pushAction, undo, redo, writeTraitFieldWithUndo, createEntityWithUndo } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
@@ -105,9 +105,10 @@ beforeEach(async () => {
   install(innerDoc);
   install(kitDoc);
   await load(sceneWith());
-  // A node the scene added under the instance's Slot — captured as `added` and respawned by the rebuild.
+  // A node the scene added under the instance's Slot — linked on Slot's row (the door) and respawned by the rebuild.
   const slot = getAllEntities().find((e) => e.name === 'Slot')!.id;
-  getCurrentWorld().spawn(eaMeta().trait({ name: 'Mine', parentId: slot, guid: ADDED }), getTraitByName('Transform')!.trait());
+  createEntityWithUndo('Create', slot, [{ name: 'EntityAttributes', data: { name: 'Mine', parentId: slot, guid: ADDED } }, { name: 'Transform' }], () => {});
+  clearHistory();
 });
 afterAll(() => { for (const id of [INNER, KIT]) setPrefabCache(id, null); getCurrentWorld()?.destroy(); });
 

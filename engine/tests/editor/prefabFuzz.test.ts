@@ -85,7 +85,7 @@ import type { SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders
 import { boot, bridge, memoryStorage, flushWatcher, editorOwns, authored, piOf } from './prefabFuzz/harness';
 import { generate, describe as describeOp, type Op, VERIFY_SEEDS, VERIFY_LEN } from './prefabFuzz/ops';
 import { projectFromStore, s5Seen } from './prefabFuzz/s5Seams';
-import { s4Seams, s4Seen, DOOR_OPS } from './prefabFuzz/s4Seams';
+import { storeSeams } from './prefabFuzz/storeSeams';
 import { installShadow } from './prefabFuzz/shadow';
 import { foldCheck, runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, firstUntoleratedDiff, type RunResult, type StepFailure } from './prefabFuzz/runner';
 import { KNOWN_OPEN, REGRESSIONS, type KnownOpen, type Reach } from './prefabFuzz/knownOpen';
@@ -101,11 +101,11 @@ vi.stubGlobal('fetch', be.fetch);
 vi.stubGlobal('window', { __modokiElectron: { bridge } });
 vi.stubGlobal('localStorage', memoryStorage());
 boot(be);
-// #2014 (S4): the real store, capture and doors behind the #2009 shadow harness — I25 and the store's coverage run after
-// every op from here on (`prefabFuzz/s4Seams.ts`).
+// #2014 (S4): the real store behind the #2009 checks — the store's coverage and P5 run after every op from here on
+// (`prefabFuzz/storeSeams.ts`; I25 ran here until #2001 S8b).
 // #2028 (S5): P1 — every record projected from the store after every op, compared with its live instance
 // (`prefabFuzz/s5Seams.ts`).
-installShadow({ ...s4Seams, project: projectFromStore });
+installShadow({ ...storeSeams, project: projectFromStore });
 
 /** console.error lines that are the editor TELLING the user something expected, each with why it is expected. A bare
  *  pattern is not allowed: every entry names the issue or the rule behind it. */
@@ -130,10 +130,12 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
       + 'the refusal is forgiven only there',
   },
   {
-    pattern: /^\[undo\] Undo of "Save prefab "[^"]*"" was REFUSED — "Save prefab "[^"]*"" was not undone: \d+ of the prefab links? it puts back names? \S+\.prefab\.json, which was deleted since, so nothing was changed/,
+    pattern: /^\[undo\] Undo of "(Save prefab "[^"]*"|Detach prefab( "[^"]*")?)" was REFUSED — "(Save prefab "[^"]*"|Detach prefab( "[^"]*")?)" was not undone: \d+ of the prefab links? it puts back names? \S+\.prefab\.json, which was deleted since, so nothing was changed/,
     why: '#1880 W5 (#1881, seed 1012): Create Prefab\'s undo asks `requireLinks` BEFORE it changes the tree, and refuses when '
       + 'a link it puts back would be lost — its entity went with a prefab an Assets trash deleted since. It half-applied '
-      + 'and counted the miss afterwards. The trash taints the segment (`assetDelete`), so the refusal is forgiven only there',
+      + 'and counted the miss afterwards. Detach\'s undo asks it of EVERY link (#2001 S8b, seed 8032): its entities stay '
+      + 'plain through the trash, and it relinked them to a prefab that does not load. The trash taints the segment '
+      + '(`assetDelete`), so the refusal is forgiven only there',
   },
   {
     pattern: /^\[undo\] (Undo|Redo) of "(Apply to Prefab|Save prefab "[^"]*")" was REFUSED — \S+\.prefab\.json would contain itself once restored/,
@@ -184,6 +186,12 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
       + 'in a composite (`runAsCompositeAction`), whose undo refuses as a whole when EVERY sub refused (#1823) and prints '
       + 'each sub\'s reason. The fuzzer reaches it once an outside edit or a trash takes away an entity an agent edited '
       + '(hunt seeds 1036, 1042, 1142). A composite that half-applied is NOT this line: it is a CompositeStepError, and fails',
+  },
+  {
+    pattern: /^\[undo\] (Undo|Redo) of ".*" was REFUSED — The prefab instance this step edited is no longer stated by the records it put back/,
+    why: '#2001 S8b (hunt seed 1294, regression #1893): a field or component step whose instance a later Create Prefab took '
+      + 'into its new one, and whose Create Prefab undo an outside edit then refused, cannot put its rows back: the record they '
+      + 'name is gone. It refuses before its live writes (`requireRowRecords`); before, it wrote them and marked every record stale',
   },
   {
     pattern: /^\[undo\] (Undo|Redo) of ".*" was REFUSED — The prefab instance \(\S+\) a deleted member belongs to is no longer in the scene/,
@@ -355,15 +363,8 @@ describe('#1789 prefab fuzz', () => {
     }, 120_000);
   }
 
-  // #2014 (S4): I25 must JUDGE records, not merely run — a shadow that skips everything (every record stale, missing or
-  // unresolved) passes vacuously. After the verify seeds, every door op has been judged and records were compared.
-  it('#2014 I25: the shadow judged records after every door op (non-vacuity)', () => {
-    expect(checksRun.get('I25 compared a record') ?? 0).toBeGreaterThan(50);
-    for (const k of DOOR_OPS) expect(checksRun.get(`I25 compared after ${k}`) ?? 0, `I25 compared a record after ${k}`).toBeGreaterThan(0);
-  });
-
   // #2028 (S5): P1 must COMPARE projections, not merely run — a seam that skips every record passes vacuously — and a
-  // scene-added reference node's list must have come from the store at least once, not only from the capture.
+  // scene-added reference node must have been projected from its own stored record at least once, not only parsed.
   it('#2028 P1: records were projected from the store and compared with their live instances (non-vacuity)', () => {
     expect(checksRun.get('P1') ?? 0).toBeGreaterThan(50);
     expect(s5Seen.nestedWithOwner).toBeGreaterThan(0);
@@ -374,7 +375,6 @@ describe('#1789 prefab fuzz', () => {
   afterAll(() => {
     const tally = (m: Map<string, number>) => [...m].sort().map(([k, n]) => `${k} ${n}`).join(', ') || 'none';
     process.stderr.write(`[prefabFuzz] verify run — taints: ${tally(taintCounts)}; checks skipped: ${tally(skippedChecks)}; #1880 checks run: ${tally(checksRun)}\n`);
-    process.stderr.write(`[prefabFuzz] I25 translations (#2014): ${JSON.stringify(s4Seen)}\n`);
   });
 
   // Hub ruling (a), 2026-10-02 (#1831, hunt seed 7078a): a scene reference node at an unresolved placeholder owns its
@@ -965,37 +965,18 @@ describe('#1789 prefab fuzz', () => {
     expect(held).toBeGreaterThan(0);
   }, 120_000);
 
-  // #2034: rule 3 keeps the records under a deleted member, and the old capture drops them — except a row today keeps as
-  // an orphan, which it writes back. An Apply that removes the member from the template leaves its `removed` row one,
-  // under the deleted member above it; I25 compared it capture-only. Minimized from #2023's hunt seed 1268.
-  it('#2034: I25 compares a row the orphan store keeps under a deleted member (hunt seed 1268)', async () => {
-    const ops: Op[] = [
-      { kind: 'delete', u: [0.43066262220963836, 0.5671485434286296, 0.31415704009123147, 0.7053195766638964, 0.6566344688180834, 0.6918214168399572, 0.13091036188416183, 0.6012136829085648] },
-      { kind: 'apply', u: [0.49852385581471026, 0.7594188530929387, 0.6740478533320129, 0.8201011335477233, 0.4186440228950232, 0.3610785307828337, 0.17998847900889814, 0.7364051344338804], check: 'rebuild-reload' },
-      { kind: 'delete', u: [0.33927211235277355, 0.5592474001459777, 0.43799786223098636, 0.7623946040403098, 0.018773149931803346, 0.774509527022019, 0.3464857474900782, 0.2845225145574659] },
-    ];
-    const { res, kept } = await uncounted(async () => {
-      const before = s4Seen.removedKeptOrphan;
-      const r = await runOps(be, ops, STRICT);
-      return { res: r, kept: s4Seen.removedKeptOrphan - before };
-    });
-    expect(res.failure, `${res.failure?.check}: ${res.failure?.detail}`).toBeUndefined();
-    expect(kept).toBeGreaterThan(0);
-  }, 60_000);
-
   // The P1 waivers (#2013, #2015, #2016) TOLERATE, and `claimsOf` reads only `stops`, so their two sides are held here:
   // each tolerates its own shape, and a near miss — another line beside it, the other direction, another leaf — is
   // tolerated by nothing, or a fold regression of a neighbouring shape would pass verify.
   // A reference node inside a PLAIN node the scene added (its `children`) is its own stored instance, and P1 compares it
   // (#2009 review: only the scene-owned list roots were walked; 20 such nodes in the verify seeds went uncompared).
-  // Minimized from verify seed 2's first 16 ops.
+  // Two ops: a plain node the scene adds under instance R's member A, then P dropped into it. (Minimized from verify
+  // seed 2 once; that walk stopped reaching the shape when #2001 S8b's direct reprojection changed the entity order the
+  // ops pick from, so it is stated here rather than drawn.)
   it('#2009: P1 by the fold reaches a reference node inside a plain node the scene added', async () => {
     const ops: Op[] = [
-      { kind: 'duplicate', u: [0.7858669895213097, 0.20154535141773522, 0.42422566725872457, 0.8349974474404007, 0.5813204094301909, 0.14100669883191586, 0.6722272289916873, 0.3666982688009739] },
-      { kind: 'prefabEdit', u: [0.9884103999938816, 0.23279935983009636, 0.4679630333557725, 0.3482415771577507, 0.05263609322719276, 0.5212198328226805, 0.09536325954832137, 0.05781813757494092], inner: [{ kind: 'undo', u: [0.0006261211819946766, 0.9820793268736452, 0.07251844787970185, 0.9723730375990272, 0.5273911911062896, 0.19475854956544936, 0.6778920909855515, 0.05147860595025122] }, { kind: 'undo', u: [0.911587618291378, 0.8271304324734956, 0.4456692119129002, 0.9488384739961475, 0.07114801253192127, 0.7140970125328749, 0.98002965352498, 0.8388770050369203] }, { kind: 'instantiate', u: [0.524419940309599, 0.03313548816367984, 0.8487747020553797, 0.838832515059039, 0.5479850363917649, 0.3125023730099201, 0.9025776439812034, 0.9283567571546882] }, { kind: 'duplicate', u: [0.34926888695918024, 0.018448069458827376, 0.9523306582123041, 0.3133497319649905, 0.4382534313481301, 0.7991957627236843, 0.8673769375309348, 0.9195172667969018] }] },
-      { kind: 'addChild', u: [0.2070961082354188, 0.6462242810521275, 0.6241721531841904, 0.713208394125104, 0.9380248752422631, 0.2051396605093032, 0.2788457141723484, 0.3453041734173894] },
-      { kind: 'duplicate', u: [0.20850570825859904, 0.059333223616704345, 0.6751196074765176, 0.6820617744233459, 0.5880381965544075, 0.789034377085045, 0.37132780719548464, 0.85833081882447] },
-      { kind: 'instantiate', u: [0.674173641949892, 0.6865298799239099, 0.8570264051668346, 0.1643060555215925, 0.5510812881402671, 0.1839873620774597, 0.39782143314369023, 0.3698480911552906] },
+      { kind: 'addChild', u: [0.5, 0.382, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5] },
+      { kind: 'instantiate', u: [0.5, 0.5, 0.99, 0.5, 0.5, 0.5, 0.5, 0.5] },
     ];
     const { res, grew } = await uncounted(async () => {
       const before = Object.fromEntries(checksRun);
@@ -1030,13 +1011,14 @@ describe('#1789 prefab fuzz', () => {
     });
   }, 60_000);
 
-  it('KNOWN_OPEN\'s P1 waivers tolerate their own shapes and nothing near them (#2013; #2015-#2018 fixed by #2007\'s close-out, #1931 by #2001 S6)', () => {
+  it('no KNOWN_OPEN waiver tolerates a P1 by the fold (#2013 retired by #2001 S8b step 6; #2015-#2018 fixed by #2007\'s close-out, #1931 by #2001 S6)', () => {
     const g = 'aaaaaaaa-0000-4000-8000-000000000001';
     const P1 = (lines: string[]) => ({ check: 'P1 the live instance is not the fold of its record', detail: `${g} ${lines.join(' ; ')}` });
     const who = (f: { check: string; detail: string }) => KNOWN_OPEN.filter((k) => k.tolerates?.(f)).map((k) => k.issue);
     const moved = 'parent /R/A: fold {"key":"/R"} live {"key":"/R/QR/M"}';
-    // Accept: each shape, alone and repeated.
-    expect(who(P1(['kept-only unused /R/A removed (applied)', 'kept-only unused /R/B removed (applied)']))).toEqual([2013]);
+    // #2013's shape (a kept removal the fold applied too): retired by #2001 S8b step 6, which stopped comparing the fold's
+    // unused records with the kept stores, so no waiver is left to tolerate a P1 by the fold, and one would go red.
+    expect(who(P1(['kept-only unused /R/A removed (applied)', 'kept-only unused /R/B removed (applied)']))).toEqual([]);
     // #1931 member 1's old shapes (a kept link the fold links at its template-added row): retired by #2001 S6 (a row a
     // live keyed node answers to is no orphan), so nothing tolerates them and a regression goes red.
     const link = 'kept-only unused /R/a+K own (applied g1)';

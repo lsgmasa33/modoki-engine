@@ -27,6 +27,7 @@ let testWorld: ReturnType<typeof createWorld>;
 const index = new Map<number, any>();
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); index.set(e.id(), e); return e; },
@@ -77,6 +78,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
 vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(), getCachedPrefab: () => undefined }));
 vi.mock('../../src/runtime/ui/uiTreeStore', () => ({ markUIDirty: vi.fn() }));
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
+  onFontInvalidated: () => () => {},
   newGuid: () => 'gen-guid',
   registerAsset: vi.fn(),
   getGuidForPath: () => undefined,

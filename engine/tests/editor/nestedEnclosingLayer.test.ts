@@ -31,7 +31,6 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import {
   setActionCallback, pushAction, clearHistory, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo,
   addTraitToEntitiesWithUndo, createEntityWithUndo, writeTraitFieldWithUndo, duplicateEntity,
@@ -41,12 +40,13 @@ import {
   setPrefabCache, getCachedPrefabSync, setPrefabSource,
 } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { place } from '../../packages/modoki/src/editor/instance/instanceEdits';
 import { rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { applyToPrefabSelective, previewApply } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import { describeEffect } from '../../packages/modoki/src/editor/scene/prefabApplyEffects';
-import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
@@ -159,7 +159,6 @@ beforeEach(() => {
   clearHistory();
   writes.length = 0;
   prefabs.clear();
-  clearKeptMemberOrphans();
   // The prefab "disk" for a multi-file Apply's pre-read (#1692 `commitPrefabWrites`, #1693 U13): a prefab's last written
   // bytes, else the document installed for it — as a real Response, whose bytes the precondition hashes.
   vi.stubGlobal('fetch', async (url: string) => {
@@ -378,6 +377,7 @@ describe('#1659: every value Apply writes into a template goes through ONE write
     for (const [id, guid] of [[qRoot, 'dddddddd-0000-4000-8000-000000001659'], [qa, 'dddddddd-0000-4000-8000-000000001660']] as const) {
       for (const e of getCurrentWorld().entities) if (e.id() === id) e.set(ea.trait, { ...(e.get(ea.trait) as object), guid });
     }
+    place(qRoot); // placed as a drop places it (#2001 S8b): QA's guid pinned as it stands
     addTraitToEntitiesWithUndo([qRoot], meta('UIFocusable'), { navDown: 'dddddddd-0000-4000-8000-000000001660' });
     await applyKeys(rootOf(ROOT1), (k) => k.startsWith('+added.'));
     const qRow = written(P)!.entities.find((e) => e.prefab === Q)!;
@@ -556,6 +556,7 @@ describe('#1693 P5–P6 close-out review: the cases the second review drove', ()
     setPrefabSource(qRoot, { id: Q });
     const ea = meta('EntityAttributes');
     for (const e of getCurrentWorld().entities) if (e.id() === qRoot) e.set(ea.trait, { ...(e.get(ea.trait) as object), guid: 'dddddddd-0000-4000-8000-000000001761' });
+    place(qRoot); // placed as a drop places it (#2001 S8b)
     addTraitToEntitiesWithUndo([qRoot], meta('UIFocusable'), { navDown: guidOf(inInstance(ROOT1, 'A')) });
     const keys = collectInstanceOverrideKeys(rootOf(ROOT1), getCachedPrefabSync(P) as PrefabFile).added;
     expect((await applyToPrefabSelective(rootOf(ROOT1), new Set(keys))).applied).toBe(true);
@@ -846,6 +847,7 @@ describe('#1715: a node the scene added inside a nested instance can be added by
     for (const e of getCurrentWorld().entities) {
       if (e.id() === inner) e.set(meta('EntityAttributes').trait, { ...(e.get(meta('EntityAttributes').trait) as object), guid: 'dddddddd-0000-4000-8000-000000001717' });
     }
+    place(inner); // its record, as a prefab drop seats it: a tree holding a root with none is not rebuilt (#2001 S8b)
     const outerA = getAllEntities().filter((e) => e.name === 'A').find((e) => {
       const byId = new Map(getAllEntities().map((x) => [x.id, x]));
       for (let c: typeof e | undefined = e; c; c = byId.get(c.parentId)) if (c.id === inner) return false;
@@ -1209,7 +1211,7 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
     };
 
     it('#1780: a scene\'s legacy channel into a frame the template does not have yet is written back by a no-edit save', async () => {
-      // The kept store holds it while no live frame reaches it (R2's legacy half). Mutation: skip the kept-channel merge
+      // The record holds it while no live frame reaches it (R2's legacy half). Mutation (before #2001 S8b deleted the kept stores): skip the kept-channel merge
       // in `serializeScene` — the channel is dropped, and a load onto P-with-C shows L at Q's bare 0.
       install(qDoc(), pDoc(), oWith({}));
       await load(legacyScene());
@@ -1237,9 +1239,10 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
     });
 
     it('#1780: a Refresh whose template GAINS that frame gives it the scene\'s value, and the save keeps it', async () => {
-      // Mutations (the entry route, #1880 F7d; each measured red): the entry capture states no kept channel (drop
-      // `withKeptLegacy` in `captureInstanceEntry`) — L comes in at Q's bare 0; the load's settle keeps every kept channel
-      // (`keepUnreachedLegacy` stores them all, not the unreached) — the save states L twice.
+      // Mutations (the entry route, #1880 F7d; each measured red before #2001 S8b deleted the kept stores): the entry capture states no kept
+      // channel (drop `withKeptLegacy` in `captureInstanceEntry`) — L comes in at Q's bare 0; the load's settle keeps every kept channel
+      // (`keepUnreachedLegacy` stores them all, not the unreached) — the save states L twice. The records route (#2001
+      // S8b): `reprojectFromStore` never re-parses a record's held legacy (`reparseHeld`) — the save writes the old channel.
       install(qDoc(), pDoc(), oWith({}));
       await load(legacyScene());
       install(pWithC());
@@ -1251,6 +1254,49 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
       expect(JSON.stringify(entry.members)).toContain('"x":7');
       await load(s);
       expect(xsOf('L')).toEqual([7]);
+    });
+
+    it('#2001 S8b review R1: a node the user added under the instance survives the Refresh that converts its held legacy statement', async () => {
+      // The Refresh parses the record again from its written entry (`reparseHeld`). With no undo's saved content, the
+      // content map it wrote from started empty, so the record wrote none of the nodes it links, and the reparse replaced
+      // it with one that linked none: Extra was gone, and gone from the save (a reload of the pre-Refresh file kept it).
+      // Mutation: `withLinkedContent` (instanceReproject.ts) adds content only to an entry it already has — red here.
+      install(qDoc(), pDoc(), oWith({}));
+      await load(legacyScene());
+      createEntityWithUndo('Add Extra', rootOf(ROOT1), [
+        { name: 'EntityAttributes', data: { name: 'Extra', parentId: rootOf(ROOT1) } }, { name: 'Transform', data: {} },
+      ], () => {})!;
+      install(pWithC());
+      await rebaseStaleInstances();
+      expect(xsOf('L')).toEqual([7]);
+      expect(named('Extra')).toHaveLength(1);
+      const { scene: s, entry } = await saved();
+      expect(JSON.stringify(entry)).toContain('Extra');
+      await load(s);
+      expect(named('Extra')).toHaveLength(1);
+    });
+
+    it('#2001 S8b review R2: a held node that spawns again is no longer held, so deleting it stays deleted after save + reload', async () => {
+      // A template change drops A, so the node the user added under it is held on the record (`held.heldOwn`); A comes
+      // back, and so does the node. Still held, the save wrote it from the record after the user deleted it. Mutation:
+      // drop the pruning of live nodes from `heldOwn` in `holdUnspawnedOwn` (instanceLoad.ts) — red here.
+      const pNoA = () => { const d = pDoc(); return { ...d, entities: d.entities.filter((e) => (e as { name?: string }).name !== 'A') }; };
+      install(qDoc(), pDoc(), oWith({}));
+      await load(scene(O, [ROOT1]));
+      const a = inInstance(ROOT1, 'A');
+      createEntityWithUndo('Add Extra', a, [
+        { name: 'EntityAttributes', data: { name: 'Extra', parentId: a } }, { name: 'Transform', data: {} },
+      ], () => {})!;
+      install(pNoA());
+      await rebaseStaleInstances();
+      expect([named('A').length, named('Extra').length]).toEqual([0, 0]);
+      install(pDoc());
+      await rebaseStaleInstances();
+      expect([named('A').length, named('Extra').length]).toEqual([1, 1]);
+      deleteEntitiesWithUndo([named('Extra')[0]!.id]);
+      const { scene: s } = await saved();
+      await load(s);
+      expect(named('Extra')).toHaveLength(0);
     });
 
     it('#1877 S4: the gained frame\'s own row states L too — the scene\'s kept legacy value, the OUTER layer, still wins', async () => {
@@ -1267,9 +1313,10 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
     });
 
     it('#1780 close-out F2: a legacy nestedStructure removal into a frame the Refresh gains applies there too, as a load does', async () => {
-      // Mutations (the entry route, #1880 F7d; each measured red): the entry capture states no kept channel (drop
-      // `withKeptLegacy` in `captureInstanceEntry`) — L is live after the Refresh, where a load of the same scene removes
+      // Mutations (the entry route, #1880 F7d; each measured red before #2001 S8b deleted the kept stores): the entry capture states no kept
+      // channel (drop `withKeptLegacy` in `captureInstanceEntry`) — L is live after the Refresh, where a load of the same scene removes
       // it; the load's settle keeps every kept channel (`keepUnreachedLegacy`) — the save states the removal twice over.
+      // The records route (#2001 S8b): no `reparseHeld` after the reprojection — the save writes the old channel back.
       const legacyRemoval = () => {
         const sc = scene(O, [ROOT1]);
         Object.assign((sc.entities as unknown as Array<Record<string, unknown>>)[1]!, { nestedStructure: { '4.3': { removed: [2] } } });
@@ -1847,7 +1894,7 @@ describe('#1736: an Apply is ONE plan of per-key effects, keyed by SLOT — the 
       expect(e.effect).toMatchObject({ op: 'setField', to: 7 });
       expect(e.note).toMatch(/^the template node holding this instance sets Transform.x = 3 on it/);
       expect(tfx(under('QR', 'QA'))).toBe(7);
-      expect(getOverrideMarkSet(entityOf(under('QR', 'QA')))?.has('Transform.x')).toBe(true);
+      expect(overrideKeysOf(entityOf(under('QR', 'QA')))?.has('Transform.x')).toBe(true);
       expect(qa).toBeTruthy();
       expect(collectInstanceOverrideKeys(under('R', 'QR'), getCachedPrefabSync(Q) as PrefabFile).fields).toContain(key);
     });
@@ -2012,7 +2059,7 @@ describe('#1781: a template reference node whose statement adds a component is n
       if (loose) install(sDoc(), qDoc(), pDoc(), withT(stmt(3), loose));
       await load(s);
       expect(focus(where)?.focusOrder, where).toBe(3);
-      const marks = getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === named(where)[0]!.id)!);
+      const marks = overrideKeysOf(getCurrentWorld().entities.find((e) => e.id() === named(where)[0]!.id)!);
       expect(marks?.has('Transform.x')).toBe(true);
       expect(marks?.has('UIFocusable.focusOrder')).toBeFalsy();
       // Not pinned: a change to T's statement reaches it, the scene's own edit kept beside it.

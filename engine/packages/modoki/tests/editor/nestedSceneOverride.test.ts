@@ -5,6 +5,7 @@
  *  and survives a child-prefab base edit (via the override marks). */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { record, clearRecorded } from '../helpers/recordedView';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
@@ -45,6 +46,10 @@ function writeTraitFieldImpl(id: number, meta: any, field: string, value: unknow
   e.set(meta.trait, { ...e.get(meta.trait), [field]: value });
 }
 
+// The record's override list, stated by the test (a fake ECS has no record store): `../helpers/recordedView.ts`.
+vi.mock('../../src/editor/instance/instanceOverrideView', async (orig) =>
+  (await import('../helpers/recordedView')).withRecordedView(await orig()));
+beforeEach(() => clearRecorded());
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
@@ -85,8 +90,6 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab
 beforeEach(async () => {
   testWorld = createWorld();
   index.clear();
-  const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
-  clearAllOverrideMarks();
 });
 
 const FLAME = 'cccccccc-0000-4000-8000-00000000c0e8';
@@ -98,7 +101,6 @@ const flamePrefab = {
 describe('captureNestedSceneDelta', () => {
   it('returns only the scene-changed field; the row\'s value, unrecorded, is not written', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabCapture'), import('../../src/editor/scene/prefabInstanceOverrides'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1, m2, m3]) => ({ ...m0, ...m1, ...m2, ...m3 }));
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     const { captureNestedSceneDelta } = await import('../../src/editor/scene/serialize');
 
     setPrefabCache(FLAME, flamePrefab as any);
@@ -110,7 +112,7 @@ describe('captureNestedSceneDelta', () => {
     writeTraitFieldImpl(root, TRAITS[0], 'x', 4.1);
     // User's SCENE edit: idleScale 0.1 -> 0.5 (set live + mark, as entityActions does).
     writeTraitFieldImpl(root, TRAITS[1], 'idleScale', 0.5);
-    markOverride(index.get(root), 'EngineFlame', 'idleScale');
+    record(index.get(root), 'EngineFlame', 'idleScale');
 
     const rowOverrides = { 1: { Transform: { x: 4.1 } } }; // the parent prefab's row override
     const delta = captureNestedSceneDelta(root, flamePrefab as any, rowOverrides);
@@ -122,14 +124,13 @@ describe('captureNestedSceneDelta', () => {
 
   it('survives a child-prefab base edit that matches the scene override', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabCapture'), import('../../src/editor/scene/prefabInstanceOverrides'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1, m2, m3]) => ({ ...m0, ...m1, ...m2, ...m3 }));
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     const { captureNestedSceneDelta } = await import('../../src/editor/scene/serialize');
 
     setPrefabCache(FLAME, flamePrefab as any);
     const root = instantiatePrefab(flamePrefab as any);
     setPrefabSource(root, { id: FLAME });
     writeTraitFieldImpl(root, TRAITS[1], 'idleScale', 0.5);
-    markOverride(index.get(root), 'EngineFlame', 'idleScale');
+    record(index.get(root), 'EngineFlame', 'idleScale');
 
     // Now the child prefab base idleScale is edited to 0.5 (coincides with override).
     const editedFlame = { ...flamePrefab, entities: [{ ...flamePrefab.entities[0], traits: { ...flamePrefab.entities[0].traits, EngineFlame: { idleScale: 0.5, boostScale: 3, response: 1 } } }] };

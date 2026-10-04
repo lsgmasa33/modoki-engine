@@ -24,7 +24,7 @@ import { setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, d
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
-import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -85,7 +85,7 @@ const idOf = (name: string) => { const all = getAllEntities().filter((e) => e.na
 const field = (id: number, trait: string, f: string) => (readTraitData(id, meta(trait)) as Record<string, unknown> | null)?.[f];
 const save = async () => JSON.parse(JSON.stringify(await serializeScene())) as SceneData;
 const rebuild = async () => load(await save());
-const marksOf = (id: number) => [...(getOverrideMarkSet(findEntity(id)!) ?? [])].sort();
+const marksOf = (id: number) => [...(overrideKeysOf(findEntity(id)!) ?? [])].sort();
 const extra = (doc: Doc) => doc.entities[1].added![0].traits as Record<string, Record<string, unknown>>;
 
 /** Save the scene, change O, reopen: what leaving a saved prefab edit does. The history stays. */
@@ -126,7 +126,7 @@ describe("an undo after a SAVED prefab edit takes a PLAIN template node's unreco
     expect(live).toEqual(reloaded);
   });
 
-  // The field-edit undo (`putMarkState`) reaches the same branch. Mutation as above: live 0, reloaded -7.
+  // The field-edit undo (`putFieldRows`) reaches the same branch. Mutation as above: live 0, reloaded -7.
   it("a field edit on Extra, a saved edit of the same field in O, undo: Extra shows the current value", async () => {
     expect(writeTraitFieldWithUndo(idOf('Extra'), meta('Transform'), 'z', 9)).toBeNull();
     expect(marksOf(idOf('Extra'))).toEqual(['Transform.z']);

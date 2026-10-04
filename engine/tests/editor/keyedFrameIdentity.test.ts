@@ -27,7 +27,7 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { setActionCallback, pushAction, clearHistory } from '@modoki/engine/editor';
+import { setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { deriveMemberGuid, isRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
@@ -37,8 +37,6 @@ import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/ver
 import { buildPrefabEditScene } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { remintSceneEntityGuids } from '../../plugins/asset-fs-ops';
-import { writeTraitField } from '@modoki/engine/runtime';
-import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
 import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
@@ -292,14 +290,15 @@ describe('a prefab member token in the spelling before #1809 still reads (prefab
 
   // Apply's filter of the prefab's own `moved` drops an entry whose key or target names nothing, and deletes it from the
   // file. A key in the spelling before #1809 names its node through the lookup (close-out re-review: only the drain was
-  // pinned). Mutation: `paths.has(k)` for the key again — an Apply of anything deletes the move from O.
+  // pinned). Since #1883 R4 a keyed move key is also kept outright (`isKeyedMoveKey`), so the property is held twice.
+  // Mutation: drop that early return AND use `paths.has(k)` for the key — an Apply of anything deletes the move from O;
+  // either alone stays green. The edit goes through the door, so the Apply's records name it (#2001 S8b).
   it('an Apply keeps a `moved` entry whose key is in the spelling before #1809', async () => {
     const moved = { [`2.2.3.+${KR}`]: '@member:3' };
     install(pDoc(), qDoc(), oDoc(undefined, moved));
     await load(scene(SCENE_FORMAT_VERSION));
     const panel = named('Panel');
-    writeTraitField(panel.id, getTraitByName('Transform')!, 'x', 5);
-    markOverride(handleOf(panel.id), 'Transform', 'x');
+    writeTraitFieldWithUndo(panel.id, getTraitByName('Transform')!, 'x', 5);
     const keys = collectInstanceOverrideKeys(rootId(), getCachedPrefabSync(O) as PrefabFile).fields.filter((k) => k.endsWith('Transform.x'));
     expect(keys).toHaveLength(1); // premise
     await applyToPrefabSelective(rootId(), new Set(keys));

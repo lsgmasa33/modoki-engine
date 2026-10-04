@@ -24,7 +24,6 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import {
   setActionCallback, pushAction, clearHistory, undo, redo, writeTraitFieldWithUndo, reparentEntity, duplicateEntity,
   addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo,
@@ -123,7 +122,6 @@ beforeEach(async () => {
   setRunMode('stopped');
   clearHistory();
   prefabs.clear();
-  clearKeptMemberOrphans();
   install(pDoc());
   await load(scene());
 });
@@ -150,8 +148,8 @@ describe('the UI resize/move handles on an instance member (#1709)', () => {
     expect([field(member('U'), 'UIAnchor', 'top'), field(member('U'), 'UIAnchor', 'left')]).toEqual([25, 30]);
   });
 
-  // Mutation: drop `putMarkState(id, trait, oldMarks)` from commitUIHandleDrag's undo — the undone width stays
-  // marked, is saved at 100, and the template's later 120 never reaches the instance.
+  // Mutation: drop `putFieldRows([id], oldRows, …)` from commitUIHandleDrag's undo — the undone width stays
+  // recorded, is saved at 100, and the template's later 120 never reaches the instance.
   it('an undone resize is not saved as an override: the instance still follows the template', async () => {
     dragUI('UIElement', { width: 200 });
     await undo();
@@ -219,12 +217,12 @@ describe('sortOrder rewrites on an instance (#1709)', () => {
     expect(rootSort()).toBe(0);
   });
 
-  // The renumber's undo puts back the marks it found, snapshotted before it ran (`makeSortOrderRenumberAction`, the
+  // The renumber's undo puts back the rows it found, taken before it ran (`makeSortOrderRenumberAction`, the
   // Hierarchy's builder). B carries a stored override equal to its base (marked before, stays marked); C has none
   // (the renumber marks it, the undo must unmark it). After the undo the template moves both: B keeps its override,
   // C follows.
-  // Mutation A: drop `putMarkState` in restorableSortOrderWrite — C stays marked at 20 and ignores the template's 25.
-  // Mutation B: snapshot after the renumber (build restorableSortOrderWrite at undo time) — the same.
+  // Mutation A: drop the undo's `putFieldRows(ids(), before, …)` — C stays recorded at 20 and ignores the template's 25.
+  // Mutation B: take the rows at undo time (`instanceEdits.rowsOf(ids())` for `before`) — the same.
   // Mutation C: pass no revert (the undo re-records by diff) — C, written back onto its base 20, keeps the record the
   // renumber made (#1914 R2: a write removes no record) and ignores the template's 25.
   it('an undone renumber restores every sibling\'s mark as it was', async () => {
@@ -250,8 +248,8 @@ describe('sortOrder rewrites on an instance (#1709)', () => {
   // unchanged value through the marking writer, re-reconciling a stored override away). The root, moved under Other.
   // Since #1914 R2 no write removes a record, so the mutation this was written against (the redo calling
   // `writeTraitFieldMarked(..., 'sortOrder', ...)` unconditionally with the old value) stays green: the test now guards
-  // the ABSENCE of a by-value un-record on this path. Since F7 not even that: an `unmarkOverride` of the root's
-  // `EntityAttributes.sortOrder` cannot take back the implicit record.
+  // the ABSENCE of a by-value un-record on this path. Since F7 not even that: nothing can take back the root's implicit
+  // `EntityAttributes.sortOrder` record.
   it('an undone + redone reparent with no sortOrder keeps a stored override', async () => {
     writeTraitFieldWithUndo(rootId(), meta('EntityAttributes'), 'sortOrder', 1); // recorded, then back on the base 0 (F3)
     writeTraitFieldWithUndo(rootId(), meta('EntityAttributes'), 'sortOrder', 0);
@@ -299,8 +297,8 @@ describe('re-adding a component the template defines (#1677)', () => {
 });
 
 describe('undo takes back the mark its write added (#1709)', () => {
-  // Mutation: drop `putMarkState(id, meta.name, oldMarks)` from writeTraitFieldWithUndo's undo — the undone x stays
-  // marked, is saved at 0, and the template's later 3 never reaches the instance.
+  // Mutation: drop `putFieldRows([id], oldRows, …)` from writeTraitFieldWithUndo's undo — the undone x stays
+  // recorded, is saved at 0, and the template's later 3 never reaches the instance.
   it('an undone Inspector edit is not saved as an override', async () => {
     writeTraitFieldWithUndo(member('B'), meta('Transform'), 'x', 5);
     await undo();
@@ -310,8 +308,8 @@ describe('undo takes back the mark its write added (#1709)', () => {
     expect(field(member('B'), 'Transform', 'x')).toBe(3);
   });
 
-  // The other side: a mark that was there BEFORE the edit (a loaded override) survives the undo.
-  // Mutation: make putMarkState unmark every key it is given — the loaded override is dropped and reloads at 0.
+  // The other side: a record that was there BEFORE the edit (a loaded override) survives the undo.
+  // Mutation: `putRows` deletes every row it is given — the loaded override is dropped and reloads at 0.
   it('an override the scene already had survives an edit + undo', async () => {
     writeTraitFieldWithUndo(member('B'), meta('Transform'), 'x', 5);
     await load(await saved()); // B.x = 5 is now a loaded override
@@ -332,12 +330,12 @@ describe('undo takes back the mark its write added (#1709)', () => {
     return field(member('B'), 'Transform', 'x');
   };
 
-  // Mutation: drop `putMarkState(id, meta.name, oldMarks[i]!)` from writeTraitFieldMultiWithUndo's undo.
+  // Mutation: drop `putFieldRows(ids, oldRows, …)` from writeTraitFieldMultiWithUndo's undo.
   it('an undone multi-select edit is not saved as an override', async () => {
     expect(await undoneFollowsTemplate(() => writeTraitFieldMultiWithUndo([member('B'), member('C')], meta('Transform'), 'x', 5))).toBe(3);
   });
 
-  // Mutation: drop `putMarkState(id, meta.name, oldMarks)` from writeTraitFieldPerEntityWithUndo's undo.
+  // Mutation: drop `putFieldRows(ids, oldRows, …)` from writeTraitFieldPerEntityWithUndo's undo.
   it('an undone per-entity edit is not saved as an override', async () => {
     expect(await undoneFollowsTemplate(() => writeTraitFieldPerEntityWithUndo([member('B')], meta('Transform'), 'x', () => 5, 'nudge'))).toBe(3);
   });
@@ -368,7 +366,7 @@ describe('undo takes back the mark its write added (#1709)', () => {
     expect(field(member('B'), 'Transform', 'x')).toBe(5);
   });
 
-  // Mutation: drop `putMarkState` from buildTransformUndoAction's apply — the undone drag stays marked.
+  // Mutation: drop `putFieldRows` from buildTransformUndoAction's apply — the undone drag stays recorded.
   it('an undone gizmo drag is not saved as an override', async () => {
     expect(await undoneFollowsTemplate(() => gizmoDrag(5))).toBe(3);
   });

@@ -29,10 +29,12 @@ import { unbindDeletedAssetEditors } from '../../packages/modoki/src/editor/pane
 import { deletedPrefabsShown, showDeletedPrefabsMissing } from '../../packages/modoki/src/editor/scene/deletedPrefabsMissing';
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
-import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
+import { SCENE_FORMAT_VERSION, CAPTURE_FORM_SCENE_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { editorPrefabDeleted, getPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { writeTraitFieldWithUndo, duplicateEntity, clipEntity } from '../../packages/modoki/src/editor/undo/entityActions';
+import { writeTraitFieldWithUndo, duplicateEntity, clipEntity, deleteEntityWithUndo, createEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
+import { emptySpecs } from '../../packages/modoki/src/runtime/scene/entityCreateSpecs';
 import { isRowPlaceholder } from '../../packages/modoki/src/editor/undo/placeholderGate';
+import { placePrefabFromPath } from '../../packages/modoki/src/editor/scene/prefabPlace';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { runAsCompositeAction } from '../../packages/modoki/src/editor/undo/compositeAction';
 import { storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
@@ -49,7 +51,6 @@ const noNest = async () => {};
 const TF = () => getTraitByName('Transform')!;
 const framesOf = (guid: string) => getAllEntities().filter((e) => piOf(e.id)?.source === guid).length;
 const named = (name: string) => getAllEntities().find((e) => e.name === name)!;
-const staleRecords = () => [...storedInstances(getCurrentWorld()).entries()].filter(([, r]) => r.stale).map(([g, r]) => `${g}:${r.stale}`);
 const leafX = () => (readTraitData(named('Leaf').id, TF()) as { x: number }).x;
 
 /** `Assets.tsx`'s `executeDeletion` of one prefab, as the fuzzer's `trashPrefab` op runs it, then the watcher's pass. */
@@ -115,7 +116,6 @@ describe('#2056: a trashed prefab\'s instances are Missing Prefab at once', () =
     await trash(f, 'Q');
     expect(framesOf(f.prefabs.Q.guid)).toBe(0);
     expect(worldHasUnsavedEdits()).toBe(false);
-    expect(staleRecords(), 'the load took back every record exactly (the baseline an aborted reload\'s retry is held to)').toEqual([]);
   });
 
   // The #2056 hunt seeds minimize to `trashPrefab ; playStop`: the world after Stop was not the one before Play.
@@ -203,8 +203,7 @@ describe('#2056 review: the conversion\'s own reload', () => {
     expect(framesOf(f.prefabs.Q.guid), 'the retry converted').toBe(0);
     // The aborted reload kept the live world; marking its records stale before the call left the retry banking stale
     // records, which the load does not take (#2056 re-review). Mutation: wrap `reloadCapturedWorld` in
-    // `staleAroundUnless` again → every record reads stale here.
-    expect(staleRecords(), 'the retry\'s world holds fresh records, as a clean conversion\'s does').toEqual([]);
+    // `staleAround` (a mark before the call) → every record reads stale here.
     expect(unexpandedRows().size).toBeGreaterThan(0);
     expect((await undoStep('undo')).did).toBe(true);
     await settle();
@@ -288,6 +287,169 @@ describe('#2056 review: a missing nested row\'s placeholder cannot be copied', (
     } finally { err.mockRestore(); }
     const p1 = getAllEntities().find((e) => { const pi = piOf(e.id); return e.parentId === 0 && pi?.source === f.prefabs.P.guid && pi.rootInstanceId === e.id; })!;
     expect(duplicateEntity(p1.id, () => {}), 'the instance it belongs to copies with its rows').not.toBeNull();
+  });
+});
+
+// #2001 S8b: the put-back re-expands an entry placeholder by loading its entry, seats the records a reload parses from it
+// (carrying the link to a user's node hung on the placeholder, § 10.4b, onto the instance it now hangs under), and
+// projects the tree from them. Before, the re-expansion marked every record of the scene stale and the next write
+// re-seeded them from the capture (hunt seed 9335). A record the editor wrote is in the current form, so the
+// placeholder's already equals that parse; one loaded from a file before v20 holds the file's localId channels verbatim
+// until the document returns (rule 9), and names the root by the entry's own name, which the expansion does not apply.
+// Mutations, each red in its own case alone: drop `seatLoadedEntry` → 'the record converted it against P'; drop the
+// `reprojectFromStore` after it → 'a save and reload builds the same world' (the root shows R, the record and the
+// reload P1); drop the `keepLiveLinks` carry in `seatLoadedEntry` → 'the node hung on the placeholder stays linked'.
+describe('putting the file back keeps the records', () => {
+  it('an entry placeholder loaded from an older file comes back with the records a reload parses', async () => {
+    const f = await startRun(be, noNest, 'putback-old-file');
+    const text = be.read(f.prefabs.P.path)!;
+    const p1 = () => getAllEntities().find((e) => e.guid?.startsWith('ffffffff-0000-4000-8002-'))!;
+    const p1Guid = p1().guid!;
+    await trash(f, 'P');
+    // P1 as a file from before the instance model states it: A's (localId 2) y through the legacy localId channel, which
+    // the parse can only hold verbatim while P is missing (rule 9).
+    be.write(f.scenePath, JSON.stringify({
+      id: f.sceneGuid, version: CAPTURE_FORM_SCENE_VERSION, name: 'Fuzz', createdAt: '2026-01-01T00:00:00.000Z', resources: [],
+      entities: [{ id: 2, prefab: f.prefabs.P.guid, guid: p1Guid, traits: { EntityAttributes: { name: 'P1', parentId: 0 }, Transform: { x: 3, y: 0, z: 0 } }, overrides: { 2: { Transform: { y: 4 } } } }],
+    }));
+    expect((await loadSceneReporting(f.scenePath)).outcome, 'premise: the file is read with P missing').toBe('loaded');
+    await settle();
+    const rec = () => storedInstances(getCurrentWorld()).get(p1Guid)!.record;
+    expect(rec().held.pendingLegacy, 'premise: the placeholder\'s record holds the legacy channel').toBeDefined();
+    const before = be.snapshot();
+    be.write(f.prefabs.P.path, text);
+    await flushWatcher(be, before);
+    expect(piOf(p1().id)?.source, 'P1 is live again').toBe(f.prefabs.P.guid);
+    const a = getAllEntities().find((e) => e.parentId === p1().id && e.name === 'A')!;
+    expect((readTraitData(a.id, TF()) as { y: number }).y, 'premise: the load gave A its y').toBe(4);
+    expect(rec().held.pendingLegacy, 'the record converted it against P').toBeUndefined();
+    const mine = structuredClone(rec());
+    const shown = worldTree();
+    expect(await reloadTree(f), 'a save and reload builds the same world').toEqual(shown);
+    // …and parses the same record, but for the pins the save adds: a file before v20 states none, so neither does its load.
+    const unpinned = (r: typeof mine) => ({ ...r, list: { rows: new Map([...r.list.rows].map(([k, { guid: _g, name: _n, ...row }]) => [k, row] as const).filter(([, row]) => Object.keys(row).length)) } });
+    expect(unpinned(rec()), 'and parses the same record').toEqual(unpinned(mine));
+  });
+
+  it('an entry placeholder comes back with fresh records, the user\'s node hung on it still linked', async () => {
+    const f = await startRun(be, noNest, 'putback-records');
+    const text = be.read(f.prefabs.P.path)!;
+    const p1 = () => getAllEntities().find((e) => e.guid?.startsWith('ffffffff-0000-4000-8002-'))!;
+
+    const { specs } = emptySpecs(p1().id);
+    const hung = createEntityWithUndo('Create Hung', p1().id, specs.map((s) => (s.name === 'EntityAttributes' ? { ...s, data: { ...s.data, name: 'Hung' } } : s)), () => {});
+    expect(hung, 'premise: a node is hung on P1').not.toBeNull();
+    await settle();
+    await trash(f, 'P');
+    expect(piOf(p1().id), 'premise: P1 is its placeholder').toBeUndefined();
+    await reloadTree(f);
+    expect(named('Hung'), 'premise: the node hangs on the placeholder').toBeDefined();
+    const hungGuid = named('Hung').guid!;
+    const linksHung = (g: string) => [...(storedInstances(getCurrentWorld()).get(g)?.record.list.rows.values() ?? [])].some((row) => row.own?.some((o) => o.guid === hungGuid));
+    expect(linksHung(p1().guid!), 'premise: the placeholder\'s record links it').toBe(true);
+
+    const before = be.snapshot();
+    { const d = JSON.parse(text); d.entities = d.entities.filter((e: any) => e.name !== 'B'); be.write(f.prefabs.P.path, JSON.stringify(d)); }
+    await flushWatcher(be, before);
+    expect(piOf(p1().id)?.source, 'P1 is live again').toBe(f.prefabs.P.guid);
+    expect(linksHung(p1().guid!), 'the node hung on the placeholder stays linked').toBe(true);
+    // The record, not a capture of the live tree, is what states P1 (#2001 S8b): it keeps the row of the B the prefab no
+    // longer has, which no live node shows. A save and reload gives the same records back.
+    const mine = structuredClone(storedInstances(getCurrentWorld()).get(p1().guid!)!.record.list);
+    const shown = worldTree();
+    expect(await reloadTree(f), 'a save and reload builds the same world').toEqual(shown);
+    expect(storedInstances(getCurrentWorld()).get(p1().guid!)!.record.list, 'and P1\'s records').toEqual(mine);
+  });
+});
+
+// #2001 S8b: a copy of a Missing Prefab placeholder carries its record (#1699: "a duplicate keeps the data too") on records,
+// under the identities the copy plan re-minted for it, so the copy shares none with the source.
+describe('a copy of a placeholder keeps the records', () => {
+  it('the copy has a fresh record of its own, re-guided; the undo takes it away, every record fresh', async () => {
+    const f = await startRun(be, noNest, 'copy-placeholder');
+    await trash(f, 'P');
+    const p1 = getAllEntities().find((e) => e.guid?.startsWith('ffffffff-0000-4000-8002-'))!;
+    const src = storedInstances(getCurrentWorld()).get(p1.guid!)!;
+    expect(piOf(p1.id), 'premise: it is a placeholder').toBeUndefined();
+
+    const copy = duplicateEntity(p1.id, () => {})!;
+    const copyGuid = getAllEntities().find((e) => e.id === copy)!.guid!;
+    const rec = storedInstances(getCurrentWorld()).get(copyGuid);
+    expect(rec!.record.source).toBe(src.record.source);
+    const pins = (r: typeof src.record) => [...r.list.rows.values()].map((row) => row.guid).filter(Boolean);
+    expect(pins(rec!.record).length, 'premise: the record pins members').toBeGreaterThan(0);
+    expect(pins(rec!.record).filter((g) => pins(src.record).includes(g)), 'no identity shared with the source').toEqual([]);
+
+    expect((await undoStep('undo')).did).toBe(true);
+    expect(storedInstances(getCurrentWorld()).has(copyGuid)).toBe(false);
+  });
+});
+
+// #2001 S8b: a delete of a placeholder takes its record (rule 9 kept it); nothing projects it, so the undo seats the record
+// back beside the respawned placeholder, exactly, and the redo takes it again.
+describe('a delete of a placeholder keeps the records', () => {
+  it('undo seats its record back exactly, fresh; redo takes it away', async () => {
+    const f = await startRun(be, noNest, 'delete-placeholder');
+    await trash(f, 'P');
+    const p1 = getAllEntities().find((e) => e.guid?.startsWith('ffffffff-0000-4000-8002-'))!;
+    const before = structuredClone(storedInstances(getCurrentWorld()).get(p1.guid!));
+    expect(piOf(p1.id), 'premise: it is a placeholder').toBeUndefined();
+
+    deleteEntityWithUndo(p1.id);
+    expect(storedInstances(getCurrentWorld()).has(p1.guid!), 'the delete takes its record').toBe(false);
+    expect((await undoStep('undo')).did).toBe(true);
+    expect(storedInstances(getCurrentWorld()).get(p1.guid!)).toEqual(before);
+    expect((await undoStep('redo')).did).toBe(true);
+    expect(storedInstances(getCurrentWorld()).has(p1.guid!)).toBe(false);
+  });
+});
+
+// …and one nested in a live instance: the instance's records are seated around the respawned placeholder (#2001 S8b).
+describe('a delete of a placeholder nested in a live instance keeps the records', () => {
+  it('undo and redo leave every record exact and fresh', async () => {
+    const f = await startRun(be, noNest, 'delete-nested-placeholder');
+    const p1 = () => getAllEntities().find((e) => e.guid?.startsWith('ffffffff-0000-4000-8002-'))!;
+    const a = getAllEntities().find((e) => e.name === 'A' && e.parentId === p1().id)!;
+    const placed = (await placePrefabFromPath(f.prefabs.Q.path, { tag: 'test', parentId: a.id }))!;
+    const qGuid = getAllEntities().find((e) => e.id === placed)!.guid!;
+    await trash(f, 'Q');
+    const q = getAllEntities().find((e) => e.guid === qGuid)!;
+    expect(piOf(q.id), 'premise: the placed Q is a placeholder now').toBeUndefined();
+    expect(piOf(p1().id)?.rootInstanceId, 'premise: P1 is live').toBe(p1().id);
+    const store = () => new Map([...storedInstances(getCurrentWorld())].map(([g, r]) => [g, structuredClone(r)]));
+    const before = store();
+
+    deleteEntityWithUndo(q.id);
+    const after = store();
+    expect(after.has(qGuid), 'the delete takes its record').toBe(false);
+    expect((await undoStep('undo')).did).toBe(true);
+    expect(store(), 'the undo seats back the exact records').toEqual(before);
+    expect((await undoStep('redo')).did).toBe(true);
+    expect(store()).toEqual(after);
+  });
+});
+
+// …and with the tree's own node it hangs under: that node and the placeholder come back from their snapshots, and the
+// tree's records are seated (a reprojection cannot rebuild the placeholder).
+describe('a delete of the member a nested placeholder hangs under keeps the records', () => {
+  it('undo brings both back with the exact records, fresh', async () => {
+    const f = await startRun(be, noNest, 'delete-member-over-placeholder');
+    const p1 = () => getAllEntities().find((e) => e.guid?.startsWith('ffffffff-0000-4000-8002-'))!;
+    const a = () => getAllEntities().find((e) => e.name === 'A' && e.parentId === p1().id)!;
+    const placed = (await placePrefabFromPath(f.prefabs.Q.path, { tag: 'test', parentId: a().id }))!;
+    const qGuid = getAllEntities().find((e) => e.id === placed)!.guid!;
+    await trash(f, 'Q');
+    const aGuid = a().guid!;
+    const store = () => new Map([...storedInstances(getCurrentWorld())].map(([g, r]) => [g, structuredClone(r)]));
+    const before = store();
+
+    deleteEntityWithUndo(a().id);
+    expect(getAllEntities().some((e) => e.guid === qGuid), 'premise: the placeholder went with A').toBe(false);
+    expect((await undoStep('undo')).did).toBe(true);
+    const backA = getAllEntities().find((e) => e.guid === aGuid);
+    expect(backA, 'A is back').toBeDefined();
+    expect(getAllEntities().find((e) => e.guid === qGuid)?.parentId, 'the placeholder is back under it').toBe(backA!.id);
+    expect(store(), 'the undo seats back the exact records').toEqual(before);
   });
 });
 

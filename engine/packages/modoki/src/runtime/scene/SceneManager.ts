@@ -98,7 +98,6 @@ import { emit } from '../core/journal';
 import { markSceneLoaded, isSceneFilePath } from '../core/ecs/sceneLoaded';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { ensurePhysicsReady } from '../physics/physicsReady';
-import { clearAllOverrideMarks, getCarriedOverrideMarks, restoreOverrideMarks } from '../loaders/overrideMarks';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../core/carriedMarkers';
 import { frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../core/ecs/identityParents';
 import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
@@ -127,9 +126,8 @@ import { loadSpriteAnimNow } from '../loaders/spriteAnimCache';
 import { loadRig2DNow } from '../loaders/rig2dCache';
 import { collectTimelineAudioRefs, collectTimelineControlRefs, collectTimelineVideoRefs } from '../timeline/types';
 import { ASSET_FETCH_INIT, parseAssetJson } from '../loaders/assetFetch';
-import { fillInstanceStoreReporting } from '../prefab/instanceLoad';
 import { takeRecordBank } from '../prefab/recordBank';
-import { markStale, setInstanceRecord, storedInstance, type StoredInstance } from '../prefab/instanceStore';
+import { setInstanceRecord, storedInstance, type StoredInstance } from '../prefab/instanceStore';
 import { assetUrl } from '../loaders/assetUrl';
 import { SceneFormatRefusedError, unparsableSceneError } from '../loaders/sceneFormatGate';
 import {
@@ -820,19 +818,6 @@ class SceneManagerImpl implements SceneManager {
       // The copies of missing prefabs the world being replaced holds, and its live frames' documents (#1939 item 2): noted
       // into the new world for every scene it loads again, below, before any of them expands.
       const sceneCopies = opts.sceneCopies ?? new Map([...this.captureSceneCopies(getCurrentWorld())].filter(([scene]) => keptBaseGuids.has(scene)));
-      // Capture each carried entity's override marks NOW, while the OLD world is
-      // still alive and its marks intact — `clearAllOverrideMarks()` below drops
-      // them, and the respawn has nothing to re-seed from (a carried snapshot is
-      // FLATTENED: it has no `overrides` map, which is why `instantiatePrefabIntoWorld`
-      // — the only place marks are normally seeded from a file — never runs on this
-      // path). Keyed by OLD ecs id; re-seeded against the fresh ids that the carry's
-      // `onEntitySpawned` hands back, which is the same old→new remap the A8 fix uses
-      // for parentId/rootInstanceId. Without this, an authored override on a carried
-      // instance serializes as "no override" and reverts to the prefab's bare defaults
-      // on the next load (A9 defect 2 —
-      // docs/reviews/a9-carried-instance-overrides-investigation.md).
-      // Marks are keyed by the packed entity (#868), so resolve each carried id in the old world.
-      const carriedMarks = new Map<number, string[]>();
       // The unregistered markers too (#1427): the snapshot is built from the trait registry, which
       // never sees them, so `Transient` and `TemplateAddedKey` were silently dropped — a runtime pool
       // was saved into the next scene, and a template-added node showed false overrides.
@@ -848,8 +833,6 @@ class SceneManagerImpl implements SceneManager {
       const carryWorld = getCurrentWorld();
       for (const entry of carriedSnapshots) {
         const old = findEntityById(entry.id);
-        const set = old ? getCarriedOverrideMarks(old) : undefined;
-        if (set && set.size > 0) carriedMarks.set(entry.id, [...set]);
         const markers = captureMarkers(old as Parameters<typeof captureMarkers>[0]);
         if (markers) carriedMarkers.set(entry.id, markers);
         const frameDoc = old ? frameRootDoc(carryWorld, old) : undefined;
@@ -882,17 +865,8 @@ class SceneManagerImpl implements SceneManager {
       nextWorld = createWorld();
       // The exact records a leaver banked for this key (#2046 S7.6, `recordBank.ts`), for the primary's entry loop.
       const recordBank = takeRecordBank(path);
-      // Override marks are keyed by raw ecs id, so they must be dropped when the
-      // WORLD changes — once, here, rather than once per `loadSceneFile` call. A
-      // chain loads N scene files into this ONE world (bases first, primary last),
-      // so a per-call clear had the primary wiping the marks the base had just
-      // seeded, and every chained/carried prefab instance then serialized with
-      // EMPTY overrides (A9 defect 1 — see the `clearMarks` docblock in
-      // loadSceneFile.ts). Every loadSceneFile call below therefore passes
-      // `clearMarks: false`.
-      clearAllOverrideMarks();
-      // Same reasoning, different bookkeeping: the #124 authored-write probe is keyed by raw ecs
-      // id too, and its records describe the scene being replaced — a save must never warn about
+      // The #124 authored-write probe is keyed by raw ecs id, so it is dropped when the WORLD changes,
+      // once, here, and its records describe the scene being replaced — a save must never warn about
       // an entity name from a scene that is no longer loaded. (Cleared here rather than from an
       // `onWorldSwap` subscription at entityUtils import time: a module-scope side effect there
       // breaks every test that mocks `core/ecs/world`.)
@@ -915,7 +889,9 @@ class SceneManagerImpl implements SceneManager {
         try {
         await loadSceneFile(sceneData, {
           world: stagingWorld,
-          clearMarks: false, // once-per-world clear above owns this (A9 defect 1)
+          // #2001 S4: the file's instance records, parsed into this world's store once the load settles. A parse failure
+          // must not fail the load: it reports and leaves that owner unstored (`fillInstanceStoreReporting`).
+          records: { bank: isPrimary ? recordBank : undefined },
           // Scene identity for #1268's derived guids. Per REF, not per chain: each scene in
           // the chain is loaded by its own call with its own path, so a base scene's entity
           // derives the same guid no matter which level extends it.
@@ -1025,11 +1001,6 @@ class SceneManagerImpl implements SceneManager {
         });
         } finally { endBootSpan(spawnSpan); }
 
-        // #2001 S4: the file's instance records, parsed beside the old expansion into this world's store. A shadow —
-        // nothing builds or saves from it yet (`runtime/prefab/instanceStore.ts`) — so a parse failure must not fail
-        // the load: it reports and leaves that owner unstored.
-        fillInstanceStoreReporting(stagingWorld, sceneData, isPrimary ? recordBank : undefined);
-
         if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 
         // Stamp sourceScene on every entity THIS scene just spawned (a post-pass
@@ -1067,31 +1038,25 @@ class SceneManagerImpl implements SceneManager {
           { version: CAPTURE_FORM_SCENE_VERSION, resources: [], entities: carriedSnapshots },
           {
             world: nextWorld,
-            clearMarks: false, // once-per-world clear above owns this (A9 defect 1)
             // ⚠️ NO `scenePath` here, deliberately (#1268). These snapshots come from the
             // live world and may originate in SEVERAL different scenes, so there is no one
             // scene identity to seed a derived guid on — and they already carry durable
             // guids from their own files. Passing a path here would re-key them mid-swap.
             fetchPrefab: async () => null, // flattened snapshots never carry a `prefab` ref
             loadModels: false,
-            // Re-seed the marks captured off the dying world, per entity, against
-            // its FRESH id (A9 defect 2). Attribution is per-(oldId → entity), never
-            // a bulk replay — mis-attributing bookkeeping across entities is exactly
-            // the cross-contamination that got an earlier A8 attempt reverted.
+            records: false, // the carried roots' records are seated below, as they stood
+            // Re-seed what was captured off the dying world, per entity, against its FRESH id. Attribution is
+            // per-(oldId → entity), never a bulk replay — mis-attributing bookkeeping across entities is exactly the
+            // cross-contamination that got an earlier A8 attempt reverted.
             onEntitySpawned: (entity: { id(): number }, oldId: number) => {
-              const keys = carriedMarks.get(oldId);
-              if (keys) restoreOverrideMarks(entity as unknown as Entity, keys);
               restoreMarkers(entity as unknown as Parameters<typeof restoreMarkers>[0], carriedMarkers.get(oldId));
               const frameDoc = carriedFrameDocs.get(oldId);
               if (frameDoc && nextWorld) noteFrameRootDoc(nextWorld, entity as unknown as Entity, frameDoc);
             },
           },
         );
-        // The carried roots' records (captured above), seated as they stood: a stale one stays stale.
-        for (const s of carriedRecords) {
-          setInstanceRecord(nextWorld, s.record);
-          if (s.stale) markStale(nextWorld, s.stale, [s.record.rootGuid]);
-        }
+        // The carried roots' records (captured above), seated as they stood.
+        for (const s of carriedRecords) setInstanceRecord(nextWorld, s.record);
       }
 
       if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
@@ -1579,14 +1544,9 @@ class SceneManagerImpl implements SceneManager {
       }
 
       // Only now that the new content exists: drop the outgoing world's global bookkeeping.
-      // ⚠️ These clear PROCESS-GLOBAL maps, not world-scoped ones, and nothing restores them —
-      // so they must sit AFTER the try, not before it. Cleared before a throwing `populate`
-      // they would leave the still-live scene with its prefab override marks gone, and the
-      // next save would then re-diff an explicitly-overridden field against the prefab base,
-      // find no difference, and silently drop the override — the exact defect override marks
-      // exist to prevent. The cost of this ordering: a future `populate` that itself seeds
-      // override marks would have them wiped here, so such a caller must clear them itself.
-      clearAllOverrideMarks();
+      // ⚠️ This clears a PROCESS-GLOBAL map, not a world-scoped one, and nothing restores it —
+      // so it must sit AFTER the try, not before it: cleared before a throwing `populate`, the
+      // still-live scene would lose it.
       clearAuthoredWritesWhileStopped();
 
       // Scene-scoped managers, disposed while the OUTGOING world is still the current one.

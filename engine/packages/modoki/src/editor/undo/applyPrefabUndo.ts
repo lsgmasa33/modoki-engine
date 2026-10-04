@@ -28,7 +28,9 @@ import { reportUndoFailure } from './undoFailure';
 import { parkPrefabChanges } from '../scene/prefabCommit';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import type { SceneData } from '../../runtime/loaders/loadSceneFile';
-import { serializeScene, isSceneLoadSwapping } from '../scene/serialize';
+import { serializeScene, isSceneLoadSwapping, SerializeSupersededError } from '../scene/serialize';
+import { whyWorldNotAuthored } from '../scene/authoredWorld';
+import { NO_RECORD_TO_WRITE } from '../instance/instanceSave';
 import { withAdoption, adoptionsSettled, captureAdoption } from '../scene/sceneAdoption';
 import { guidForEntityId, entityIdForGuid, resolveInstanceContext, type PrefabFile } from '../scene/prefab';
 import { getPrefabSource } from '../scene/prefabCache';
@@ -46,11 +48,14 @@ import { captureEntityIdentity, getAllEntities, readTraitData } from '../../runt
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { PREFAB_EDIT_SCENE_PREFIX } from '../scene/prefabEditWorld';
-import { currentSceneKey } from '../scene/authoredSnapshot';
-import { restoreSide, takeEveryTree, takeTreeRecords, storeStatesTheWorld, reseedEveryTree, type TreeRecords } from '../instance/instanceHistory';
-import { markStale } from '../../runtime/prefab/instanceStore';
+import { currentSceneKey, seatBaseRecords } from '../scene/authoredSnapshot';
+import { restoreSide, seatSide, takeEveryTree, takeTreeRecords, storeStatesTheWorld, type TreeRecords } from '../instance/instanceHistory';
+import { storedInstances, type StoredInstance } from '../../runtime/prefab/instanceStore';
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+
+/** Every record of the current world, copied: one side of an Apply, for a snapshot reload's base seat. */
+const copyStore = (): Map<string, StoredInstance> => new Map([...storedInstances(getCurrentWorld())].map(([g, s]) => [g, structuredClone(s)]));
 
 /** Restore one side of an Apply (#1868, owner ruling D1 = Park): every prefab it wrote goes back IN MEMORY — both caches,
  *  and parked for Save, which writes it (`parkPrefabChanges`) — and the live world is rebuilt from the scene
@@ -83,7 +88,9 @@ async function restoreSnapshot(
     { source, doc: prefab, from: expected },
     ...others.map((o) => ({ source: o.source, doc: o.doc, from: o.expected })),
   ], {
-    // The reload below rebases what it carries itself.
+    // The reload below rebases what it carries itself. It parses the primary's records from the snapshot, and the step
+    // seats a carried base's back after it (`reseat`): before (#2001 S8b), the commit marked every record stale after this
+    // rebuild, and the next write re-seeded the snapshot's exact records from the live tree.
     rebase: false,
     rebuild: async () => {
       // Still THAT world? An Exit swaps a real scene in under the edit world's undo (#1573 close-out re-review), where
@@ -227,7 +234,6 @@ async function restoreRecords(
     { source, doc: prefab, from: expected },
     ...others.map((o) => ({ source: o.source, doc: o.doc, from: o.expected })),
   ], {
-    maintainsRecords: true,
     // The rebase is run below, only in the world this step belongs to: a load in flight replaces the world it would rebuild.
     rebase: false,
     rebuild: async () => {
@@ -240,16 +246,20 @@ async function restoreRecords(
       if (!restored) return;
       // Every other tree the fan-out reached, from ITS records on this side: a load since (a snapshot-path undo of another
       // Apply, a reload) re-parsed its pins from a file the Apply wrote, a member's pin the restored template no longer
-      // has, which R2 keeps and the save wrote back (hunt seed 7529's Inspector form). A tree that cannot be rebuilt is
-      // left to the rebase, from its capture.
-      for (const t of fanned) if (!restoreSide(t.side, t.at)) markStale(world, 'apply', [t.at]);
+      // has, which R2 keeps and the save wrote back (hunt seed 7529's Inspector form). A tree that cannot be rebuilt from
+      // them now still gets them, as they stood on this side (#2001 S8b: before, it was marked stale, and re-seeded from
+      // its live tree, the other side's): one at a Missing Prefab placeholder (a prefab it holds trashed since, then a
+      // load; hunt seed 9405) projects nothing, and the prefab's return reprojects from them; any other is left to the
+      // rebase below, which rebuilds it from them. A tree whose root is gone has nothing to seat.
+      for (const t of fanned) {
+        if (!restoreSide(t.side, t.at) && findEntityByGuid(t.at)) seatSide(t.side);
+      }
       // Every tree left onto the restored documents, each from its own record (`rebuildStaleFrames`).
       await rebaseStaleInstances();
     },
   });
   if (restored === null) return false;
   if (!restored) {
-    markStale(world, 'apply');
     throw new Error('the applied instance could not be rebuilt from its records (its root is gone, or a prefab it reads cannot be read), so only the prefab was restored');
   }
   const id = selGuid ? entityIdForGuid(selGuid) : 0;
@@ -307,33 +317,45 @@ function makeApplyPrefabAction(opts: {
   /** The applying tree's records on each side (#2046 S7.3): when both were taken, the undo and redo restore them and
    *  reload no world; otherwise they reload the scene snapshot. */
   records?: { before: TreeRecords; after: TreeRecords; fanned?: { before: TreeRecords; after: TreeRecords }[] } | null;
+  /** Every record of the world on each side (#2001 S8b): what a snapshot reload seats a kept base's records back to. */
+  stores: { before: ReadonlyMap<string, StoredInstance>; after: ReadonlyMap<string, StoredInstance> };
 }): UndoAction {
   const label = 'Apply to Prefab';
+  // The reload parses the primary's records from the snapshot, and carries a kept base's as they stood, the other side's;
+  // the base re-derive rebuilds its trees from their captures and leaves those records. So each base root whose record
+  // differs from this side's is seated back and its tree rebuilt from it (`seatBaseRecords`, as Stop does), and the
+  // inspected entity re-selected (a rebuild respawns ids). Before (#2001 S8b), every record was marked stale before and
+  // after, and the base's were re-seeded from their live trees: the mark before rode the reload's carry.
+  const reseat = (store: ReadonlyMap<string, StoredInstance>) => {
+    if (!seatBaseRecords(store)) return;
+    const id = opts.selGuid ? entityIdForGuid(opts.selGuid) : 0;
+    if (id) useEditorStore.getState().selectEntity(id);
+  };
   const snapshot = {
     undo: async () => {
       const others = opts.others.map((o) => ({ source: o.source, doc: o.before, expected: o.after }));
       if (!await restoreSnapshot(opts.source, opts.prefabBefore, opts.prefabAfter, opts.sceneBefore, opts.selGuid, others)) throw worldLeft();
       await rederiveBaseInstances(opts.writes.map((w) => ({ source: w.source, from: w.after, to: w.before })), opts.baseBefore, 'Undo');
+      reseat(opts.stores.before);
     },
     redo: async () => {
       const others = opts.others.map((o) => ({ source: o.source, doc: o.after, expected: o.before }));
       if (!await restoreSnapshot(opts.source, opts.prefabAfter, opts.prefabBefore, opts.sceneAfter, opts.selGuid, others)) throw worldLeft();
       await rederiveBaseInstances(opts.writes.map((w) => ({ source: w.source, from: w.before, to: w.after })), opts.baseAfter, 'Redo');
+      reseat(opts.stores.after);
     },
   };
   const recs = opts.records;
   if (recs) {
-    // The snapshot when the store cannot state the world any more (a step since left a record stale): only the applying
-    // tree's list changed, so every OTHER tree is reprojected from its own — which a stale one has not got. Stale before
-    // and after that path, as every step that does not maintain the records (`undoStep`).
-    const viaSnapshot = async (run: () => Promise<void>) => {
-      markStale(getCurrentWorld(), 'apply');
-      try { await run(); } finally { markStale(getCurrentWorld(), 'apply'); }
-    };
+    // The snapshot when the store cannot state the world any more (a record missing): only the applying tree's list
+    // changed, so every OTHER tree is reprojected from its own — which a missing one has not got. Its reload
+    // parses the primary's records and seats a base's (above). One that throws is the step's: a REFUSAL
+    // (`parkPrefabChanges` throws one before anything changed: a prefab trashed since the Apply, hunt seeds 9303, 9344)
+    // leaves the records that state the world the step left alone, and any other throw rolls back (`instanceRollback.ts`).
+    const viaSnapshot = (run: () => Promise<void>) => run();
     return {
       label,
       affectedScenes: opts.affectedScenes,
-      maintainsRecords: true,
       undo: async () => {
         if (!storeStatesTheWorld() || !projectable(recs.before.at)) return viaSnapshot(snapshot.undo);
         const others = opts.others.map((o) => ({ source: o.source, doc: o.before, expected: o.after }));
@@ -355,6 +377,8 @@ function makeApplyPrefabAction(opts: {
     // world is live, which is then a scene this Apply never touched (#1575 close-out re-review). And the step THROWS
     // then, because it applied only half — the file, not the world. `runStep` drops a throwing step with a loud report
     // (#310), rather than pushing it to the other stack as if the world had followed.
+    // Its records are the reload's and the seated base's (above), as on the records path; until #2001 S8b every record was
+    // marked stale before and after it, for the re-seed. A throw rolls back (`undoStep`).
     undo: snapshot.undo,
     redo: snapshot.redo,
   };
@@ -392,6 +416,8 @@ export async function applyToPrefabWithUndo(
   }
 }
 
+const RECORDS_UNREADABLE = 'Apply not done: this instance\'s override list could not be read — reload its scene, and Apply again.';
+
 async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targets?: ApplyTargets, opts: { expect?: string } = {}): Promise<ApplyResult> {
   // …and not over a world an editor route is still adopting (#1698): its snapshot, its scene save and its undo entry
   // would describe a world whose history and path are about to change under them.
@@ -409,7 +435,20 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
   if (settling) await settling;
   // assignGuids so every entity (incl. the selection) has a stable guid the snapshot
   // and selection-restore can key on.
-  const sceneBefore = (await serializeScene({ assignGuids: true })) as unknown as SceneData;
+  // Records exact or refuse (below), asked before the snapshot too: the snapshot's save refuses a tree with no record.
+  if (!takeTreeRecords(rootInstanceId)) return { ...NOT_APPLIED, refused: RECORDS_UNREADABLE };
+  let sceneBefore: SceneData;
+  try { sceneBefore = (await serializeScene({ assignGuids: true })) as unknown as SceneData; } catch (err) {
+    // A reload landing in the serialize's await (it fetches a cold prefab): refused as below.
+    if (err instanceof SerializeSupersededError) {
+      if (!adopted()) return { ...NOT_APPLIED, refused: 'the scene reloaded — open Apply again.' };
+      return { ...NOT_APPLIED, refused: 'the instance was rebuilt meanwhile — open Apply again.' };
+    }
+    // Another tree of the scene holding no record (the console names it): the save refuses it, and so does the Apply,
+    // whose undo snapshot is that save.
+    if (whyWorldNotAuthored() === NO_RECORD_TO_WRITE) return { ...NOT_APPLIED, refused: `Apply not done: ${NO_RECORD_TO_WRITE}.` };
+    throw err;
+  }
   // Anchor selection-restore to the INSTANCE being applied (its root guid), not the
   // editor's transient selection — the scene rebuild on undo/redo mints new ECS ids,
   // and the instance root is the entity the user was working on. Falls back to the
@@ -438,8 +477,11 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
   if (!adopted()) return { ...NOT_APPLIED, refused: 'the scene reloaded — open Apply again.' };
   if (!sameInstance()) return { ...NOT_APPLIED, refused: 'the instance was rebuilt meanwhile — open Apply again.' };
   // The applying tree's records before (#2046 S7.3), taken after the last await: the plan reads the tree as it is here.
-  reseedEveryTree();
+  const storeBefore = copyStore();
   const recordsBefore = takeTreeRecords(rootInstanceId);
+  // Records exact or refuse (#2001 S8b): with a record of the tree missing, nothing states which of its fields are its own
+  // (the marks that did are gone), so the undo could not put them back. Refused before anything is written, as Revert is.
+  if (!recordsBefore) return { ...NOT_APPLIED, refused: RECORDS_UNREADABLE };
   // …and every other tree's, for the ones the fan-out reaches (decided once the Apply says what it wrote, below).
   const everyBefore = takeEveryTree();
   const sceneOf = (guid: string): string => (readTraitData(entityIdForGuid(guid), getTraitByName('EntityAttributes')!) as { sourceScene?: string } | null)?.sourceScene ?? '';
@@ -458,8 +500,8 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
   // instance's own value into the enclosing row, and a re-derive from the row it restores cannot bring that value back.
   const liveAfter = baseBefore && rootGuid ? entityIdForGuid(rootGuid) : 0;
   const baseAfter = liveAfter && ctx ? captureSide(liveAfter, rootGuid, ctx.source) : null;
-  // …and after: the Apply rebuilt the applying tree from its capture (its U15 subtraction) and left its records stale, so
-  // they are re-seeded from that capture here — fresh, the after side. Each side names the roots only the other holds.
+  // …and after: the applying tree's records as the Apply left them, the after side (none to be had, stale or missing,
+  // leaves the step on the snapshot route: nothing re-seeds them, #2001 S8b). Each side names the roots only the other holds.
   const topAfter = recordsBefore ? entityIdForGuid(recordsBefore.at) : 0;
   const recordsAfter = recordsBefore && topAfter ? takeTreeRecords(topAfter, recordsBefore.side.records.keys()) : null;
   const records = recordsBefore && recordsAfter ? {
@@ -469,6 +511,8 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
     // fixed here (#2046 S7.3, hub ruling 2026-10-03). An instance added later, or one in another scene, is not in it.
     fanned: fannedTrees(everyBefore, recordsBefore.at, new Set(writes.map((w) => w.source)), applyingScene, sceneOf),
   } : null;
+  // After the records are taken.
+  const storeAfter = copyStore();
   pushAction(makeApplyPrefabAction({
     source: result.source,
     prefabBefore: result.prefabBefore,
@@ -483,6 +527,7 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
     others: writes.filter((w) => w.source !== result.source),
     writes,
     records,
+    stores: { before: storeBefore, after: storeAfter },
   }));
   return result;
 }

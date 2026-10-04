@@ -7,7 +7,7 @@
  *  plus throwaway lights + an HDR environment so the prefab is visible. On save we
  *  serialize the prefab subtree back out, excluding the scaffold entities. */
 
-import { staleAroundUnless } from '../../runtime/prefab/instanceStore';
+import { rollbackOnThrow } from '../instance/instanceRollback';
 import { bankInstanceRecords, cloneInstanceStore, dropRecordBank, rekeyRecordBank, steadyRecords, type RecordBank } from '../../runtime/prefab/recordBank';
 import { movedSceneFile, type PathMove } from '../utils/assetPaths';
 import { normScenePath } from '../../runtime/scene/scenePathKey';
@@ -22,7 +22,7 @@ import { channelsOf } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID, SCAFFOLD_PREFIX } from './prefabEditGuids';
 import { warnInertPrefabSizes } from './prefab';
 import { getCachedPrefabSync, preloadNestedPrefabs, fetchPrefabSource, prefabReadRefusal } from './prefabCache';
-import { serializePrefab } from './prefabSerialize';
+import { RecordlessRowError, serializePrefab } from './prefabSerialize';
 import { commitPrefabWrite, commitPrefabChanges } from './prefabCommit';
 import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, getCurrentScenePath, saveScene, serializeScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
@@ -1099,18 +1099,24 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
     }
     unresolvedRows.set(e.id(), { localId: 0, name: '', prefab: ref.source, traits: {}, ...channels } as PrefabEntity);
   }
-  const prefab = serializePrefab(rootId, guid, {
-    unresolvedRows,
-    preserveLocalIds: preservedLocalIds,
-    preserveNodeGuids,
-    name: previous.name,
-    // A row the prefab's own move placed under a nested member keeps its original row parent (#1437).
-    rowParents: new Map(previous.entities.map((e) => [e.localId, ((e.traits.EntityAttributes as { parentId?: number } | undefined)?.parentId) ?? 0])),
-    onRuntimeExcluded: (n) => { runtimeExcluded = n; },
-    onRows: (r) => { rowsById = r; },
-    localIdFloor: session.floor,
-    keptMoves: keyedMoves(previous.moved),
-  });
+  let prefab: PrefabFile | null;
+  try {
+    prefab = serializePrefab(rootId, guid, {
+      unresolvedRows,
+      preserveLocalIds: preservedLocalIds,
+      preserveNodeGuids,
+      name: previous.name,
+      // A row the prefab's own move placed under a nested member keeps its original row parent (#1437).
+      rowParents: new Map(previous.entities.map((e) => [e.localId, ((e.traits.EntityAttributes as { parentId?: number } | undefined)?.parentId) ?? 0])),
+      onRuntimeExcluded: (n) => { runtimeExcluded = n; },
+      onRows: (r) => { rowsById = r; },
+      localIdFloor: session.floor,
+      keptMoves: keyedMoves(previous.moved),
+    });
+  } catch (e) {
+    if (e instanceof RecordlessRowError) return { error: e.message };
+    throw e;
+  }
   // By guid, read NOW: the save records it only after its write's await, when an ecs id may name another entity.
   const rows = new Map<string, number>();
   for (const [ecsId, localId] of rowsById) {
@@ -1150,10 +1156,11 @@ async function exitPrefabEditingUnmarked(): Promise<string | null> {
   return target;
 }
 
-// #2046 S7.6: the Exit's reload of the return scene takes back the records the open banked (`bankSceneRecords`) where its
-// file still states them, and parses fresh ones elsewhere — so a leave that reloaded a scene marks nothing. One with no
-// scene to go back to, or that throws, marks the store stale, as before.
-export const exitPrefabEditing = staleAroundUnless('prefabLeave', exitPrefabEditingUnmarked, (target) => target !== null);
+// #2046 S7.6 / #2001 S8b: the Exit's reload of the return scene takes back the records the open banked
+// (`bankSceneRecords`) where its file still states them, and parses fresh ones elsewhere, so a leave marks nothing. One
+// with no scene to go back to ends the session in place, in a world whose records its edits kept through the door. One
+// that throws rolls back (`instanceRollback.ts`).
+export const exitPrefabEditing = rollbackOnThrow('prefabLeave', exitPrefabEditingUnmarked);
 
 /** Bank the scene world's exact records for the Exit's reload of its file (`recordBank.ts`), with the entries the world
  *  serializes to now — after the open's save, so they are the file's when that save landed. A world with no file (an
@@ -1170,7 +1177,7 @@ async function bankSceneRecords(): Promise<{ key: string; guid?: string; bank: R
     // move to follow. A move keeps the world, so the world check below still holds.
     const key = sceneManager.getCurrent()?.path;
     const guid = key ? [...sceneManager.getLoadedScenes().values()].find((e) => e.role === 'primary' && normScenePath(e.path) === normScenePath(key))?.guid : undefined;
-    if (key && getCurrentWorld() === world) return { key, guid, bank: bankInstanceRecords(key, steadyRecords(recordsAt, world), entities as unknown as SceneEntityEntry[], 'prefabLeave') };
+    if (key && getCurrentWorld() === world) return { key, guid, bank: bankInstanceRecords(key, steadyRecords(recordsAt, world), entities as unknown as SceneEntityEntry[]) };
   } catch (err) {
     console.warn(`[PrefabEdit] the scene's instance records were not banked for the return (#2046 S7.6): ${(err as Error)?.message ?? err}`);
   }

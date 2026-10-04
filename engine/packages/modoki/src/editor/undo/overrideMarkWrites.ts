@@ -1,40 +1,21 @@
-/** THE editor's override-mark writes: how an editor gesture tells the scene save that a prefab-instance field is
- *  the instance's own edit (#1709). The marks are the instance's RECORDED override list (#1914, docs/prefabs.md § I2).
- *
- *  The save keeps a member's field only when it is MARKED (the mark gate in `captureInstanceOverrides`; the marks
- *  themselves are `runtime/loaders/overrideMarks.ts`). So every editor write that changes a field on a member has to
- *  leave the mark in the state the save needs, and every undo has to put it back. #1709 found gestures that wrote raw
- *  (the UI resize/move handles, every `sortOrder` rewrite, re-adding a trait the template defines) and saved nothing,
- *  and undos that restored the value but kept the mark, so an undone edit was saved pinned at the old value. The
- *  writes go through here instead of marking at each call site.
+/** THE editor's override writes: how an editor gesture records that a prefab-instance field is the instance's own edit
+ *  (#1709), in the instance's override list, its record (#2001; docs/prefabs.md § I2). Until #2001 S8b a per-entity mark
+ *  store (`runtime/loaders/overrideMarks.ts`) said it too, and every write and undo here kept it in step; the record is
+ *  now the only statement, read through the view (`instanceOverrideView.ts`).
  *
  *  ONE rule for every write since #1914 R2 (owner rulings F2, F3; Unity's): {@link recordOverridesByDiff} records each
- *  field the write left differing from the instance's base, and removes NOTHING. A deliberate edit (the Inspector, a
- *  gizmo commit, agent `setTrait`, Paste Component Values, through {@link markOverrideIfInstance}) and a write the user
- *  did not aim at a field (a sibling renumber's `sortOrder`, a UI handle drag, a re-added trait) take the same rule: a
- *  renumber records only the siblings it moved off their base, so the instance's child order is not pinned whole (hub,
- *  2026-09-28), and a value typed or dragged back onto the base keeps the record an earlier write made. A record leaves
- *  the list only by Revert, Apply, or an undo restoring the list it found.
+ *  field the write left differing from the instance's base (`instanceEdits.setFields`), and removes NOTHING. A deliberate
+ *  edit (the Inspector, a gizmo commit, agent `setTrait`, Paste Component Values, through {@link markOverrideIfInstance})
+ *  and a write the user did not aim at a field (a sibling renumber's `sortOrder`, a UI handle drag, a re-added trait)
+ *  take the same rule. A record leaves the list only by Revert, Apply, or an undo restoring the list it found.
  *
- *  The base is {@link instanceBase}, the one the Inspector highlight and the override list diff against.
- *
- *  An undo that RE-LINKS or RE-ADDS (Detach's, Remove Component's, a delete's relink of the members its frame-ending
- *  unlinked) restores values from its own snapshot, so it takes the marks with them: {@link captureMarks} with the
- *  snapshot, {@link restoreMarks} with the restore (#1794, #1800). Trusting the side store instead held only while the
- *  world the forward step ran in was still there: a rebuild between the step and its undo (Play→Stop, a prefab-edit
- *  visit, returning to the scene) re-seeds the marks from the FILE, which has none for a detached tree or a removed
- *  component, and the next save dropped the values the screen still showed. Unity keeps its overrides as data on the
- *  instance (`m_Modifications`), which its undo snapshots like any other; this is that rule for Modoki's side store. */
+ *  An undo puts the rows its step found back (`putFieldRows`, `instanceEdits.putRows`), and a field the record leaves
+ *  unrecorded takes the CURRENT template's value ({@link takeUnmarkedFromBase}, #1800). */
 
 import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { findEntity, writeTraitField, cloneTraitValues } from '../../runtime/core/ecs/entityUtils';
-import { markOverride, unmarkOverride, getOverrideMarkSet, getStoredOverrideMarks, getCarriedOverrideMarks, restoreOverrideMarks, clearOverrideMarks, ROTATION_MARKS } from '../../runtime/loaders/overrideMarks';
 import { markUIDirty } from '../../runtime/core/uiDirty';
-import { findEntityByGuid, getCurrentWorld } from '../../runtime/core/ecs/world';
-import { markStale } from '../../runtime/prefab/instanceStore';
-import { relinkDetachedMembers, type DetachedMember } from '../../runtime/core/ecs/memberHome';
-import { getCachedPrefabSync } from '../scene/prefabCache';
 import { baseTokenResolver } from '../scene/prefabTokens';
 import { hasMemberToken } from '../../runtime/core/templateRefs';
 import { collectComparableTraits, getOverrideValues, recordedOverrides } from '../scene/prefabInstanceOverrides';
@@ -47,6 +28,8 @@ import type { UndoAction } from './undoManager';
 import { entityRef, buildGuidIndex, requireWith } from './entityRef';
 import { refsCheck } from './stepCheck';
 import * as instanceEdits from '../instance/instanceEdits';
+import { UndoRefusedError } from './undoFailure';
+import { overrideKeysOf } from '../instance/instanceOverrideView';
 
 interface MemberPi { source?: string; localId?: number; rootInstanceId?: number }
 
@@ -66,25 +49,6 @@ export function markOverrideIfInstance(entityId: number, traitName: string, fiel
   if (meta) recordOverridesByDiff(entityId, meta, [field]);
 }
 
-/** The fields of `meta` on member `entityId` whose live value differs from what the instance resolves them to with
- *  no override of its own, or null when that base cannot be read (its template is not cached). A trait the template
- *  does not define here counts as differing whole (`getOverrideValues`' added-trait rule). */
-function fieldsOffBase(entityId: number, meta: TraitMeta, pi: MemberPi): Set<string> | null {
-  const diff = traitDiffOffBase(entityId, meta, pi);
-  return diff === null ? null : new Set(Object.keys(diff ?? {}));
-}
-
-/** The member's diff of `meta` against its base (`getOverrideValues`): undefined when nothing differs, the whole trait
- *  when the base lacks it (a tag: `{}`), null when the base cannot be read. */
-function traitDiffOffBase(entityId: number, meta: TraitMeta, pi: MemberPi): Record<string, unknown> | undefined | null {
-  if (!pi.source || !pi.localId) return null;
-  const prefab = getCachedPrefabSync(pi.source);
-  if (!prefab) return null;
-  const root = pi.rootInstanceId || 0;
-  const current = collectComparableTraits(entityId, [meta]);
-  return getOverrideValues(pi.localId, current, root ? instanceBase(root, prefab) : prefab, root ? baseTokenResolver(root) : undefined)[meta.name];
-}
-
 /** THE write-time recorder (#1914 R2, docs/prefabs.md § I2/I17): after an editor write to `fields` of `meta` (every
  *  field the entity's trait holds when omitted), record each one whose live value now differs from the instance's
  *  base, and remove NOTHING. Unity's rule (`RecordPrefabInstancePropertyModifications`: "record property modifications
@@ -96,11 +60,8 @@ function traitDiffOffBase(entityId: number, meta: TraitMeta, pi: MemberPi): Reco
  *  neither does a write that leaves it at that value. A base that cannot be read records, so what the screen shows is
  *  kept. No-op off an instance, for a tag, and for a trait the entity does not have. */
 export function recordOverridesByDiff(entityId: number, meta: TraitMeta, fields?: readonly string[]): void {
-  // #2001 S4 (#2014): the door records the same write in the instance list FIRST — before the marks, so a stale record's
-  // re-seed from the mark-based capture cannot see this edit. Every field writer reaches the door through here until S8
-  // deletes the recorder and the writers call `setFields` themselves.
+  // The door records the write in the instance list (#2001 S4, #2014; the marks it also wrote went in S8b).
   instanceEdits.setFields(entityId, meta.name, fields);
-  recordByDiff(entityId, meta, fields);
   // A record can land in a later event than the write it follows — a handle drag writes live on every frame and records on
   // pointer-up, after the last frame's dirty signal was consumed — so the recorder signals the editor itself. The
   // Inspector re-reads the accent (`memberOverrideKeys`) on that signal; without it the accent stayed off until the
@@ -108,112 +69,13 @@ export function recordOverridesByDiff(entityId: number, meta: TraitMeta, fields?
   markUIDirty();
 }
 
-function recordByDiff(entityId: number, meta: TraitMeta, fields?: readonly string[]): void {
-  // A tag has no values to diff.
-  if (meta.name === 'PrefabInstance' || meta.category === 'tag') return;
-  const m = memberEntity(entityId);
-  if (!m) { recordNodeByDiff(entityId, meta, fields); return; }
-  if (!m.entity.has(meta.trait)) return;
-  const off = fieldsOffBase(entityId, meta, m.pi);
-  const list = fields ?? Object.keys(collectComparableTraits(entityId, [meta])[meta.name] ?? {});
-  // Rotation is ONE record (#1880 F5, `ROTATION_MARKS`): any axis off its base records the orientation.
-  const isRotation = (f: string) => (ROTATION_MARKS as readonly string[]).includes(`${meta.name}.${f}`);
-  const rotationOff = off === null || [...off].some(isRotation);
-  for (const f of list) {
-    if (isRotation(f) ? rotationOff : off === null || off.has(f)) markOverride(m.entity, meta.name, f);
-  }
-}
-
-/** Not a field edit on a node: identity the load re-derives (`guid`) and the live ecs parent (`parentId`). The node diff's
- *  rule (`nodeRowDiff.ts`). */
-const NODE_IDENTITY_FIELDS: Record<string, readonly string[]> = { EntityAttributes: ['guid', 'parentId'] };
-
-/** {@link recordOverridesByDiff} for a PLAIN node a template added (#1914 R3a): it is no instance member, so its base is
- *  the template node that spawned it ({@link templatePlainNode}), compared as the save's node diff compares (a field
- *  either side omits reads as the schema default; a trait the node lacks differs whole). No-op for a node no enclosing
- *  layer states — the writer's own, written whole by the save. */
-function recordNodeByDiff(entityId: number, meta: TraitMeta, fields?: readonly string[]): void {
-  const e = findEntity(entityId);
-  if (!e || !e.has(meta.trait)) return;
-  const node = nodeDiffer(entityId, meta);
-  if (!node) return;
-  const { live, differs, identity } = node;
-  const list = (fields ?? Object.keys(live)).filter((f) => !identity.includes(f));
-  const isRotation = (f: string) => (ROTATION_MARKS as readonly string[]).includes(`${meta.name}.${f}`);
-  const rotationOff = list.some(isRotation) && Object.keys(live).some((f) => isRotation(f) && differs(f));
-  for (const f of list) if (isRotation(f) ? rotationOff : differs(f)) markOverride(e, meta.name, f);
-}
-
-/** The node diff {@link recordNodeByDiff} records by, for `meta` on PLAIN template node `entityId`: its live values, and
- *  whether a field differs from the template node that spawned it ({@link templatePlainNode}), compared as the save's node
- *  diff compares (a field either side omits reads as the schema default; a trait the node lacks differs whole; identity is
- *  never a field). Null when `entityId` is no such node. */
-function nodeDiffer(entityId: number, meta: TraitMeta): { live: Record<string, unknown>; differs: (f: string) => boolean; identity: readonly string[] } | null {
-  const tpl = templatePlainNode(entityId);
-  if (!tpl) return null;
-  const live = collectComparableTraits(entityId, [meta])[meta.name] ?? {};
-  const raw = tpl.node.traits?.[meta.name];
-  const chain = raw && typeof raw === 'object' ? raw as Record<string, unknown> : undefined;
-  const resolve = baseTokenResolver(tpl.frame);
-  const schema = (meta.trait as { schema?: Record<string, unknown> }).schema ?? {};
-  const dflt = (f: string) => { const d = schema[f]; return typeof d === 'function' ? (d as () => unknown)() : d; };
-  const identity = NODE_IDENTITY_FIELDS[meta.name] ?? [];
-  const differs = (f: string): boolean => {
-    if (identity.includes(f)) return false;
-    if (!chain) return true;
-    const a = f in live ? live[f] : dflt(f);
-    const b = resolve(f in chain ? chain[f] : dflt(f));
-    return a !== undefined && !valuesEqual(a, b);
-  };
-  return { live, differs, identity };
-}
-
-/** Which of the entity's RECORDS still differ from its base — the base {@link recordOverridesByDiff} records against (an
- *  instance member's, through the layers enclosing its frame; a plain template node's template node) — or null when that
- *  base cannot be read. A record of a trait the entity no longer has is kept (F5's unused record, not this question).
- *  Rotation is one record (`ROTATION_MARKS`): its axes differ together.
- *
- *  For Create Prefab's tag (#1932, R4-L1 finding 1): a nested frame's members keep their records, and the new document's
- *  rows now carry their values, so each record that no longer differs is the NEW prefab's statement, not the scene's.
- *  Asked AFTER the tag, so the base is the new document's. Not a reconcile: the caller removes records only at a
- *  re-scoping act (the list's owner changed), never after an edit (F3). */
-export function recordsOffBase(entityId: number): Set<string> | null {
-  const e = findEntity(entityId);
-  const records = e ? getStoredOverrideMarks(e) : undefined;
-  const out = new Set<string>();
-  if (!e || !records?.size) return out;
-  const m = memberEntity(entityId);
-  const byTrait = new Map<string, string[]>();
-  for (const k of records) { const i = k.indexOf('.'); const t = k.slice(0, i); byTrait.set(t, [...(byTrait.get(t) ?? []), k.slice(i + 1)]); }
-  for (const [traitName, fields] of byTrait) {
-    const meta = getTraitByName(traitName);
-    if (!meta || !e.has(meta.trait)) { for (const f of fields) out.add(`${traitName}.${f}`); continue; }
-    if (meta.category === 'tag') {
-      // A tag's record is off while the base lacks the tag (the save writes it as an added component).
-      const tpl = m ? null : templatePlainNode(entityId);
-      if (!m && !tpl) return null;
-      const lacks = m ? traitDiffOffBase(entityId, meta, m.pi) : tpl!.node.traits?.[traitName] === undefined ? {} : undefined;
-      if (lacks === null) return null;
-      if (lacks !== undefined) for (const f of fields) out.add(`${traitName}.${f}`);
-      continue;
-    }
-    let off: (f: string) => boolean;
-    if (m) {
-      const set = fieldsOffBase(entityId, meta, m.pi);
-      if (!set) return null;
-      off = (f) => set.has(f);
-    } else {
-      const node = nodeDiffer(entityId, meta);
-      if (!node) return null;
-      off = node.differs;
-    }
-    const rotationOff = [...ROTATION_MARKS].some((k) => k.startsWith(`${traitName}.`) && off(k.slice(traitName.length + 1)));
-    for (const f of fields) {
-      const isRotation = (ROTATION_MARKS as readonly string[]).includes(`${traitName}.${f}`);
-      if (isRotation ? rotationOff : off(f)) out.add(`${traitName}.${f}`);
-    }
-  }
-  return out;
+/** {@link writeTraitFieldMarked} without the door (#2001 S8b): for a write whose record its op states itself afterwards —
+ *  a fresh copy's order, which the copy's seat (`seatCopy`, `afterCopy`) takes from the live copy once it is spawned.
+ *  Through the door, the write asked for the copy's record before the seat and re-seeded its tree from the capture, which
+ *  the seat then replaced (the hunt tally's commonest re-seed). */
+export function writeTraitFieldMarkedBeforeSeat(entityId: number, meta: TraitMeta, field: string, value: unknown): void {
+  writeTraitField(entityId, meta, field, value);
+  markUIDirty();
 }
 
 /** Write one field, then record it by {@link recordOverridesByDiff}. THE write for a field an editor gesture changes
@@ -225,11 +87,11 @@ export function writeTraitFieldMarked(entityId: number, meta: TraitMeta, field: 
 }
 
 /** The Hierarchy's sibling renumber as one undo step, built (but not applied: call `redo()` once, then push it) with
- *  the marks it must put back. Forward, each `sortOrder` is written marked by value ({@link writeTraitFieldMarked}):
- *  marking every renumbered sibling would pin the instance's whole child order against the template. Back, each
- *  sibling gets its old value AND its old mark ({@link restorableSortOrderWrite}), snapshotted HERE, before the
- *  renumber runs: a snapshot taken after it would hold the marks the renumber added, and the undo would pin the old
- *  order (#1709). Lives here, not in the panel, so the ordering is testable. */
+ *  the rows it must put back. Forward, each `sortOrder` is written and recorded by value ({@link writeTraitFieldMarked}):
+ *  recording every renumbered sibling would pin the instance's whole child order against the template. Back, each
+ *  sibling gets its old value written raw, then its old row (`putFieldRows`), taken HERE, before the renumber runs: a
+ *  row taken after it would hold the records the renumber added, and the undo would pin the old order (#1709). Lives
+ *  here, not in the panel, so the ordering is testable. */
 export function makeSortOrderRenumberAction(changes: SiblingSortChange[], label = 'Renumber siblings'): UndoAction | null {
   const attrMeta = getTraitByName('EntityAttributes');
   if (!attrMeta) return null;
@@ -242,38 +104,51 @@ export function makeSortOrderRenumberAction(changes: SiblingSortChange[], label 
     live = new Map(changes.map((c, i) => [c.id, requireWith(refs[i], idx)]));
   };
   const at = (id: number) => live.get(id) ?? id;
-  const restore = restorableSortOrderWrite(changes.map((c) => c.id));
   const inner = makeReorderSiblingsAction(
     changes, (id, sort) => writeTraitFieldMarked(at(id), attrMeta, 'sortOrder', sort), label,
-    (id, sort) => restore(id, sort, at(id)),
+    (id, sort) => writeTraitField(at(id), attrMeta, 'sortOrder', sort),
   );
-  // #2010: `pin`'s refs, askable before a batch runs. The renumber changes no entity's presence.
-  return { ...inner, undo: () => { pin(); inner.undo(); }, redo: () => { pin(); inner.redo(); }, check: refsCheck(() => refs) };
-}
-
-/** The UNDO of a `sortOrder` rewrite on `ids`: a writer that restores the value AND the `sortOrder` mark each entity
- *  has now (call it before the rewrite). Re-reconciling on the way back would drop a stored override that happened to
- *  equal the base, and the save would lose it (#1709 close-out review). Called with the id it was built with (the
- *  key of the mark it took) and the id that entity lives at now. */
-function restorableSortOrderWrite(ids: readonly number[]): (id: number, sort: number, liveId?: number) => void {
-  const attrMeta = getTraitByName('EntityAttributes');
-  const was = new Map(ids.map((id) => [id, markStateOf(id, 'EntityAttributes', ['sortOrder'])]));
-  return (id, sort, liveId = id) => {
-    if (!attrMeta) return;
-    writeTraitField(liveId, attrMeta, 'sortOrder', sort);
-    const state = was.get(id);
-    if (state) putMarkState(liveId, 'EntityAttributes', state);
+  // #2001 S8b: each sibling's row (an instance root's placement) as the renumber found it, put back by the undo after its
+  // raw writes; and as the first redo (the forward) left it, put back by every later redo. Before, the undo marked every
+  // record stale and the re-seed read the restored order back off the live tree.
+  const ids = () => changes.map((c) => at(c.id));
+  const before = instanceEdits.rowsOf(changes.map((c) => c.id));
+  let after: (instanceEdits.RowSnap | null)[] | null = null;
+  return {
+    ...inner,
+    undo: () => { requireRowRecords(before); pin(); inner.undo(); putFieldRows(ids(), before, 'EntityAttributes', ['sortOrder']); },
+    redo: () => {
+      requireRowRecords(after);
+      pin();
+      inner.redo();
+      if (after) putFieldRows(ids(), after, 'EntityAttributes', ['sortOrder']);
+      else after = instanceEdits.rowsOf(ids());
+    },
+    // #2010: `pin`'s refs, askable before a batch runs. The renumber changes no entity's presence.
+    check: refsCheck(() => refs),
   };
 }
 
 /** Put back the rows a field step found or left (#2046 S7.2; rule 8: undo and redo restore the EXACT list, never a
- *  re-derived one — D-8a, D-8b) after its live writes. A row that cannot be put (its record cannot be had: a frame
- *  whose prefab is missing, which the capture cannot state) leaves the records stale, as every step that does not
- *  maintain them does, and its fields take the base the marks name (`takeUnmarkedFromBase`, which reads such a frame's
- *  built document, #1939 rule 2), as before S7. */
+ *  re-derived one — D-8a, D-8b) after its live writes. Where a row cannot be shown from its record (a frame whose prefab
+ *  is missing, whose record the row is still put back into), or the step found no record to take its rows from,
+ *  its fields take the base the marks name (`takeUnmarkedFromBase`, which reads such a frame's built document, #1939 rule
+ *  2), as before S7. A record the rows name that cannot be had any more throws, and the step rolls back (`putRows`).
+ *  Nothing is marked stale (#2001 S8b): before, every record of the world was. */
+/** Refuse a field or component step's undo or redo BEFORE its live writes when a record its rows name cannot be had any
+ *  more (#2001 S8b): a later step took it (a Create Prefab takes the record of an instance it swallows into its new one,
+ *  whose record then states the node), so putting the rows back could not keep the records exact. Before, the step wrote
+ *  live and marked every record stale. Call it after the step's refs are required, before its first write. */
+export function requireRowRecords(rows: readonly (instanceEdits.RowSnap | null)[] | null | undefined): void {
+  if (!rows || instanceEdits.rowsHeld(rows)) return;
+  throw new UndoRefusedError(
+    'The prefab instance this step edited is no longer stated by the records it put back (a later step, such as a Create Prefab, took it into another instance), so nothing was changed.',
+    'its prefab instance was taken into another one since',
+  );
+}
+
 export function putFieldRows(ids: readonly number[], rows: readonly (instanceEdits.RowSnap | null)[] | null, trait: string, fields: readonly string[]): void {
   if (rows && instanceEdits.putRows(ids, rows, trait, fields)) return;
-  markStale(getCurrentWorld(), 'undo');
   const meta = getTraitByName(trait);
   if (meta) for (const id of ids) takeUnmarkedFromBase(id, [meta], [...fields]);
 }
@@ -286,80 +161,21 @@ export function putFieldRows(ids: readonly number[], rows: readonly (instanceEdi
 export function makeLiveFieldEditAction<T>(
   entityId: number, trait: string, field: string, setLive: (id: number, value: T) => void, before: T, after: T, label: string,
 ): UndoAction {
-  const oldMarks = markStateOf(entityId, trait, [field]); // put back by the undo (#1709)
-  // From a record fresh before the commit, or none: the gesture already wrote live, so a re-seed would capture its value
-  // (#2046 S7 close-out review F1). Without them the step marks the records stale, as a step that keeps none.
+  // From the record as it stood before the commit, or none: the gesture already wrote live, so rows read now would state
+  // its value (#2046 S7 close-out review F1). Without them (no record) the step puts back the live values and marks only.
   const oldRows = instanceEdits.priorRowsOf([entityId]);
   setLive(entityId, after);
   markOverrideIfInstance(entityId, trait, field);
-  const newMarks = markStateOf(entityId, trait, [field]);
   const newRows = oldRows && instanceEdits.rowsOf([entityId]);
   const ref = entityRef(entityId);
-  const put = (value: T, marks: MarkState, rows: typeof oldRows) => {
+  const put = (value: T, rows: typeof oldRows) => {
     // `require` (I19): a target that is gone, or a placeholder now, refuses rather than reading as done.
     const id = ref.require();
+    requireRowRecords(rows);
     setLive(id, value);
-    putMarksOnly(id, trait, marks);
     putFieldRows([id], rows, trait, [field]);
   };
-  return { label, undo: () => put(before, oldMarks, oldRows), redo: () => put(after, newMarks, newRows), ...(oldRows ? { maintainsRecords: true as const } : {}) };
-}
-
-/** The marks half of {@link putMarkState}, with no value taken from a base: for a step that puts its rows back
- *  (`instanceEdits.putRows`, #2046 S7.2), which shows an unrecorded field at the fold of the RECORD instead (D-8b: the
- *  base read off the capture was a second, re-derived answer to the same question). False when the entity is gone. */
-export function putMarksOnly(entityId: number, traitName: string, state: MarkState): boolean {
-  const e = findEntity(entityId);
-  if (!e) return false;
-  for (const [f, marked] of Object.entries(state)) {
-    if (marked) markOverride(e, traitName, f);
-    else unmarkOverride(e, traitName, f);
-  }
-  return true;
-}
-
-/** Whether each of `fields` of `traitName` is marked on the entity now: taken before a write, so its undo can put
- *  the marks back with {@link putMarkState} (and after it, for the redo). */
-export type MarkState = Record<string, boolean>;
-export function markStateOf(entityId: number, traitName: string, fields: readonly string[]): MarkState {
-  const e = findEntity(entityId);
-  const set = e ? getCarriedOverrideMarks(e) : undefined;
-  const out: MarkState = {};
-  for (const f of fields) out[f] = !!set?.has(`${traitName}.${f}`);
-  return out;
-}
-export function putMarkState(entityId: number, traitName: string, state: MarkState): void {
-  if (!putMarksOnly(entityId, traitName, state)) return;
-  const meta = getTraitByName(traitName);
-  if (meta) takeUnmarkedFromBase(entityId, [meta], Object.keys(state));
-}
-
-/** An entity's override marks as plain data, taken WITH an undo snapshot: its whole set, or only `trait`'s keys when
- *  the step touches one trait. Survives any world rebuild, since it holds no entity. */
-export interface MarkCapture { trait?: string; keys: string[] }
-export function captureMarks(entityId: number, trait?: string): MarkCapture {
-  const e = findEntity(entityId);
-  const all = e ? [...(getCarriedOverrideMarks(e) ?? [])] : [];
-  return trait ? { trait, keys: all.filter((k) => k.startsWith(`${trait}.`)) } : { keys: all };
-}
-/** The marks half of {@link restoreMarks}, with no value taken from a base: for a step that puts its rows back
- *  (`instanceEdits.putRows`, #2046 S7.2; see {@link putMarksOnly}). False when the entity is gone. */
-export function restoreMarksOnly(entityId: number, capture: MarkCapture): boolean {
-  const e = findEntity(entityId);
-  if (!e) return false;
-  if (!capture.trait) clearOverrideMarks(e);
-  else for (const k of [...(getStoredOverrideMarks(e) ?? [])]) if (k.startsWith(`${capture.trait}.`)) unmarkOverride(e, capture.trait, k.slice(capture.trait.length + 1));
-  restoreOverrideMarks(e, capture.keys);
-  return true;
-}
-
-/** Put a {@link captureMarks} back: the marks in its scope become exactly the captured ones, and the fields they leave
- *  unmarked take the CURRENT template's values ({@link takeUnmarkedFromBase}). A trait the current template no longer
- *  gives the member is the instance's own now, an added component, so its fields are recorded (`recordAdded`). */
-export function restoreMarks(entityId: number, capture: MarkCapture): void {
-  if (!restoreMarksOnly(entityId, capture)) return;
-  const meta = capture.trait ? getTraitByName(capture.trait) : undefined;
-  if (!capture.trait || meta) takeUnmarkedFromBase(entityId, meta ? [meta] : undefined, undefined, true);
+  return { label, undo: () => put(before, oldRows), redo: () => put(after, newRows) };
 }
 
 /** After an undo puts a member's marks back, bring every UNMARKED field in scope (`traits`, every trait the entity has
@@ -379,10 +195,6 @@ export function restoreMarks(entityId: number, capture: MarkCapture): void {
  *  the overrides. No-op off an instance, and when neither the cache nor the frame's record holds the template. */
 export function takeUnmarkedFromBase(
   entityId: number, traits?: readonly TraitMeta[], fields?: readonly string[],
-  /** Record every field of a trait the base does not have (#1914 R1): an undo snapshot taken while a layer gave the
-   *  member that trait holds its fields unrecorded, and once the layer has dropped it the save writes the trait whole as
-   *  an added component, which a reload records. The live marks must be what that reload gives. */
-  recordAdded = false,
 ): void {
   const m = memberEntity(entityId);
   if (!m) { takeUnmarkedNodeFromBase(entityId, traits, fields); return; }
@@ -401,12 +213,10 @@ export function takeUnmarkedFromBase(
   const metas = (traits ?? getAllTraits()).filter((t) => t.category !== 'tag' && m.entity.has(t.trait));
   const current = collectComparableTraits(entityId, metas);
   const diffs = getOverrideValues(localId, current, base, resolve);
-  const kept = recordedOverrides(diffs, getOverrideMarkSet(m.entity), baseEntity, () => instanceMovedMembers(root, prefab)(entityId, !!diffs['Transform']), current);
-  if (recordAdded) {
-    for (const [traitName, fs] of Object.entries(diffs)) {
-      if (baseEntity.traits[traitName] === undefined) for (const f of Object.keys(fs)) markOverride(m.entity, traitName, f);
-    }
-  }
+  // No record, nothing known: which fields are the instance's own is the record's to say, so none is taken from the base.
+  const recorded = overrideKeysOf(m.entity);
+  if (!recorded) return;
+  const kept = recordedOverrides(diffs, recorded, baseEntity, () => instanceMovedMembers(root, prefab)(entityId, !!diffs['Transform']), current);
   for (const [traitName, fs] of Object.entries(diffs)) {
     const meta = getTraitByName(traitName);
     const baseData = baseEntity.traits[traitName] as Record<string, unknown>;
@@ -425,6 +235,10 @@ export function takeUnmarkedFromBase(
   }
 }
 
+/** Not a field edit on a node: identity the load re-derives (`guid`) and the live ecs parent (`parentId`). The node diff's
+ *  rule (`nodeRowDiff.ts`). */
+const NODE_IDENTITY_FIELDS: Record<string, readonly string[]> = { EntityAttributes: ['guid', 'parentId'] };
+
 /** {@link takeUnmarkedFromBase} for a PLAIN node a template added (no `PrefabInstance`, so not a member; #1932, hunt seed
  *  1224): its base is the template node that spawned it ({@link templatePlainNode}), and the save writes only the fields
  *  it RECORDED (`nodeRowDiff`'s `recordedOf`), so an unrecorded field restored from an undo snapshot taken before a saved
@@ -436,7 +250,8 @@ function takeUnmarkedNodeFromBase(entityId: number, traits?: readonly TraitMeta[
   const e = findEntity(entityId);
   const tpl = e ? templatePlainNode(entityId) : null;
   if (!e || !tpl) return;
-  const marks = getOverrideMarkSet(e);
+  const marks = overrideKeysOf(e);
+  if (!marks) return; // no record: nothing known, nothing taken (as `takeUnmarkedFromBase`)
   const resolve = baseTokenResolver(tpl.frame);
   const metas = (traits ?? getAllTraits()).filter((t) => t.category !== 'tag' && t.name !== 'PrefabInstance' && e.has(t.trait));
   for (const meta of metas) {
@@ -456,38 +271,5 @@ function takeUnmarkedNodeFromBase(entityId: number, traits?: readonly TraitMeta[
       const now = f in live ? live[f] : dflt(f);
       if (!valuesEqual(now, value)) writeTraitField(entityId, meta, f, cloneTraitValues({ v: value }).v);
     }
-  }
-}
-
-/** Record each detached member's marks on it, right after the frame-ending that detached it (`endFrames`, or a
- *  delete): the members outside the ended tree keep their marks in the side store only until a rebuild. By live guid,
- *  through every rename a promotion made (a → b → c). (`memberHome` is L0 and cannot read the L3 store, so the record is
- *  made here.)
- *  ⚠️ A member that no longer resolves records NOTHING, not an empty set: a multi-select delete can destroy a member an
- *  earlier target's frame-ending detached, and its own snapshot's respawn restores its marks. An empty record made the
- *  relink below wipe them again, and the next save dropped its overrides (#1794 close-out review). */
-export function recordDetachedMarks(detached: DetachedMember[]): DetachedMember[] {
-  const renamed = new Map(detached.flatMap((d) => d.renamed ?? []));
-  for (const d of detached) {
-    let g = d.guid;
-    for (let hops = 0; renamed.has(g) && hops < renamed.size; hops++) g = renamed.get(g)!;
-    const e = findEntityByGuid(g) ?? findEntityByGuid(d.guid);
-    // The STORED set, exactly: this runs after the frame-ending, which has just made the member a scene root it will not be
-    // once the undo relinks it, so the carried set (less the order that role records) dropped a deliberate order the
-    // member stored in its owned role (#1914 close-out re-review). Nothing writes a mark between the frame-ending and here.
-    d.marks = e ? [...(getStoredOverrideMarks(e) ?? [])] : undefined;
-  }
-  return detached;
-}
-
-/** THE relink of detached members for an editor undo: {@link relinkDetachedMembers}, then each member's recorded
- *  marks back ({@link recordDetachedMarks}); a member with no record keeps the marks it has.
- *  No {@link takeUnmarkedFromBase} here: it runs before the undo's own relinks and rebase have settled the frame, so the
- *  caller runs it after them (the delete's undo does, over its respawned and relinked nodes). */
-export function relinkDetachedMembersMarked(detached: readonly DetachedMember[]): void {
-  relinkDetachedMembers(detached);
-  for (const d of detached) {
-    const e = d.marks ? findEntityByGuid(d.guid) : undefined;
-    if (e) { clearOverrideMarks(e); restoreOverrideMarks(e, d.marks!); }
   }
 }

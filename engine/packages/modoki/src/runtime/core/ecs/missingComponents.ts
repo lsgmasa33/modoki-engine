@@ -10,7 +10,7 @@ import { getTraitByName } from './traitRegistry';
  *  the entity's guid, verbatim, and those writers put it back (`withMissingComponents`), beside the traits the entity
  *  carries. A trait registered later is still written from here (the entity was spawned without it).
  *
- *  Keyed by the guid the live entity carries, as R2's kept stores are keyed by root guid — so a delete and its undo, which
+ *  Keyed by the guid the live entity carries, as the instance records are (`instanceStore`) — so a delete and its undo, which
  *  respawns the entity under a new id and the same guid, keep it. Every load sets or clears the record of each entity it
  *  spawns, so a component removed from the file outside the editor does not come back. A record whose entity is gone is
  *  never written (the writers walk live entities). The Inspector shows each as a read-only "Missing component" row with a

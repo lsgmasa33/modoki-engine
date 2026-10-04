@@ -10,11 +10,12 @@ import { getCachedPrefabSync, getPrefabSource, preloadNestedPrefabs } from './pr
 import { framesBuiltFromOtherRows, missingSourceRefusal, staleFramesRefusal, staleInstanceRefusal } from './prefabFrames';
 import { preloadRebuildEntry, keptEnclosingSource } from './prefabRebuild';
 import { ensureGuid } from '../undo/entityRef';
-import { dropInstanceRecord, markStale, setInstanceRecord } from '../../runtime/prefab/instanceStore';
+import { dropInstanceRecord, setInstanceRecord } from '../../runtime/prefab/instanceStore';
 import * as instanceEdits from '../instance/instanceEdits';
 import { guidOfEntity, storedRootsUnder } from '../instance/instanceKeys';
 import { treeForWrite } from '../instance/instanceSync';
 import { projectionRootOf, reprojectFromStore } from '../instance/instanceReproject';
+import { rollbackOnThrow } from '../instance/instanceRollback';
 import { recordsSide, type RecordsSide } from '../instance/instanceHistory';
 
 /** Why a Revert of instance `rootInstanceId` would refuse, or null: {@link staleInstanceRefusal}, or its OWN prefab does
@@ -111,17 +112,18 @@ async function revertOverridesSelectiveUnmarked(
   const kept = keptFrameRefusal(rootInstanceId);
   if (kept) { console.warn(`[Prefab] ${kept}`); return null; }
 
-  // Both found again by their durable guids after each rebuild: one is minted where there is none (a runtime guid dies
-  // with its world), as any entity an undo step names is given one (`ensureGuid`, #1880 F7c).
   const top = projectionRootOf(rootInstanceId) || rootInstanceId;
-  const topGuid = ensureGuid(top);
-  const frameGuid = ensureGuid(rootInstanceId);
-  // Every record of the tree fresh, a stale nested one included: the before side below must state each one the Revert can
-  // touch (review F2).
+  // Every record of the tree stored, a nested one included: the before side below must state each one the Revert can
+  // touch (review F2). Asked BEFORE anything is minted: a refused Revert changes nothing (#2001 S8b), and a root on a
+  // runtime guid (#1210) holds no record, the store keying an instance by its root's durable guid.
   if (!treeForWrite(top)) {
     console.warn(`[Prefab] Revert of an instance of "${source}" not done: its override list could not be read — reload its scene`);
     return null;
   }
+  // Both found again by their durable guids after each rebuild (`ensureGuid`, #1880 F7c): a tree that holds its records
+  // has one at its top already; a frame under it keyed by derivation is given its own.
+  const topGuid = ensureGuid(top);
+  const frameGuid = ensureGuid(rootInstanceId);
   // Every record of the tree, before: the Revert can drop a nested instance's record with the node that held it.
   const guids = storedRootsUnder(top).map(guidOfEntity).filter(Boolean);
   let before = recordsSide(guids, top);
@@ -166,13 +168,7 @@ function restoreRecords(side: RecordsSide): void {
 }
 
 /** A Revert that throws part-way can leave the records saying "reverted" (`instanceEdits.revert` edits them in place)
- *  while the rebuild did not land: the store is marked stale then, as the old `staleAround` wrapper marked it around every
- *  Revert (#2046 S7 close-out review F4). A Revert that returns maintains the records itself. */
-export async function revertOverridesSelective(rootInstanceId: number, selectedKeys: Set<string>): Promise<RevertResult | null> {
-  try {
-    return await revertOverridesSelectiveUnmarked(rootInstanceId, selectedKeys);
-  } catch (e) {
-    markStale(getCurrentWorld(), 'revert');
-    throw e;
-  }
-}
+ *  while the rebuild did not land (#2046 S7 close-out review F4): it rolls back (`instanceRollback.ts`, #2001 S8b). A
+ *  Revert that returns maintains the records itself. */
+export const revertOverridesSelective: (rootInstanceId: number, selectedKeys: Set<string>) => Promise<RevertResult | null> =
+  rollbackOnThrow('Revert', revertOverridesSelectiveUnmarked);

@@ -33,6 +33,7 @@ import {
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { storedRecord, setInstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -154,6 +155,31 @@ describe('a copied member that holds a nested instance keeps that instance linke
     const reQx = getAllEntities().find((e) => e.guid === qxGuid);
     expect(reQx?.name).toBe('QX');
     expect(x(reQx!.id)).toBe(3);
+  });
+});
+
+// #2001 S8b review G3: the held data a record keeps verbatim — what no reader took (`held.unparsed`), and what a
+// template-keyed node held of its own (`held.keyedNodeHeld`) — is copied with the record. A node guid in it named the
+// SOURCE's node in the copy's record (#1293: two instances stating one member). The held values are seated directly: the
+// shapes that carry a member's guid there come from files no current writer makes. Mutation: drop either remap in
+// `seatCopy` (instanceEdits.ts) — red at that channel.
+describe('a copied record\'s verbatim held data names the copy\'s nodes', () => {
+  it('unparsed and keyedNodeHeld follow the copy plan\'s guids', async () => {
+    install(qDoc(), pqDoc());
+    await load(scene(PQ));
+    const aGuid = named('A')[0]!.guid!;
+    const rec = structuredClone(storedRecord(getCurrentWorld(), INST)!);
+    rec.held.unparsed = { templateMoved: aGuid };
+    rec.held.keyedNodeHeld = new Map([['/a+k' as never, { unparsed: { templateMoved: aGuid } }]]);
+    setInstanceRecord(getCurrentWorld(), rec);
+
+    const copy = duplicateEntity(getAllEntities().find((e) => e.guid === INST)!.id, () => {})!;
+    const copyGuid = getAllEntities().find((e) => e.id === copy)!.guid!;
+    const copyA = getAllEntities().find((e) => e.name === 'A' && e.guid !== aGuid)!.guid!;
+    const held = storedRecord(getCurrentWorld(), copyGuid)!.held;
+    expect(held.unparsed, 'unparsed').toEqual({ templateMoved: copyA });
+    expect(held.keyedNodeHeld?.get('/a+k' as never), 'keyedNodeHeld').toEqual({ unparsed: { templateMoved: copyA } });
+    expect(storedRecord(getCurrentWorld(), INST)!.held.unparsed, 'the source keeps its own').toEqual({ templateMoved: aGuid });
   });
 });
 

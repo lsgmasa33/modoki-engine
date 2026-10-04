@@ -22,7 +22,8 @@ import { boot, bridge, memoryStorage, startRun, settle, authored, type Fixture }
 import { getCurrentWorld, getTraitByName } from '@modoki/engine/runtime';
 import { enterPlay, stopPlay } from '../../packages/modoki/src/editor/scene/playMode';
 import { openPrefabForEditing, exitPrefabEditing } from '../../packages/modoki/src/editor/scene/prefabEdit';
-import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
+import { writeTraitFieldWithUndo, createEntityWithUndo, reparentEntity } from '../../packages/modoki/src/editor/undo/entityActions';
+import { emptySpecs } from '../../packages/modoki/src/runtime/scene/entityCreateSpecs';
 import { storedInstance } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
@@ -46,7 +47,6 @@ const stored = (k: number) => storedInstance(getCurrentWorld(), rootGuid(k));
 type Marked = { s76?: string };
 function markHeld(k: number): void {
   const s = stored(k)!;
-  expect(s.stale).toBeUndefined(); // premise: a fresh record to bank
   (s.record as unknown as Marked).s76 = 'banked';
 }
 const held = (k: number) => { const m = (stored(k)?.record as unknown as Marked | undefined)?.s76; return m ? { s76: m } : undefined; };
@@ -78,13 +78,35 @@ describe('a reload of a world the editor held takes back its exact records (#204
     markHeld(2);
     await playStop();
     expect(held(2)).toEqual({ s76: 'banked' });
-    for (const k of [1, 2, 3]) expect(stored(k)?.stale, String(k)).toBeUndefined();
+  });
+
+  // Mutation: `foldText` compares the links under each anchor in link order (the sort removed in `recordBank.ts`) — P1's
+  // record is left as the parse, stale (hunt seed 9306). The save writes a row's own nodes in sibling order, so two nodes
+  // the user made under P1 and then reordered come back from the banked text in the other order than the record links them.
+  it('Stop: a record whose own links are not in sibling order comes back exact and fresh', async () => {
+    await startRun(be, async () => {}, 'reload-own-order');
+    const p1 = authored().find((e) => e.guid === rootGuid(2))!.id;
+    const make = (name: string) => {
+      const { specs } = emptySpecs(p1);
+      return createEntityWithUndo(`Create ${name}`, p1, specs.map((s) => (s.name === 'EntityAttributes' ? { ...s, data: { ...s.data, name } } : s)), () => {})!;
+    };
+    const [x, y] = [make('X'), make('Y')];
+    const sortOf = (id: number) => authored().find((e) => e.id === id)!.sortOrder;
+    expect(reparentEntity(y, p1, sortOf(x) - 1)).toBe(true); // Y before X among P1's children
+    const [gx, gy] = [x, y].map((id) => authored().find((e) => e.id === id)!.guid!); // read here: Stop's reload renumbers
+    const links = () => (stored(2)!.record.list.rows.get('/')?.own ?? []).map((o) => o.guid);
+    expect(links(), 'premise: linked X first').toEqual([gx, gy]);
+    expect(sortOf(y)).toBeLessThan(sortOf(x)); // premise: the save writes Y first
+    markHeld(2);
+    await playStop();
+    expect(held(2)).toEqual({ s76: 'banked' });
+    expect(links()).toEqual([gx, gy]);
   });
 
   // Mutation: `adoptBankedRecords` skips the fold comparison — O1 comes back naming its root "Bogus", which it does not show.
   // The BANKED record is changed while away (the bank re-made with it): since #2001 S6 the banked text is written from
   // the records, so a record changed before the bank is made is what the text states too, and is rightly seated.
-  it('a prefab edit\'s Exit: a banked record whose fold differs from the parse is not seated — the parse stays, stale', async () => {
+  it('a prefab edit\'s Exit: a banked record whose fold differs from the parse is not seated — the parse stays, fresh', async () => {
     const f = await startRun(be, async () => {}, 'reload-fold');
     const shown = stored(1)!.record.placement.name;
     const g1 = rootGuid(1);
@@ -92,11 +114,9 @@ describe('a reload of a world the editor held takes back its exact records (#204
       const bank = takeRecordBank(f.scenePath)!;
       expect(bank, 'premise: the open banked the scene').toBeTruthy();
       bank.stored.get(g1)!.record.placement.name = 'Bogus';
-      bankInstanceRecords(f.scenePath, bank.stored, [...bank.entries.values()].map((t) => JSON.parse(t) as never), bank.by);
+      bankInstanceRecords(f.scenePath, bank.stored, [...bank.entries.values()].map((t) => JSON.parse(t) as never));
     } });
     expect(stored(1)!.record.placement.name).toBe(shown);
-    expect(stored(1)!.stale).toBe('prefabLeave');
-    for (const k of [2, 3]) expect(stored(k)?.stale, String(k)).toBeUndefined(); // the others are seated
   });
 
   // Mutation: the prefab edit's open banks nothing (`bankSceneRecords` returns at once) — the marker is lost.
@@ -105,7 +125,6 @@ describe('a reload of a world the editor held takes back its exact records (#204
     markHeld(2);
     await editAndLeave(f);
     expect(held(2)).toEqual({ s76: 'banked' });
-    for (const k of [1, 2, 3]) expect(stored(k)?.stale, String(k)).toBeUndefined();
   });
 
   // Mutation: `adoptBankedRecords` skips the entry comparison — P1 takes back a record stating an edit its file never got.
@@ -117,7 +136,6 @@ describe('a reload of a world the editor held takes back its exact records (#204
     await editAndLeave(f, { discardUnsaved: true });
     expect(held(1)).toEqual({ s76: 'banked' }); // O1's entry is the file's: banked
     expect(held(2)).toBeUndefined(); // P1's is not: the discarded edit's record is not taken back
-    expect(stored(2)!.stale).toBe('prefabLeave');
     expect(JSON.stringify([...stored(2)!.record.list.rows.values()])).not.toContain('42');
   });
 
@@ -139,7 +157,6 @@ describe('a reload of a world the editor held takes back its exact records (#204
     expect(held(1)).toEqual({ s76: 'banked' });
     expect(held(2)).toBeUndefined();
     expect(stored(2)!.record.held.unparsed).toEqual({ templateMoved: 5 }); // the file's, not the bank's
-    expect(stored(2)!.stale).toBe('prefabLeave');
   });
 
   // Mutation: the open drops no bank it did not use (the `dropRecordBank` call removed from `openPrefabForEditing`) — the
@@ -188,6 +205,5 @@ describe('a reload of a world the editor held takes back its exact records (#204
     expect((await loadSceneReporting(l2)).outcome).toBe('loaded');
     await settle();
     expect(held(2)).toEqual({ s76: 'banked' });
-    expect(stored(2)?.stale).toBeUndefined();
   });
 });

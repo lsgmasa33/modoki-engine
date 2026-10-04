@@ -29,6 +29,7 @@ import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
 import { frameRootDoc, noteFrameRootDoc } from '../../packages/modoki/src/runtime/core/ecs/identityParents';
+import { place } from '../../packages/modoki/src/editor/instance/instanceEdits';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -96,6 +97,7 @@ describe('agent prefab create — undo restores the links the tree already had (
     const bolt = game!.spawn(Transform(), EntityAttributes({ name: 'Bolt', parentId: hull.id(), guid: 'g-agent-bolt' }));
     hull.add(PrefabInstance({ source: CHILD_GUID, localId: 1, rootInstanceId: hull.id() }));
     bolt.add(PrefabInstance({ source: CHILD_GUID, localId: 2, rootInstanceId: hull.id() }));
+    place(hull.id()); // a held instance holds its record, as a load or a drop leaves it (#2001 S8b)
 
     const res = await runAgentOp('prefab', { action: 'create', entityGuid: 'g-agent-r', path: NEW_PATH }) as { ok: boolean };
     expect(res.ok).toBe(true);
@@ -140,6 +142,7 @@ describe('agent prefab create — undo restores the links the tree already had (
     const bolt = game!.spawn(Transform(), EntityAttributes({ name: 'Bolt', parentId: hull.id(), guid: 'g-reload-bolt' }));
     hull.add(PrefabInstance({ source: CHILD_GUID, localId: 1, rootInstanceId: hull.id() }));
     bolt.add(PrefabInstance({ source: CHILD_GUID, localId: 2, rootInstanceId: hull.id() }));
+    place(hull.id()); // a held instance holds its record, as a load or a drop leaves it (#2001 S8b)
 
     await runAgentOp('prefab', { action: 'create', entityGuid: 'g-reload-r', path: NEW_PATH });
 
@@ -230,6 +233,7 @@ describe('agent prefab create — undo restores the links the tree already had (
       hull.add(PrefabInstance({ source: CHILD_GUID, localId: 1, rootInstanceId: hull.id() }));
       bolt.add(PrefabInstance({ source: CHILD_GUID, localId: 2, rootInstanceId: hull.id() }));
       noteFrameRootDoc(getCurrentWorld(), hull, { source: CHILD_GUID, doc: childPrefab as never });
+      place(hull.id()); // a held instance holds its record, as a load or a drop leaves it (#2001 S8b)
       return hull;
     };
     const sourceOf = (e: ReturnType<typeof spawnHull>) => (e.get(PrefabInstance) as { source: string }).source;
@@ -296,6 +300,7 @@ describe('agent prefab create — undo restores the links the tree already had (
     const bolt = game!.spawn(Transform(), EntityAttributes({ name: 'Bolt', parentId: hull.id(), guid: 'g-rn-bolt' }));
     hull.add(PrefabInstance({ source: CHILD_GUID, localId: 1, rootInstanceId: hull.id() }));
     bolt.add(PrefabInstance({ source: CHILD_GUID, localId: 2, rootInstanceId: hull.id() }));
+    place(hull.id()); // a held instance holds its record, as a load or a drop leaves it (#2001 S8b)
     const x = game!.spawn(Transform(), EntityAttributes({ name: 'X', guid: 'g-rn-x' }),
       UIAction({ bindings: [{ event: 'click', kind: 'call' as const, action: 'noop', target: 'g-rn-bolt' }] }));
     const targetOfX = () => ((x.get(UIAction) as { bindings: { target: string }[] }).bindings)[0].target;
@@ -327,6 +332,7 @@ describe('agent prefab create — undo restores the links the tree already had (
       const bolt = game!.spawn(Transform(), EntityAttributes({ name: 'Bolt', parentId: hull.id(), guid: 'g-quiet-bolt' }));
       hull.add(PrefabInstance({ source: CHILD_GUID, localId: 1, rootInstanceId: hull.id() }));
       bolt.add(PrefabInstance({ source: CHILD_GUID, localId: 2, rootInstanceId: hull.id() }));
+    place(hull.id()); // a held instance holds its record, as a load or a drop leaves it (#2001 S8b)
 
       await runAgentOp('prefab', { action: 'create', entityGuid: 'g-quiet-r', path: NEW_PATH });
       for (const e of [hull, bolt]) e.set(EntityAttributes, { ...(e.get(EntityAttributes) as object), guid: '' });

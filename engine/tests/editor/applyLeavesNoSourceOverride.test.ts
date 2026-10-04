@@ -11,6 +11,8 @@
  *  applied value instead of the template's new one. */
 
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { whyWorldNotAuthored } from '../../packages/modoki/src/editor/scene/authoredWorld';
+import { NO_RECORD_TO_WRITE } from '../../packages/modoki/src/editor/instance/instanceRollback';
 import { createWorld } from 'koota';
 
 const prefabs = new Map<string, unknown>();
@@ -24,7 +26,6 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData, type SceneEntityEntry,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { setActionCallback, pushAction, writeTraitFieldWithUndo } from '@modoki/engine/editor';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
@@ -33,7 +34,7 @@ import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/p
 import { rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { freshInstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { dropInstanceRecord, storedRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -127,7 +128,7 @@ const saveRetuneReload = async (next: PrefabFile) => {
 };
 
 beforeEach(() => {
-  setRunMode('stopped'); prefabs.clear(); clearKeptMemberOrphans();
+  setRunMode('stopped'); prefabs.clear();
   // The apply writes the prefab file through the dev-server API.
   vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({}) }) as unknown as Response));
 });
@@ -174,43 +175,75 @@ describe('Apply leaves no override behind on the instance it applied from (#1469
 
 // #2046 S7.3 (rule 7, § 3.2's fan-out row): an Apply changes only the applying instance's list. Every OTHER instance of
 // the prefab is reprojected from its own record onto the new template — its list kept exactly, fresh — not rebuilt from
-// a capture of its live tree. The applying instance is still rebuilt from the capture (its U15 subtraction), so its
-// records are left stale.
+// a capture of its live tree. The applying instance's applied statement leaves its record (U15, `subtractApplied`,
+// #2001 S8b): it is reprojected from that record too, fresh, and shows the value as the prefab's.
 describe('Apply reprojects the other instances from their records (#2046 S7.3)', () => {
   it('another instance keeps its exact record, fresh, and shows the applied value under its own override', async () => {
     install(template());
     await load(scene([{ guid: ROOT1, name: 'Root1' }, { guid: ROOT2, name: 'Root2' }]));
     writeTraitFieldWithUndo(member('Root2', 'B').id, getTraitByName('Transform')!, 'y', 3);
+    // The scene as this editor saves it, reloaded: its records hold the identity pins a save writes for every present
+    // member (rule 5), which the Apply's fan-out pins too. The fixture's hand-written file states none.
+    await saveRetuneReload(getCachedPrefabSync(P)!);
     writeTraitFieldWithUndo(member('Root1', 'A').id, getTraitByName('Transform')!, 'x', 5);
-    const before = structuredClone(freshInstanceRecord(getCurrentWorld(), ROOT2));
+    const before = structuredClone(storedRecord(getCurrentWorld(), ROOT2));
     expect(before?.list.rows.size).toBeGreaterThan(0); // precondition: Root2 holds a record of its own
 
     const result = await applyToPrefabSelective(rootId('Root1'), new Set([`${gA}.Transform.x`]));
     expect(result.applied).toBe(true);
-    expect(freshInstanceRecord(getCurrentWorld(), ROOT2)).toEqual(before);
+    expect(storedRecord(getCurrentWorld(), ROOT2)).toEqual(before);
     expect(tf('Root2', 'A').x).toBe(5); // the new template's value
     expect(tf('Root2', 'B').y).toBe(3); // its own override
-    expect(freshInstanceRecord(getCurrentWorld(), ROOT1)).toBeUndefined(); // the applying tree: rebuilt from the capture
+    // The applying tree: on records, fresh, with no statement of the applied field left, and the value now the prefab's.
+    const applying = storedRecord(getCurrentWorld(), ROOT1);
+    expect(applying, 'the applying tree keeps a fresh record').toBeTruthy();
+    expect([...applying!.list.rows.values()].some((r) => (r.traits?.Transform as { x?: number } | undefined)?.x !== undefined), 'the applied statement left it').toBe(false);
+    expect(tf('Root1', 'A').x).toBe(5);
   });
 });
 
-// #2046 S7.3: a rebase rebuilds from the capture only the trees whose record is stale (or missing), and leaves stale only
-// THEIR records: a tree it reprojected from its own record keeps it fresh, exactly as it was.
-// Mutation: have `rebuildStaleFrames` mark the whole store stale when it captured anything — Root2's record goes stale.
-describe('a rebase leaves stale only the entries it rebuilt from the capture (#2046 S7.3)', () => {
-  it('a fresh tree is reprojected and keeps its record; a tree with none is captured', async () => {
+// #2001 S8b: a stored root's order is its placement, which no row states. An Apply of it changes the template's, and the
+// applying tree's records stay on records with that placement untouched, beside the applied field that leaves them.
+describe('an Apply of the root\'s order keeps the applying tree on records (#2001 S8b)', () => {
+  it('the record stays fresh, its placement as it was, and the applied field leaves it', async () => {
+    install(template());
+    await load(scene([{ guid: ROOT1, name: 'Root1' }, { guid: ROOT2, name: 'Root2' }]));
+    writeTraitFieldWithUndo(rootId('Root1'), getTraitByName('EntityAttributes')!, 'sortOrder', 4);
+    writeTraitFieldWithUndo(member('Root1', 'A').id, getTraitByName('Transform')!, 'x', 5);
+    const placement = structuredClone(storedRecord(getCurrentWorld(), ROOT1)!.placement);
+
+    const result = await applyToPrefabSelective(rootId('Root1'), new Set([`${gR}.EntityAttributes.sortOrder`, `${gA}.Transform.x`]));
+    expect(result.applied).toBe(true);
+    const rec = storedRecord(getCurrentWorld(), ROOT1);
+    expect(rec, 'the applying tree keeps a fresh record').toBeTruthy();
+    expect(rec!.placement).toEqual(placement);
+    expect([...rec!.list.rows.values()].some((r) => (r.traits?.Transform as { x?: number } | undefined)?.x !== undefined)).toBe(false);
+  });
+});
+
+// #2046 S7.3: a tree a rebase reprojected from its own record keeps it, exactly as it was; #2001 S8b: a tree with no record
+// is not rebuilt from the capture any more — left as it was, and the world marked unsavable (`leftRecordless`).
+// Mutation: drop `leftRecordless` from `rebuildTargetsByEntry` — Root1 is rebuilt from its capture (x 9, counted 2).
+describe('a rebase reprojects a tree from its record and leaves one with none (#2046 S7.3, #2001 S8b)', () => {
+  it('a fresh tree is reprojected and keeps its record; a tree with none is left as it was and blocks the save', async () => {
     install(template());
     await load(scene([{ guid: ROOT1, name: 'Root1' }, { guid: ROOT2, name: 'Root2' }]));
     writeTraitFieldWithUndo(member('Root2', 'B').id, getTraitByName('Transform')!, 'y', 3);
-    const before = structuredClone(freshInstanceRecord(getCurrentWorld(), ROOT2));
+    const before = structuredClone(storedRecord(getCurrentWorld(), ROOT2));
     expect(before, 'premise: Root2 holds a fresh record').toBeTruthy();
-    expect(freshInstanceRecord(getCurrentWorld(), ROOT1), 'premise: Root1 holds none (the capture path)').toBeUndefined();
+    // A load records every tree (#2001 S8b): Root1's record dropped is a state no gesture makes. A rebuild never rebuilds
+    // it from its live tree (hub ruling): it is left as it was, said, and the world marked unsavable.
+    dropInstanceRecord(getCurrentWorld(), ROOT1);
+    expect(storedRecord(getCurrentWorld(), ROOT1), 'premise: Root1 holds none').toBeUndefined();
 
     install(retuned(getCachedPrefabSync(P)!, 'A', 'x', 9) as { id: string });
-    expect(await rebaseStaleInstances()).toBe(2);
-    expect(tf('Root1', 'A').x).toBe(9);
+    const x1 = tf('Root1', 'A').x;
+    expect(x1, 'premise: the retune changes it').not.toBe(9);
+    expect(await rebaseStaleInstances()).toBe(1);
+    expect(tf('Root1', 'A').x).toBe(x1);
+    expect(whyWorldNotAuthored()).toBe(NO_RECORD_TO_WRITE);
     expect(tf('Root2', 'A').x).toBe(9);
     expect(tf('Root2', 'B').y).toBe(3);
-    expect(freshInstanceRecord(getCurrentWorld(), ROOT2)).toEqual(before);
+    expect(storedRecord(getCurrentWorld(), ROOT2)).toEqual(before);
   });
 });

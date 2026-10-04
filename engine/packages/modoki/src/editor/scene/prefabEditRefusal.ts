@@ -37,7 +37,7 @@
  *  reader its caller hands in rather than importing `prefab.ts`. */
 
 import { getAllEntities, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
-import { rowPlaceholderOf, unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { PREFAB_EDIT_ROOT_GUID, SCAFFOLD_PREFIX } from './prefabEditGuids';
 import { PREFAB_EDIT_SCENE_PREFIX, prefabEditWorldPath } from './prefabEditWorld';
 import { prefabNests, type NestingReader } from '../../runtime/loaders/prefabNesting';
@@ -63,7 +63,6 @@ export const PREFAB_EDIT_REFUSAL_TEXT: Record<PrefabEditRefusalReason, string> =
   'self-nesting': 'A prefab cannot contain itself: this holds an instance of the prefab being edited.',
   'scaffold': 'The prefab-edit lights, environment and stage are editor scaffolding, not part of the prefab: they stay outside the root, where the save does not write them.',
   'under-missing-prefab': 'Nothing can be put under a Missing Prefab: its save writes only what its file held for it, so a new child would be lost or saved in the wrong place. Restore the prefab (the reload re-expands it), then add to it.',
-  'missing-prefab-row': 'This is part of a Missing Prefab: its save writes what its file held for it, so a delete would come back on reload. Restore the prefab (the reload re-expands it), then delete it.',
 };
 
 /** Why `gesture` is refused, or null when it may run: a new link under a Missing Prefab placeholder anywhere, and the rest
@@ -75,8 +74,6 @@ export function prefabEditRefusal(gesture: PrefabEditGesture): PrefabEditRefusal
   // In the scene and in prefab edit alike (the header): a NEW link under a placeholder. A reorder is not one.
   if (gesture.kind !== 'delete' && gesture.parentId && underMissingPrefab(gesture.parentId, byId)
     && !(gesture.kind === 'reparent' && byId.get(gesture.id)?.parentId === gesture.parentId)) return refuse('under-missing-prefab');
-  // In the scene and in prefab edit alike: a delete of a missing row's placeholder (rule 9; #2028 close-out review).
-  if (gesture.kind === 'delete' && missingRowDelete(gesture.ids, byId)) return refuse('missing-prefab-row');
   const world = prefabEditWorldPath();
   if (!world) return null;
   const root = all.find((e) => e.guid === PREFAB_EDIT_ROOT_GUID);
@@ -117,29 +114,6 @@ function underMissingPrefab(id: number, byId: ReadonlyMap<number, EntityInfo>): 
   for (let cur = byId.get(id); cur && !seen.has(cur.id); cur = cur.parentId ? byId.get(cur.parentId) : undefined) {
     seen.add(cur.id);
     if (unresolvedRefOf(findEntity(cur.id) as Parameters<typeof unresolvedRefOf>[0])) return true;
-  }
-  return false;
-}
-
-/** A delete of a missing nested row's placeholder itself (#2001 S5, ruling D; rule 9): its save restates the row from
- *  the file, so the delete came back on reload. Only the delete's ROOTS are asked: deleting an ancestor member or the
- *  instance takes the row with it, which its own save records. A node under the placeholder is not refused, whether
- *  the user added it this session or the kept rows state it (refused too until #2001 S6, when the scene's save began
- *  writing the record, which holds that node's removal).
- *  ⚠️ The placeholder's own removal is one the record can hold as well, and the v20 save writes it; it stays refused
- *  because a re-seed of a stale record reads the old capture, which cannot state it (measured: I25 red on #2058's
- *  repro with the refusal off). It can be lifted when S8 deletes that capture. */
-function missingRowDelete(ids: readonly number[], byId: ReadonlyMap<number, EntityInfo>): boolean {
-  const picked = new Set(ids);
-  for (const id of picked) {
-    if (!rowPlaceholderOf(findEntity(id) as Parameters<typeof rowPlaceholderOf>[0])) continue;
-    let covered = false;
-    const seen = new Set<number>([id]);
-    for (let cur = byId.get(byId.get(id)?.parentId ?? 0); cur && !seen.has(cur.id) && !covered; cur = cur.parentId ? byId.get(cur.parentId) : undefined) {
-      seen.add(cur.id);
-      covered = picked.has(cur.id);
-    }
-    if (!covered) return true;
   }
   return false;
 }

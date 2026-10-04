@@ -32,6 +32,7 @@ function getAllEntitiesImpl() {
 }
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   // The guid lookups entityRef resolves through — a scan of the live index, which is all a test needs.
   findEntityByGuid: (g: string) => [...index.values()].find((e: any) => e.has(EntityAttributes) && e.get(EntityAttributes).guid === g),
@@ -73,6 +74,12 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
 }));
 
 vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn() }));
+// The trait strip is what this covers, in a hand-built world that holds no instance records: the door's Detach is
+// stubbed to keep them (#2001 S8b: a Detach whose records cannot be had is refused before it unpacks, `prefabLink.ts`).
+vi.mock('../../src/editor/instance/instanceEdits', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  beginDetach: () => () => true,
+}));
 
 beforeEach(() => { testWorld = createWorld(); index.clear(); });
 

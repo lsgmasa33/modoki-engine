@@ -67,12 +67,14 @@ vi.mock('../../src/editor/scene/prefabRebuild', () => ({
   rebaseStaleInstances: vi.fn(async () => 0),
 }));
 vi.mock('../../src/editor/scene/prefabSerialize', () => ({}));
-// #2046 S7.3: no record side can be taken here (no stored roots), so every case drives the SNAPSHOT path — the Apply
-// undo's fallback when the store cannot state the world. The record path is covered by the app suite's Apply cases.
+// #2046 S7.3: every case drives the SNAPSHOT path — the Apply undo's fallback when the records after the Apply cannot be
+// taken. The tree's records BEFORE are taken (an empty side), since an Apply with them missing refuses (#2001 S8b); the
+// after side is not. The record path is covered by the app suite's Apply cases.
 vi.mock('../../src/editor/instance/instanceKeys', () => ({ allStoredRoots: () => [], projectionRootOf: () => 0, guidOfEntity: () => '', storedRootsUnder: () => [] }));
 vi.mock('../../src/editor/instance/instanceHistory', () => ({
   recordsSide: () => ({ records: new Map() }), restoreSide: () => null,
-  takeTreeRecords: () => null, takeEveryTree: () => new Map(), storeStatesTheWorld: () => false, reseedEveryTree: () => {},
+  takeTreeRecords: (_id: number, also?: Iterable<string>) => (also === undefined ? { at: '', side: { records: new Map() } } : null),
+  takeEveryTree: () => new Map(), storeStatesTheWorld: () => false, reseedEveryTree: () => {},
 }));
 vi.mock('../../src/editor/instance/instanceSync', () => ({ recordForWrite: () => null }));
 vi.mock('../../src/editor/scene/prefabApplyStructure', () => ({}));

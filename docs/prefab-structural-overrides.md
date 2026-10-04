@@ -749,7 +749,8 @@ lookup cannot see it, so:
   read it as moved, and froze every Transform field a re-imported base had changed.
 - The gate never asked whether the frame ROOT moved, because an owned root's row is its OWNER's.
   `ownedRootMoved` now asks that frame. Without it a moved owned root's compensated pose, which
-  `markCompensatedTransform` deliberately leaves unmarked, was dropped on save. The same root's Transform
+  the reparent's compensation (`markCompensatedTransform` then,
+  `beginReparent` since #2001 S8b) deliberately leaves unrecorded, was dropped on save. The same root's Transform
   must then be subtracted from its ROW by VALUE, not by key: the spaceship's rows set each flame's
   position, so a moved flame reloaded at its row's position (found by the live check,
   `games/space-console`). #1481 made that one case by value. Since #1498 every field is, with the row's
@@ -1448,12 +1449,17 @@ What changed:
 
 ### R2 for a template reference node (#1542)
 
+> **#2001 S8b deleted the store this section describes.** The instance's record holds these rows; the store, its load
+> step (`keepTemplateNodeOrphans`) and the re-emit through it below are the history of the fix. `keepsTemplateRows`
+> survives as the #1293 gate: a bake (Create Prefab, Apply's promotion) reads no record of such a root, and a rebuild
+> keys its rows (`keyEntryRows`).
+
 **The symptom.** OUTER2's reference node → MID carried a row for a member INNER (inside MID) no longer
 had. An untouched save of OUTER2 dropped it, while the same orphan on a prefab ROW survived. So if an
 inner prefab briefly deleted a node, any save of the outer prefab erased the outer prefab's edit to
 it for good.
 
-**The mechanism.** R2's store (`runtime/core/ecs/keptOrphanRows.ts`, read through `keptMemberOrphans`) is keyed by an
+**The mechanism.** R2's store (`keptOrphanRows.ts`, read through `keptMemberOrphans`) was keyed by an
 instance root's guid, and the load found a reference node's rows by the guid the node STORES
 (`collectReferenceNodeRows`). A template reference node stores none: it has a `key`, and its root
 derives a guid. So its rows never reached `applyStoredMemberRows`. The fold skipped the unmatched row
@@ -1549,6 +1555,10 @@ Tests: `templateReferenceNodeRows.test.ts` § #1542, § #1567 and § #1568. Each
 
 ### R2's store follows a guid rename (#1778)
 
+> **#2001 S8b deleted this store** (`rekeyKeptOrphanRows` with it). The instance record that holds the rows now is
+> keyed by the root's guid too, and follows a rename on the same registry (`onGuidRemap('instanceStore')`,
+> `runtime/prefab/instanceStore.ts`).
+
 The store is keyed by the root's guid, which is its identity, so a rename has to take the rows along.
 Before #1778 nothing did. Create Prefab's stamp (#1758, `stampDerivedMemberGuids`) renames a reference
 node the scene added inside a held instance to its derived guid, because the write swallows it into the
@@ -1566,7 +1576,7 @@ because `remapWorldGuidRefs` reaches live trait values only.
 
 The new prefab file still carries no row. #1293's gate keeps scene rows out of a template, and an
 identity-only orphan converts to nothing (`templateRowOf`), so the scene save is the carrier.
-Tests: `createPrefabMemberIdentity.test.ts` § #1778, `tests/ecs/keptOrphanRows.test.ts`.
+Tests: `createPrefabMemberIdentity.test.ts` § #1778 (the store's own test went with it in #2001 S8b).
 
 ### Every store keyed by an entity guid follows the rename (#1785)
 
@@ -1605,6 +1615,10 @@ before Create Prefab still undoing after the create is undone. The guid index ke
 its lookups check `guidOf(entity) === guid`.
 
 ### R2's store rides in an entity snapshot (#1788)
+
+> **#2001 S8b deleted this store.** `EntitySnapshot.kept` stays, read from the instance's record
+> (`keptStateFromRecord`), so a copy still re-mints every identity it states (`keptGuidMints`); the respawn puts no
+> store back (`restoreKeptState` is gone), since the record is what the respawned tree is the projection of.
 
 A rename moves an entry. A COPY needs a second one, and nothing made it. Duplicating an instance whose
 entry held an orphan row or a kept legacy channel gave the copy neither: the store sits beside the tree,
@@ -1787,8 +1801,8 @@ reading a newer prefab, because nothing there saves.
   silently dropped (a silent drop is #1468 reproduced). A member the instance REMOVED is still in the
   template, so its row is not an orphan. This is why rows keep `name` (owner, 2026-09-23): an orphan's
   template member is gone, so only the row can name it in the log.
-  **A rebuild (Refresh, Apply, Revert, and each one's undo) leaves the kept store exactly as a reload
-  of the same scene would (#1535)**, because it is the other route a template change reaches an open
+  **A rebuild (Refresh, Apply, Revert, and each one's undo) leaves the orphans exactly as a reload
+  of the same scene would (#1535)** (in the instance's record since #2001 S8b; a kept store before), because it is the other route a template change reaches an open
   scene by. It used to keep only half: a row's guid, and the node rows of a frame it captured. So a
   template that dropped a member and brought it back lost the scene's edit to it in the editor, at any
   depth, while the file still held it. And a Refresh that DROPPED a member threw its row away, where a
@@ -1927,6 +1941,17 @@ pre-#1869 file holds, which loads, saves, applies and reverts as described (§ M
 | Drag a member into ANOTHER instance | **refused** (#1869); it was unpacked (#1445) | — | — |
 | Drag an instance into an instance of the SAME prefab | allowed, a reference node (#1436) | **refused**, with a reason: a prefab cannot contain itself (#1446) | — |
 
+**Since #2001 S8b a move that would unlink a member, and a Detach that would orphan one, are REFUSED** (owner ruling
+2026-10-04, superseding the 2026-09-19 "unpack, not refuse" below for this state only). Since #1869 the only member
+that reaches `planMoveUnlinks`' strip or promotion is one an older version moved out of its instance (a pre-#1869
+file's move), and the same member is what a Detach's frame-ending orphans (`endFrames`, below). Both gestures now
+change nothing and say "an older version moved a member of this prefab instance out of its instance; nothing was
+changed" (`MOVED_MEMBER_REFUSAL_TEXT`: `planReparent`'s `'moved-member'`, `detachMovedMemberRefusal`). Why refuse:
+the corpus holds no such state (0 in 179 scene and prefab files under `games/` and `demos/`, counted 2026-10-04), and
+keeping the instance records exact through that unpack would have needed a new design where a member's pin and the
+guid it keeps as a plain node overlap. The paragraphs below describe what the unpack did; `planMoveUnlinks` still
+decides which moves those are, and a delete's frame-ending still unlinks or promotes such a member where it stands.
+
 A linked member is written by its **frame**'s save: the first promoted root on its ownership chain, or else
 the stored root (top-level or user-added) that chain reaches. A frame is saved from its root down. So after
 EVERY reparent (`planMoveUnlinks`, which since #1869 moves only stored roots and scene-added nodes, and so reaches these
@@ -1993,8 +2018,9 @@ re-derived new guids on reload and a ref to one dangled.
 
 A frame also ends WITHOUT a delete, when a Detach Prefab or an unpack-on-leave strips `PrefabInstance` off it, and
 the same step applies. Every frame-ending path calls it as **`endFrames(gone)`** (`memberHome.ts`), before the
-strip, because the owner walk reads the links being stripped. The callers are `deleteEntities`,
-`detachPrefabInstance` and `reparentEntity`'s `applyDetach`. Detach and unpack used to run only the re-homing
+strip, because the owner walk reads the links being stripped. The callers are `deleteEntities` and
+`detachPrefabInstance`; `reparentEntity`'s `applyDetach` was the third until #2001 S8b deleted it, and since then a
+Detach that would orphan a member is refused before it unpacks (`hasOrphansOf`, above), so its call finds none. Detach and unpack used to run only the re-homing
 half (`rehomeDependents`, deleted in Phase 6), so a member moved OUT of the detached subtree kept its link to a
 frame that no longer existed. The save wrote it nowhere, and it vanished on reload (#1453). There were two shapes. One was a nested
 root moved beside its detached owner, left owned by a plain entity. The other was a plain member moved beside it,

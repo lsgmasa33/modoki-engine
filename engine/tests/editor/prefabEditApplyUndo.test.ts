@@ -71,9 +71,9 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOri
 
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, loadSceneFile, instantiatePrefabIntoWorld,
-  destroyEntity, spawnEntity, EntityAttributes, Transform, type SceneData,
+  destroyEntity, Transform, type SceneData,
 } from '@modoki/engine/runtime';
-import { setActionCallback, pushAction, deleteEntitiesWithUndo } from '@modoki/engine/editor';
+import { setActionCallback, pushAction, deleteEntitiesWithUndo, createEntityWithUndo } from '@modoki/engine/editor';
 import { setRunMode } from '../../packages/modoki/src/runtime/core/playState';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
@@ -226,10 +226,13 @@ describe('undoing an Apply made in the prefab editor rebuilds that world (#1573)
   });
 
   it('a promoted addition goes back to being the instance\'s own, and leaves the other instance', async () => {
-    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Extra', parentId: rootOf('A'), guid: G(99) }));
+    createEntityWithUndo('Create', rootOf('A'), [{ name: 'EntityAttributes', data: { name: 'Extra', parentId: rootOf('A'), guid: G(99) } }, { name: 'Transform' }], () => {});
     const before = saved();
     await applyFromA((k) => k.added);
     expect(inRow('B', 'Extra')).not.toBe(0); // precondition: B gained the promoted member
+    // On records (#2001 S8b): A's record links Extra as the edit world's own, while the node also carries the template key
+    // its save writes. MUTATION TARGET: find the anchor by `instanceTargetOf` (a member, by that key) and the Apply is
+    // refused.
 
     await quietly(() => undo());
     expect(midOnDisk().entities.some((e) => e.name === 'Extra')).toBe(false);
@@ -258,7 +261,7 @@ describe('undoing an Apply made in the prefab editor rebuilds that world (#1573)
 
 describe('undoing an Apply in the prefab editor keeps what the session added addressable (#1573 close-out review)', () => {
   it('an entity added in the session keeps its guid, so the undo entries behind the Apply still reach it', async () => {
-    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Extra', parentId: all().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!.id, guid: G(99) }));
+    createEntityWithUndo('Create', all().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!.id, [{ name: 'EntityAttributes', data: { name: 'Extra', parentId: all().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!.id, guid: G(99) } }, { name: 'Transform' }], () => {});
     writeTraitFieldWithUndo(byGuid(G(99)), getTraitByName('Transform')!, 'x', 7);
     writeTraitFieldWithUndo(inRow('A', 'Box'), getTraitByName('Transform')!, 'x', 5);
     await applyFromA((k) => k.fields);
@@ -271,7 +274,7 @@ describe('undoing an Apply in the prefab editor keeps what the session added add
   });
 
   it('a child added under an instance and not applied keeps its guid across the undo', async () => {
-    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Kid', parentId: rootOf('A'), guid: G(98) }));
+    createEntityWithUndo('Create', rootOf('A'), [{ name: 'EntityAttributes', data: { name: 'Kid', parentId: rootOf('A'), guid: G(98) } }, { name: 'Transform' }], () => {});
     writeTraitFieldWithUndo(byGuid(G(98)), getTraitByName('Transform')!, 'x', 7);
     writeTraitFieldWithUndo(inRow('A', 'Box'), getTraitByName('Transform')!, 'x', 5);
     await applyFromA((k) => k.fields);
@@ -286,7 +289,7 @@ describe('undoing an Apply in the prefab editor keeps what the session added add
 
   it('a Save after the undo does not give a deleted row\'s identity to an entity added in its place', async () => {
     deleteEntitiesWithUndo([rootOf('B')]);
-    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Extra', parentId: all().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!.id, guid: G(99) }));
+    createEntityWithUndo('Create', all().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!.id, [{ name: 'EntityAttributes', data: { name: 'Extra', parentId: all().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!.id, guid: G(99) } }, { name: 'Transform' }], () => {});
     writeTraitFieldWithUndo(inRow('A', 'Box'), getTraitByName('Transform')!, 'x', 5);
     await applyFromA((k) => k.fields);
 

@@ -14,7 +14,8 @@ import { clearHistory, markSceneSaved, canUndo, undo, hasUnsavedChanges, pushAct
 import { _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
-import { markStateOf } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
+import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../packages/modoki/src/runtime/core/ecs/traitRegistry';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
@@ -96,16 +97,16 @@ describe('editor set-traits writes the way the Inspector does (#1816)', () => {
     expect(live(a).has(persistent)).toBe(false);
   });
 
-  // The #1709 half: a member's field is saved only when marked. Same mutation as the first case — the raw write marks nothing.
-  it('a prefab member\'s field is override-marked, so the save writes it', async () => {
+  // The #1709 half: a member's field is saved only when recorded. Same mutation as the first case — the raw write records nothing.
+  it('a prefab member\'s field is recorded, so the save writes it', async () => {
     await runAgentOp('prefab', { action: 'instantiate', path: PATH });
     const slot = getCurrentWorld().entities.find((e) => (e.get(EntityAttributes) as { name?: string } | undefined)?.name === 'Slot')!.id();
-    expect(markStateOf(slot, 'Transform', ['x']).x).toBe(false);
+    expect(!!overrideKeysOf(findEntity(slot)!)?.has('Transform.x')).toBe(false);
     const r = await setTraits({ guid: attrs(slot)!.guid, set: { 'Transform.x': 3 } });
     expect(r.ok).toBe(true);
-    expect(markStateOf(slot, 'Transform', ['x']).x).toBe(true);
+    expect(!!overrideKeysOf(findEntity(slot)!)?.has('Transform.x')).toBe(true);
     await undo();
-    expect(markStateOf(slot, 'Transform', ['x']).x).toBe(false);
+    expect(!!overrideKeysOf(findEntity(slot)!)?.has('Transform.x')).toBe(false);
   });
 
   // A dry run writes nothing, so it records nothing. Mutation: drop `!p.dryRun &&` before `deps.writer` in

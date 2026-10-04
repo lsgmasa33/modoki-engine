@@ -10,7 +10,7 @@
  *  that turns it red. */
 
 import { v9Channels } from './v10Rows';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { setRunMode as setRunModeForAuthoring } from '../../packages/modoki/src/runtime/core/playState';
 import { createWorld } from 'koota';
 
@@ -42,10 +42,10 @@ import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefab
 import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
+import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { removeTraitFromEntitiesWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { templateKeysOf } from '../../packages/modoki/src/runtime/loaders/templateKeyRecovery';
 import { derivedMemberPaths } from '../../packages/modoki/src/runtime/loaders/memberPaths';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -110,8 +110,13 @@ async function load(scene: SceneData): Promise<void> {
   });
 }
 
+// The prefab-edit world is known by its path (`isPrefabEditWorld`), as the editor's is: its rows are written from their
+// records (#2001 S8b step 5), never from a capture of the live tree.
+let editWorld: { mockRestore(): void } | undefined;
+afterEach(() => { editWorld?.mockRestore(); editWorld = undefined; });
 const openInEditor = async (doc: PrefabFile): Promise<number> => {
   install(doc);
+  editWorld = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: `/__prefab-edit__/${doc.id}` } as never);
   await load(buildPrefabEditScene(doc) as SceneData);
   const root = getAllEntities().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!;
   expect(root).toBeDefined();
@@ -153,7 +158,6 @@ async function eachExpansion(outer: PrefabFile, check: (where: string) => void):
 beforeEach(() => {
   prefabs.clear();
   install(innerDoc);
-  clearKeptMemberOrphans();
 });
 
 // The editor authors in 'stopped'; the runtime DEFAULT is 'playing' (a shipped game boots playing), and
@@ -415,7 +419,11 @@ describe('#1533 close-out review', () => {
     ] } as unknown as SceneData);
     warn.mockRestore();
     writes.length = 0;
-    await applyToPrefabSelective(getAllEntities().find((e) => e.name === 'HostRoot')!.id, new Set([`+added.${MID_GUID}`]));
+    const res = await applyToPrefabSelective(getAllEntities().find((e) => e.name === 'HostRoot')!.id, new Set([`+added.${MID_GUID}`]));
+    // On records (#2001 S8b): the node the reference node's record holds (`heldOwn`, its anchor gone) goes into the row
+    // with it, so neither it nor its link stops the promotion. MUTATION TARGET: refuse on any held data, or on a link to a
+    // node that is not live, and the Apply is refused.
+    expect(res.applied, res.refused).toBe(true);
     const written = writes.map((w) => JSON.parse(w.content) as PrefabFile).find((p) => p.id === HOST)!;
     const members = written.entities.find((e) => e.prefab === MID)!.members ?? {};
     const rows = JSON.stringify(members);

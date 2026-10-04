@@ -31,8 +31,9 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
-  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, getOverrideMarkSet, findEntityById, type SceneData,
+  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, findEntityById, type SceneData,
 } from '@modoki/engine/runtime';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, addTraitToEntitiesWithUndo,
 } from '@modoki/engine/editor';
@@ -289,7 +290,7 @@ describe('an ADDED component is one row (#1663)', () => {
     await revertOverridesSelective(rootOf(ROOT1), new Set([row]));
     const a1 = inInstance(ROOT1, 'A');
     expect(hasTag(a1, 'UIFocusable')).toBe(false);
-    expect([...(getOverrideMarkSet(findEntityById(a1)! as never) ?? [])].filter((m) => m.startsWith('UIFocusable.'))).toEqual([]);
+    expect([...(overrideKeysOf(findEntityById(a1)! as never) ?? [])].filter((m) => m.startsWith('UIFocusable.'))).toEqual([]);
     const after = collectInstanceOverrideKeys(rootOf(ROOT1), prefabs.get(P) as PrefabFile);
     expect(after.all).toEqual(after.defaultOverrides); // only F7's root order
     expect(hasTag(inInstance(ROOT2, 'A'), 'UIFocusable')).toBe(true); // the other instance is untouched

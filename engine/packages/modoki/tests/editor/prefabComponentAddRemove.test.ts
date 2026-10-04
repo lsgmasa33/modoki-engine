@@ -62,7 +62,9 @@ function deleteEntitiesImpl(ids: number[]) {
   for (const id of toDelete) { index.get(id)?.destroy(); index.delete(id); }
 }
 
-vi.mock('../../src/runtime/core/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  onWorldSwap: () => () => {},
   // #1880 F7c: a Revert names its scene entry's root by durable guid, minting one (`ensureGuid`) where the root has none,
   // and finds it again by it after the rebuild. This mock is an explicit list, so each reachable export is named here.
   indexEntityGuid: () => {},
@@ -74,7 +76,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   unregisterEntity: (e: any) => index.delete(e.id()),
   destroyEntity: (e: any) => { ((e: any) => index.delete(e.id()))(e); e.destroy(); },
 }));
-vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
   // The pre-capture snapshot of the tree's unkeyed nodes (#1884, `capturedKeys.ts`).
   captureEntityIdentity: () => () => true,
   getAllEntities: () => getAllEntitiesImpl(),
@@ -104,7 +107,9 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
 }));
 vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(), getCachedPrefab: () => undefined }));
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
-  newGuid: () => 'gen-guid',
+  onFontInvalidated: () => () => {},
+  // Distinct per mint: two instances' records are keyed by their root guids, so one shared guid would merge them.
+  newGuid: (() => { let n = 0; return () => `aaaaaaaa-0000-4000-8000-${String(++n).padStart(12, '0')}`; })(),
   registerAsset: vi.fn(),
   getGuidForPath: () => undefined,
   isGuid: (s: string) => typeof s === 'string' && s.includes('-'),
@@ -122,8 +127,6 @@ global.fetch = vi.fn(async (url: string, init?: { body?: string }) => {
 
 beforeEach(async () => {
   testWorld = createWorld(); index.clear(); writtenPrefab = null;
-  const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
-  clearAllOverrideMarks();
 });
 const getModule = () => Promise.all([import('../../src/editor/scene/prefabApply'), import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabCapture'), import('../../src/editor/scene/prefabInstantiate'), import('../../src/editor/scene/prefabRevert')]).then(([m0, m1, m2, m3, m4]) => ({ ...m0, ...m1, ...m2, ...m3, ...m4 }));
 
@@ -161,6 +164,7 @@ describe('remove a prefab component from an instance', () => {
     setPrefabCache(SHIP, shipPrefab as any);
     const a = instantiatePrefab(shipPrefab as any); setPrefabSource(a, { id: SHIP });
     const b = instantiatePrefab(shipPrefab as any); setPrefabSource(b, { id: SHIP });
+    await placed(a); await placed(b); // the editor drop's door: a durable root guid, and its record (#2001 S8b)
 
     rootMember(a, 1).remove(Spin);
     await applyToPrefabSelective(a, new Set(['-trait.1.Spin']));
@@ -177,8 +181,15 @@ describe('revert a removed component', () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource, revertOverridesSelective } = await getModule();
     setPrefabCache(SHIP, shipPrefab as any);
     const root = instantiatePrefab(shipPrefab as any); setPrefabSource(root, { id: SHIP });
+    // Placed and edited through the door, as the editor does (#2001 S8b): a durable root guid, its record, the removal.
+    const door = await import('../../src/editor/instance/instanceEdits');
+    const rootEnt = rootMember(root, 1);
+    rootEnt.set(EntityAttributes, { ...rootEnt.get(EntityAttributes), guid: 'aaaaaaaa-0000-4000-8000-00000000f011' });
+    door.place(root);
 
+    const removed = door.beginRemoveComponent([rootEnt.id()], 'Spin');
     rootMember(root, 1).remove(Spin); // instance drops Spin...
+    removed();
     const result = await revertOverridesSelective(root, new Set(['-trait.1.Spin']));
     expect(result).not.toBeNull();
 
@@ -195,6 +206,7 @@ describe('add a component on an instance then apply', () => {
     setPrefabCache(SHIP, shipPrefab as any);
     const a = instantiatePrefab(shipPrefab as any); setPrefabSource(a, { id: SHIP });
     const b = instantiatePrefab(shipPrefab as any); setPrefabSource(b, { id: SHIP });
+    await placed(a); await placed(b); // the editor drop's door: a durable root guid, and its record (#2001 S8b)
 
     // Add Glow to instance A only.
     rootMember(a, 1).add(Glow({ intensity: 0.8, radius: 4 }));
@@ -210,3 +222,9 @@ describe('add a component on an instance then apply', () => {
     }
   });
 });
+
+async function placed(root: number): Promise<void> {
+  const { ensureGuid } = await import('../../src/editor/undo/entityRef');
+  const { place } = await import('../../src/editor/instance/instanceEdits');
+  ensureGuid(root); place(root);
+}

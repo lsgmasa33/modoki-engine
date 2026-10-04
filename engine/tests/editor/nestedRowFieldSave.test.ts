@@ -45,9 +45,9 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans, keptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, reparentEntity, deleteEntitiesWithUndo, duplicateEntity,
+  createEntityWithUndo, addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo,
 } from '@modoki/engine/editor';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import {
@@ -69,8 +69,11 @@ import { TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templat
 import { buildPrefabEditScene, serializePrefabEditWorld } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
+import { place } from '../../packages/modoki/src/editor/instance/instanceEdits';
+import { deriveInstanceMemberGuids } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { ensureGuid } from '../../packages/modoki/src/editor/undo/entityRef';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -162,7 +165,6 @@ beforeEach(() => {
   clearHistory();
   writes.length = 0;
   prefabs.clear();
-  clearKeptMemberOrphans(); // R2's kept rows are process state; one case's orphans must not reach the next
   // Apply repairs refs in other files after a re-parent; nothing else is on disk here.
   // The prefab "disk" for a multi-file Apply's pre-read (#1692 `commitPrefabWrites`, #1693 U13): a prefab's last written
   // bytes, else the document installed for it — as a real Response, whose bytes the precondition hashes.
@@ -278,7 +280,7 @@ describe('a scene edit to a field the row also sets is saved (#1498)', () => {
 describe('a copy taken OUT of the row records what the row gave it (#1914 R1)', () => {
   // The row's value is the nested frame's base, not a record. A Duplicate of the nested root makes the copy an instance of
   // its own (#1354), which the row does not reach: it shows the row's value only if it records it, and a save must then
-  // write it. Mutation: drop `layerMarks` from `copySnapshot`'s recorded list — the copy reloads at P's own 0.
+  // write it. Mutation: `promotedRecord` composes no layer from outside the frame (`compose([])`) — red.
   it('Duplicate of the nested root: the copy keeps the row\'s value, recorded, live and after a save', async () => {
     install(pDoc(), oWith({ 2: { Transform: { x: 2 } } }));
     await load(scene(O, [ROOT1]));
@@ -286,7 +288,7 @@ describe('a copy taken OUT of the row records what the row gave it (#1914 R1)', 
     const copy = duplicateEntity(inInstance(ROOT1, 'R'), () => {})!;
     const aCopy = getAllEntities().find((e) => e.name === 'A' && e.parentId === copy)!;
     expect(x(aCopy.id)).toBe(2);
-    const marksOf = (guid: string) => [...(getOverrideMarkSet(findEntity(getAllEntities().find((e) => e.guid === guid)!.id)!) ?? [])];
+    const marksOf = (guid: string) => [...(overrideKeysOf(findEntity(getAllEntities().find((e) => e.guid === guid)!.id)!) ?? [])];
     expect(marksOf(aCopy.guid!)).toContain('Transform.x');
     expect(marksOf(sourceA)).not.toContain('Transform.x'); // the source: the row's value is its base
     await load((await saved()).scene);
@@ -682,15 +684,19 @@ describe('a nested instance\'s base is its enclosing layer WHOLE: structure, and
 
     it('ACCEPT side: an instance the SCENE put inside the template\'s plain node is its own — its edit is listed, and Revert gives the template', async () => {
       // Mutation: match any candidate when the root has no key (`candidates[0]`) in `templateReferenceNode` — the
-      // scene's instance takes the row's node as its base, and its x = 3 edit is not listed.
+      // scene's instance took the row's node as its base, and its x = 3 edit was not listed. Measured green since #2001
+      // S8b placed the instance through the door: the listing of a placed instance does not reach that match here.
       install(pDoc(), p2Doc(), withHeldRefNode());
       await load(scene(O, [ROOT1]));
       const holder = inInstance(ROOT1, 'Holder2');
       const mine = instantiatePrefab(getCachedPrefabSync(P2) as PrefabFile, holder);
       setPrefabSource(mine, { id: P2 });
+      // Placed as a drop places it (#2001 S8b). Its placement states the root's order, one of Unity's default overrides
+      // (rootOrder), listed for every placed instance; this case is about XA's edit, so the list is read without it.
+      ensureGuid(mine); deriveInstanceMemberGuids(getCurrentWorld()); place(mine);
       const mineXa = getAllEntities().find((e) => e.name === 'XA' && e.parentId === mine)!.id;
       setTf(mineXa, 'x', 3);
-      expect(keys(mine, P2)).toEqual([xaKey]);
+      expect(keys(mine, P2).filter((k) => !k.endsWith('.EntityAttributes.sortOrder'))).toEqual([xaKey]);
       await revertOverridesSelective(mine, new Set([xaKey]));
       expect(x(mineXa)).toBe(0);
     });
@@ -753,10 +759,8 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
     await load(sc);
     return entry;
   };
-  const remove = (id: number) => {
-    const world = getCurrentWorld();
-    for (const e of world.entities) if (e.id() === id) { destroyEntity(e, world); break; }
-  };
+  /** The delete gesture (#2001 S8b: a save writes the records the door keeps, not a capture of the world). */
+  const remove = (id: number) => { deleteEntitiesWithUndo([id]); };
 
   it('an ADDED node: a later change to it reaches the saved scene', async () => {
     // Mutation: mark every anchor `whole` in `frameAddedDiff`'s result — R's row restates Extra and the reload shows 1.
@@ -1024,10 +1028,7 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
     const MINE = 'eeeeeeee-0000-4000-8000-000000001516';
     install(pDoc(), twoRow(1, 1));
     await load(scene(O, [ROOT1]));
-    getCurrentWorld().spawn(
-      meta('EntityAttributes').trait({ name: 'Mine', parentId: inInstance(ROOT1, 'R'), guid: MINE }),
-      meta('Transform').trait({ x: 2 }),
-    );
+    createEntityWithUndo('Create', inInstance(ROOT1, 'R'), [{ name: 'EntityAttributes', data: { name: 'Mine', parentId: inInstance(ROOT1, 'R'), guid: MINE } }, { name: 'Transform', data: { x: 2 } }], () => {});
     const entry = await reloadUnder(twoRow(8, 8));
     expect((rows(entry)[`/${gN}`]?.own as Array<{ guid: string }>).map((n) => n.guid)).toEqual([MINE]);
     expect(rows(entry)[`/${gN}`]?.added).toBeUndefined();
@@ -1038,7 +1039,7 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
     // Mutation: drop the `false` half of `traitRemovalStatements` — nothing is saved and the reload removes it again.
     install(pWithAction(), oRow({ removedTraits: { 2: ['UIAction'] } }));
     await load(scene(O, [ROOT1]));
-    getCurrentWorld().entities.find((e) => e.id() === inInstance(ROOT1, 'A'))!.add(meta('UIAction').trait());
+    addTraitToEntitiesWithUndo([inInstance(ROOT1, 'A')], meta('UIAction'));
     const entry = await reloadUnder(oRow({ removedTraits: { 2: ['UIAction'] } }));
     expect(rows(entry)[aRow]?.traitRemovals).toEqual({ UIAction: false });
     expect(readTraitData(inInstance(ROOT1, 'A'), meta('UIAction'))).toBeTruthy();
@@ -1096,10 +1097,7 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
     const KID = 'eeeeeeee-0000-4000-8000-000000001517';
     install(pDoc(), twoRow(1, 1));
     await load(scene(O, [ROOT1]));
-    getCurrentWorld().spawn(
-      meta('EntityAttributes').trait({ name: 'Kid', parentId: inInstance(ROOT1, 'Extra'), guid: KID }),
-      meta('Transform').trait({ x: 4 }),
-    );
+    createEntityWithUndo('Create', inInstance(ROOT1, 'Extra'), [{ name: 'EntityAttributes', data: { name: 'Kid', parentId: inInstance(ROOT1, 'Extra'), guid: KID } }, { name: 'Transform', data: { x: 4 } }], () => {});
     install(twoRow(8, 8));
     expect(await rebaseStaleInstances()).toBe(1);
     const parentName = () => { const byId = new Map(getAllEntities().map((e) => [e.id, e])); return byId.get(byId.get(inInstance(ROOT1, 'Kid'))!.parentId)!.name; };
@@ -1263,7 +1261,7 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
 
   it('#1516: a template REFERENCE node the scene deleted stays deleted across a Refresh, and is not kept as an orphan (re-review R3b)', async () => {
     // `applyNodeRowsLive` skipped every instance entity, so it never found a reference node: the Refresh brought it
-    // back and handed its `removed` row to the kept store. Mutation: skip reference-node roots in `applyNodeRowsLive`.
+    // back and handed its `removed` row to the kept store (deleted in #2001 S8b). Mutation: skip reference-node roots in `applyNodeRowsLive`.
     const P2 = 'cccccccc-0000-4000-8000-000000001519';
     const p2 = { id: P2, version: 5, name: 'P2', rootLocalId: 1, entities: [row(1, 'R2', 0, 'eeeeeeee-0000-4000-8000-000000001520'), row(2, 'XA', 1, 'eeeeeeee-0000-4000-8000-000000001521')] };
     const ref = { parentLocalId: 1, guid: '', key: 'k-ref', name: 'Ref', prefab: P2, traits: {}, children: [] };
@@ -1441,7 +1439,6 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       } finally {
         warn.mockRestore();
       }
-      expect(keptMemberOrphans(ROOT1)).toBeUndefined();
       expect([tfOf(inInstance(ROOT1, 'Inner')).y, tfOf(inInstance(ROOT1, 'Deep')).y]).toEqual([5, 6]);
     });
 
@@ -1597,7 +1594,7 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
     });
 
     // The replayed row is the scene's record again (#1914 R3a: a node's own row records its fields), so an edit back onto
-    // the template's value keeps it (F3) and is saved as that value — not as the old 5 the kept store held.
+    // the template's value keeps it (F3) and is saved as that value — not as the old 5 the kept store held (deleted in #2001 S8b).
     it('a replayed row leaves the store: an edit back to the template value after the Refresh is saved as that edit', async () => {
       // Mutation: keep the replayed rows in the store — the save re-emits `/gN/a+k-extra: {x: 5}`, and the reload shows 5.
       install(pDoc(), withN());
@@ -1787,7 +1784,7 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       // the lists pick their targets in id order (2 of 109 recorded lists drifted; neither can be re-aimed, one `u` slot
       // serves two picks). This states it without the ids: Y (an S instance the scene dropped under A, a member of O's
       // nested frame N) goes with A when P drops it, is kept in N/A's row, and a P that brings A back brings Y back once,
-      // guid intact, as a reload does. Mutation (re-run #1933): drop the kept orphan rows from the scene entry
+      // guid intact, as a reload does. Mutation (re-run #1933, before #2001 S8b deleted the kept stores): drop the kept orphan rows from the scene entry
       // (`captureInstanceMembers`' kept merge in prefabMembers.ts, `keptMemberOrphans(rootGuid) ?? {}` → `{}`) — Y does not
       // come back.
       const S = 'cccccccc-0000-4000-8000-000000001127';
@@ -2014,7 +2011,7 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
     });
 
     it('a load of a REFERENCE node with no rows leaves nothing kept for it — no stale row back on disk (re-review 2)', async () => {
-      // Mutation: collect only reference nodes WITH `members` in `collectReferenceNodeRows` — the Ghost row kept by the
+      // Mutation (before #2001 S8b deleted the kept stores): collect only reference nodes WITH `members` in `collectReferenceNodeRows` — the Ghost row kept by the
       // first load is written back by the save of the second.
       const gRef = 'dddddddd-0000-4000-8000-000000001550';
       const ghost = 'eeeeeeee-0000-4000-8000-000000001551';
@@ -2051,8 +2048,7 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
     const pTwo = () => { const d = pWithAction(); (d.entities[1]!.traits as Record<string, unknown>).UIFocusable = {}; return d; };
     install(pTwo(), oRow({ removedTraits: { 2: ['UIAction'] } }));
     await load(scene(O, [ROOT1]));
-    const a = getCurrentWorld().entities.find((e) => e.id() === inInstance(ROOT1, 'A'))!;
-    a.remove(meta('UIFocusable').trait as never);
+    removeTraitFromEntitiesWithUndo([inInstance(ROOT1, 'A')], meta('UIFocusable'));
     expect(readTraitData(inInstance(ROOT1, 'A'), meta('UIFocusable'))).toBeFalsy(); // precondition
     await reloadUnder(oDoc());
     expect(readTraitData(inInstance(ROOT1, 'A'), meta('UIFocusable'))).toBeFalsy(); // the scene's removal wins
@@ -2210,18 +2206,6 @@ describe('#1771: a saved member reference is read against the document its frame
     expect([refreshed, x(inInstance(ROOT1, 'A'))]).toEqual([6, 6]);
   });
 
-  it('accept side: a row whose chain still exists through the new template is backed — not kept as an orphan', async () => {
-    // The fold applies a row whether or not it is backed, so the value alone cannot tell; the kept store can. Mutation:
-    // answer "not backed" for every member-row key in `rowBackedTest` — `/gN2/gA` is kept too, and a later Refresh
-    // would replay it over whatever the scene does to that member next.
-    install(pAB(), p2(), swapped(true));
-    await load(scene(O, [ROOT1]));
-    const sc = JSON.parse(JSON.stringify((await saved()).scene)) as { entities: Array<Record<string, unknown>> };
-    const entry = sc.entities.find((e) => e.prefab === O)!;
-    entry.members = { ...(entry.members as object), [`/${gN2}/${gA}`]: { traits: { Transform: { x: 6 } } } };
-    await load(sc as unknown as SceneData);
-    expect(Object.keys(keptMemberOrphans(ROOT1) ?? {})).not.toContain(`/${gN2}/${gA}`);
-  });
 });
 
 // ── #1717 close-out review: the fold-in is excluded PER FIELD under an enclosing row ─────────────────────────────────
@@ -2246,5 +2230,33 @@ describe("a nested member's marked value equal to its base is listed unless the 
     // …and the save keeps what the list shows.
     const { entry } = await saved();
     expect(JSON.stringify(entry)).toContain('"x":0');
+  });
+});
+
+// #2001 S8b: in the prefab editor a row's root order is a record only where the row's `"/"` states it
+// (`Placement.orderStated`; a scene root records its order always, F7). An order edit there states it, and its Revert
+// takes the statement back out. Mutation: the door's order edit leaves `orderStated` unset (`setFields`) — the first save
+// writes no order. Mutation: the Revert keeps `orderStated` — the second save still writes 7.
+describe('a prefab row\'s order is saved on its "/" row once an edit states it, and its Revert takes it out (#2001 S8b)', () => {
+  it('in O\'s own edit: reorder N, save — the row states 7; Revert it, save — the row states no order', async () => {
+    install(pDoc(), oDoc());
+    const editWorld = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: `/__prefab-edit__/${O}` } as never);
+    try {
+      await load(buildPrefabEditScene(oDoc() as unknown as PrefabFile) as SceneData);
+      // N's root, under Slot (it shows its template root's name, as the row states none).
+      const n = () => { const all = getAllEntities(); const slot = all.find((e) => e.name === 'Slot')!.id; return all.find((e) => e.parentId === slot)!.id; };
+      const rootOrder = (doc: PrefabFile) => {
+        const r = (doc.entities as unknown as Array<Record<string, unknown>>).find((e) => e.nodeGuid === gN)!;
+        return ((r.members as Record<string, { traits?: { EntityAttributes?: { sortOrder?: number } } }> | undefined)?.['/'])?.traits?.EntityAttributes?.sortOrder;
+      };
+      const save = () => { const out = serializePrefabEditWorld(O); if ('error' in out) throw new Error(out.error); return out.prefab; };
+      expect(rootOrder(save()), 'precondition: the row states no order').toBeUndefined();
+      writeTraitFieldWithUndo(n(), meta('EntityAttributes'), 'sortOrder', 7);
+      expect(rootOrder(save())).toBe(7);
+      expect(await revertOverridesWithUndo(n(), new Set(['1.EntityAttributes.sortOrder']))).toBeTruthy();
+      expect(rootOrder(save())).toBeUndefined();
+    } finally {
+      editWorld.mockRestore();
+    }
   });
 });

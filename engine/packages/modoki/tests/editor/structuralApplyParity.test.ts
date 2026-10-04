@@ -37,6 +37,7 @@ const traitNamesOf = (e: any) => TRAITS.filter((t) => e.has(t.trait)).map((t) =>
 const spawnLog = new Map<string, number>();
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: () => () => {},
   getCurrentWorld: () => editorWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   spawnEntity: (world: any, ...traits: any[]) => {
@@ -96,6 +97,7 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({
 }));
 vi.mock('../../src/runtime/ui/uiTreeStore', () => ({ markUIDirty: vi.fn() }));
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
+  onFontInvalidated: () => () => {},
   newGuid: () => 'gen-guid',
   registerAsset: vi.fn(),
   getGuidForPath: () => undefined,

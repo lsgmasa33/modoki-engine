@@ -48,31 +48,6 @@ vi.mock('three/examples/jsm/loaders/GLTFLoader.js', () => ({
   },
 }));
 
-// Override marks are keyed by raw ecs id, so the global clear is a WORLD-scoped
-// concern — but it used to run on every `loadSceneFile` CALL, which meant a chain
-// (N scene files into ONE world, bases first / primary last) had the primary wipe
-// the marks the base had just seeded (A9 defect 1). Count the clears so the
-// "exactly once per staging world" contract is pinned, not just assumed.
-// See docs/reviews/a9-carried-instance-overrides-investigation.md.
-const markCounters = vi.hoisted(() => ({ clearAllCalls: 0 }));
-vi.mock('../../src/runtime/loaders/overrideMarks', () => {
-  // Keyed by the packed entity, like the real module (#868).
-  const marks = new Map<number, Set<string>>();
-  const setFor = (e: { valueOf(): number }) => {
-    let s = marks.get(e.valueOf());
-    if (!s) { s = new Set(); marks.set(e.valueOf(), s); }
-    return s;
-  };
-  return {
-    markOverride: (e: { valueOf(): number }, t: string, f: string) => { setFor(e).add(`${t}.${f}`); },
-    restoreOverrideMarks: (e: { valueOf(): number }, keys: Iterable<string>) => { const s = setFor(e); for (const k of keys) s.add(k); },
-    getOverrideMarkSet: (e: { valueOf(): number }) => marks.get(e.valueOf()),
-    getCarriedOverrideMarks: (e: { valueOf(): number }) => marks.get(e.valueOf()),
-    clearOverrideMarks: (e: { valueOf(): number }) => { marks.delete(e.valueOf()); },
-    clearAllOverrideMarks: () => { markCounters.clearAllCalls++; marks.clear(); },
-  };
-});
-
 vi.mock('../../src/runtime/core/traits/Time', () => ({ Time: TimeLike }));
 vi.mock('../../src/runtime/traits/Input', () => ({ Input: InputLike }));
 // `runtime/core/ecs/world.ts` (registerEntity/findEntityByGuid/guidOf) imports the REAL
@@ -231,21 +206,11 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     expect(sourceScenes.get('Level1Thing')).toBe('');
   });
 
-  it('clears override marks ONCE per staging world, not once per scene in the chain (A9 defect 1)', async () => {
+  it('a level-to-level swap reports the base it carried (#1417)', async () => {
     const { sceneManager } = await getSceneManager();
-
-    // A 2-scene chain (base + level1). Before the fix this cleared twice — the
-    // second clear wiping the base's freshly-seeded marks, which is what made
-    // every chained prefab instance serialize with EMPTY overrides.
-    markCounters.clearAllCalls = 0;
     await sceneManager.loadScene('/level1.json');
-    expect(markCounters.clearAllCalls).toBe(1);
-
-    // The swap to a level sharing the base carries the base (no reload) and
-    // respawns the snapshot — still exactly one clear for the new world.
-    markCounters.clearAllCalls = 0;
+    // The swap to a level sharing the base carries the base (no reload) and respawns the snapshot.
     const swap = await sceneManager.loadScene('/level2.json');
-    expect(markCounters.clearAllCalls).toBe(1);
     // #1417: the level→level swap reports the carried base, the case the editor's dirty flag needs.
     expect([...swap.keptBaseGuids]).toEqual([BASE_GUID]);
   });
@@ -296,45 +261,6 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     expect(names).toContain('Level2Thing');
   });
 
-  /** A9 defect 2 — the carry path never re-seeded override marks.
-   *
-   *  A carried snapshot is FLATTENED (no `overrides` map), and
-   *  `instantiatePrefabIntoWorld` — the only place marks are normally seeded from
-   *  a file — never runs on the carry path. So an authored override on a carried
-   *  instance had nothing to gate on at serialize time and came back as "no
-   *  override", reverting to the prefab's bare defaults on the next load.
-   *
-   *  Asserted PER ENTITY, not as a total count: mis-attributing per-entity
-   *  bookkeeping across entities is the cross-contamination failure that got an
-   *  earlier A8 attempt reverted, and a count-only assertion cannot see it. */
-  it('carries override marks across a swap, attributed to the right entity (A9 defect 2)', async () => {
-    const { sceneManager } = await getSceneManager();
-    const { getCurrentWorld } = await getWorld();
-    const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
-
-    const idsByName = (world: any) => {
-      const out = new Map<string, any>(); // name → entity (marks are keyed by the packed entity, #868)
-      world.query(EntityAttributes).updateEach(([attr]: any[], e: any) => out.set((attr as any).name, e));
-      return out;
-    };
-
-    await sceneManager.loadScene('/level1.json');
-    const before = idsByName(getCurrentWorld());
-    // Two DIFFERENT carried base entities with DIFFERENT marks — the attribution test.
-    markOverride(before.get('Camera')!, 'Transform', 'x');
-    markOverride(before.get('Time')!, 'Time', 'timeScale');
-
-    await sceneManager.loadScene('/level2.json'); // carries the base
-
-    const after = idsByName(getCurrentWorld());
-    // Fresh world → fresh ids, so this is a real remap, not an id coincidence.
-    expect(after.get('Camera')).toBeDefined();
-    expect(after.get('Time')).toBeDefined();
-
-    expect([...(getOverrideMarkSet(after.get('Camera')!) ?? [])]).toEqual(['Transform.x']);
-    expect([...(getOverrideMarkSet(after.get('Time')!) ?? [])]).toEqual(['Time.timeScale']);
-  });
-
   it("the base's resources are NOT released across the swap (no re-fetch, refcount survives)", async () => {
     const { sceneManager } = await getSceneManager();
     const { getResourceStats } = await getCache();
@@ -375,7 +301,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
 
   /** #1427 — the carry snapshot is built from the trait registry, so the UNREGISTERED markers were
    *  silently dropped: `Transient` (what keeps a runtime subtree out of a save) and `TemplateAddedKey`
-   *  (how a template-added node is named). Asserted per entity, like the marks above, so a marker
+   *  (how a template-added node is named). Asserted per entity, so a marker
    *  landing on the wrong carried entity fails too. Mutation: drop the `restoreMarkers` call in the
    *  carry respawn's `onEntitySpawned`. */
   it('carries the unregistered markers across a swap, attributed to the right entity (#1427)', async () => {

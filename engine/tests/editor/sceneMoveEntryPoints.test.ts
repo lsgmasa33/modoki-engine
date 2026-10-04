@@ -190,7 +190,7 @@ describe('a created entity belongs to its target scene (#1760)', () => {
     spawn('Lid', { sourceScene: BASE, parentId: src.id() });
     const clip = clipEntity(src.id(), 'copy')!;
     freshWorld(); // the clipboard outlives a scene load
-    const pasted = pasteEntityCopy(clip.snapshot, 0, () => {});
+    const pasted = pasteEntityCopy(clip, 0, () => {})!;
     expect(attrs(pasted).sourceScene).toBe('');
     expect(attrs(byName('Lid')).sourceScene).toBe('');
     expect(await saved()).toMatch(/"Crate"[\s\S]*"Lid"|"Lid"[\s\S]*"Crate"/);
@@ -204,7 +204,7 @@ describe('a created entity belongs to its target scene (#1760)', () => {
     const src = spawn('Crate');
     const clip = clipEntity(src.id(), 'copy')!;
     const baseParent = spawn('BaseShelf', { sourceScene: BASE });
-    const pasted = pasteEntityCopy(clip.snapshot, baseParent.id(), () => {});
+    const pasted = pasteEntityCopy(clip, baseParent.id(), () => {})!;
     expect(attrs(pasted)).toMatchObject({ parentId: baseParent.id(), sourceScene: BASE });
     expect(await saved(BASE_FILE)).toContain(attrs(pasted).guid);
   });

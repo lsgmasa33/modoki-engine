@@ -100,6 +100,8 @@ import { undo, redo, swapHistory, _resetHistoryContexts } from '../../packages/m
 import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { clearDirtyAssets, peekDirtyAsset } from '../../packages/modoki/src/editor/scene/dirtyAssets';
+import { place as seatInstance } from '../../packages/modoki/src/editor/instance/instanceEdits';
+import { deriveInstanceMemberGuids } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -197,6 +199,7 @@ beforeEach(() => {
   for (const guid of [ROOT, ROOT2]) {
     const id = instantiatePrefabIntoWorld(getCurrentWorld(), oDoc() as never, 0, undefined, O);
     for (const e of getCurrentWorld().entities) if (e.id() === id) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), guid });
+    deriveInstanceMemberGuids(getCurrentWorld()); seatInstance(id!); // placed as a drop places it (#2001 S8b)
   }
 });
 

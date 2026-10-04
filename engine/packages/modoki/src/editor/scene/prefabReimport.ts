@@ -30,14 +30,17 @@ import { worldHasUnsavedEdits } from './serialize';
 import { type PrefabFile } from './prefab';
 import { getCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
 import { asSceneEntry } from '../../runtime/loaders/unresolvedPrefabRefs';
-import { loadSceneFile, instantiatePrefabIntoWorld, type ExpansionReader, type SceneData } from '../../runtime/loaders/loadSceneFile';
+import { loadSceneFile, instantiatePrefabIntoWorld, type ExpansionReader, type SceneData, type SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
 import { openScenePath } from '../../runtime/scene/openScenePath';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { isGuid } from '../../runtime/core/assetRefRules';
 import { markUIDirty } from '../../runtime/core/uiDirty';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { frameRootDoc } from '../../runtime/core/ecs/identityParents';
-import { markStale } from '../../runtime/prefab/instanceStore';
+import { storedInstances } from '../../runtime/prefab/instanceStore';
+import { seatLoadedEntry } from '../instance/instanceSync';
+import { reprojectFromStore } from '../instance/instanceReproject';
+import { rollbackOnThrow } from '../instance/instanceRollback';
 import { showDeletedPrefabsMissing } from './deletedPrefabsMissing';
 
 export interface PrefabReimportReport {
@@ -76,9 +79,9 @@ async function reimportPrefabsInPlaceUnmarked(paths: readonly string[], opts: { 
     // A world replaced during the reads loaded its frames from these files itself: nothing here is left to rebase.
     if (opts.rebase === false || !sources.size || getCurrentWorld() !== world) return report;
     const names = new Map(getAllEntities().map((e) => [e.id, e]));
-    // A placeholder's re-expansion rebuilds its frame from the capture, or loads its entry anew: the records are left
-    // behind (#2001 S4). The rebase before it reprojected every fresh tree from its record (#2046 S7.3).
-    if (placeholdersOf(sources).length) markStale(getCurrentWorld(), 'outsideEdit');
+    // A placeholder's re-expansion keeps the records (#2001 S8b): a node placeholder's frame rebuild marks what it rebuilt
+    // from the capture (`rebuildStaleFrames`), and an entry's load seats what a reload would parse from it, or the entry
+    // stays a placeholder when it holds no record to parse.
     await reexpandPlaceholders(sources);
     for (const { entity: e, source } of placeholdersOf(sources)) {
       report.placeholders.push({ entity: e.name || String(e.id), ...(e.guid ? { guid: e.guid } : {}), source });
@@ -166,12 +169,22 @@ async function reexpandEntryPlaceholder(id: number): Promise<void> {
   await preloadNestedPrefabs(doc);
   if (getCurrentWorld() !== world || findEntity(id) !== handle) return;
   const children = all.filter((e) => e.parentId === id).map((e) => e.id);
+  // The instance's records come back from the record the placeholder holds (#2001 S8b). One holding no record has
+  // nothing to carry its user's nodes from, so it stays a placeholder, untouched, and the caller reports it: its way out
+  // is the reload that parses its records from the file. Before, it was re-expanded and its records marked stale, for the
+  // next write to re-seed from the live tree.
+  const was = storedInstances(world).get(guid);
+  if (!was) {
+    console.warn(`[prefab] ${info.name || guid} stays a Missing Prefab placeholder: it holds no record to re-expand it from (reload the scene to take it from the file)`);
+    return;
+  }
+  const wasRecord = structuredClone(was.record);
   // Its guid is the new root's: the placeholder goes first, or the load's own pass-1 entity collides with it.
   destroyEntity(handle, world);
   // Read by the rules of the file the kept entry came from (`UnresolvedPrefabRef.version`, #2001 S6).
   await loadSceneFile({ id: 'reimport', version: ref.version, name: '', resources: [], entities: [entry] } as unknown as SceneData, {
     world,
-    clearMarks: false,
+    records: false, // seated below from the record the placeholder held (`seatLoadedEntry`)
     scenePath: live.sourceScene || openScenePath() || undefined,
     loadModels: false,
     // The editor's cache, which holds a document edited and not yet saved. The load adds the world's copies of missing
@@ -208,6 +221,11 @@ async function reexpandEntryPlaceholder(id: number): Promise<void> {
     // recycles ids, so an id diff misses members (R1 review).
     if (live.sourceScene) for (const id of subtreeIds(now, newRoot.id)) writeTraitField(id, eaMeta, 'sourceScene', live.sourceScene);
     for (const c of children) if (findEntity(c)) writeTraitField(c, eaMeta, 'parentId', newRoot.id);
+    // The instance's records, as a reload parses them from this entry, and the tree projected from them: what a save and
+    // reload shows. The expansion alone left the root a name the record does not state (a pre-v20 entry's own `name`, the
+    // placeholder's, which this load does not apply).
+    seatLoadedEntry(entry as unknown as SceneEntityEntry, ref.version, wasRecord, world);
+    reprojectFromStore(newRoot.id);
   }
   markStructureDirty();
   markUIDirty();
@@ -235,11 +253,8 @@ async function reimportOutsidePrefabChangesUnmarked(paths: readonly string[], op
   return { report, needsReload: leftover > 0 && !worldHasUnsavedEdits() };
 }
 
-/** `fn`, marking the instance store stale only when it throws part-way: an outside change maintains the list otherwise —
- *  its landing changes no record, its rebase reprojects each fresh tree from its record and marks what it rebuilt from
- *  the capture, and a placeholder re-expansion marks itself (#2046 S7.3). */
-const staleOnThrow = <A extends unknown[], R>(fn: (...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
-  try { return await fn(...args); } catch (err) { markStale(getCurrentWorld(), 'outsideEdit'); throw err; }
-};
-export const reimportOutsidePrefabChanges = staleOnThrow(reimportOutsidePrefabChangesUnmarked);
-export const reimportPrefabsInPlace = staleOnThrow(reimportPrefabsInPlaceUnmarked);
+// An outside change maintains the list — its landing changes no record, its rebase reprojects each fresh tree from its
+// record and marks what it rebuilt from the capture, and an entry placeholder re-expands from its record or stays put — and one
+// that throws part-way rolls back (`instanceRollback.ts`, #2001 S8b).
+export const reimportOutsidePrefabChanges = rollbackOnThrow('an outside prefab change', reimportOutsidePrefabChangesUnmarked);
+export const reimportPrefabsInPlace = rollbackOnThrow('a prefab reimport', reimportPrefabsInPlaceUnmarked);

@@ -106,6 +106,7 @@ import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/e
 import { isSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { clearDirtyAssets, peekDirtyAsset } from '../../packages/modoki/src/editor/scene/dirtyAssets';
+import { place } from '../../packages/modoki/src/editor/instance/instanceEdits';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -183,6 +184,7 @@ beforeEach(() => {
   for (const guid of [ROOT, ROOT2]) {
     const id = instantiatePrefabIntoWorld(getCurrentWorld(), oDoc() as never, 0, undefined, O);
     for (const e of getCurrentWorld().entities) if (e.id() === id) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), guid });
+    place(id); // its record under that guid, as a load or a drop stores one (#2001 S8b)
   }
   for (const e of getCurrentWorld().entities) {
     if (e.has(eaMeta.trait)) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), sourceScene: BASE });

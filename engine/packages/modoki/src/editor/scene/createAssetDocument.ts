@@ -23,6 +23,7 @@
 import { newGuid, getAssetEntry } from '../../runtime/loaders/assetManifest';
 import { classifyJsonAssetPath } from '../../runtime/loaders/assetTypeClassifier';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
+import { notePrefabWrite } from './prefabWriteLog';
 import { backendFetch, postWriteFile, readBackendAnswer, thrownRefusal, type BackendAnswer } from '../backend/editorBackend';
 import { classifyExistingDocumentId } from './prefabCache';
 import { assetWrittenToDisk } from './dirtyAssets';
@@ -183,7 +184,10 @@ function refusalFields(r: { error: string; options?: string[] }): { error: strin
 
 /** The route's answer, read by the one reader — a request that never reached it is a refusal with `status` 0. */
 async function post(path: string, content: string, createOnly: boolean): Promise<BackendAnswer> {
-  try { return await readBackendAnswer(await postWriteFile(path, content, undefined, { createOnly })); } catch (e) { return thrownRefusal(e); }
+  let r: BackendAnswer;
+  try { r = await readBackendAnswer(await postWriteFile(path, content, undefined, { createOnly })); } catch (e) { return thrownRefusal(e); }
+  if (r.ok) notePrefabWrite(path, false);
+  return r;
 }
 
 async function readText(path: string): Promise<string | null> {

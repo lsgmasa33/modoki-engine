@@ -23,7 +23,6 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -106,7 +105,7 @@ const one = (name: string) => {
 const tf = (name: string) => readTraitData(one(name).id, getTraitByName('Transform')!) as { x: number; y: number } | null;
 const parentName = (name: string) => getAllEntities().find((e) => e.id === one(name).parentId)?.name;
 
-beforeEach(() => { setRunMode('stopped'); prefabs.clear(); clearKeptMemberOrphans(); });
+beforeEach(() => { setRunMode('stopped'); prefabs.clear(); });
 afterAll(() => { getCurrentWorld()?.destroy(); });
 
 describe('member row channels reach the member they NAME, across a template renumber (#1468 Phase 4)', () => {

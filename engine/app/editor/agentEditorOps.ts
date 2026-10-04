@@ -56,7 +56,7 @@ import {
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
 detachPrefabInstanceWithUndo, detachRefusal,
-  restructureRefusal, reorderWriteRefusal, RESTRUCTURE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT,
+  restructureRefusal, reorderWriteRefusal, RESTRUCTURE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT, MOVED_MEMBER_REFUSAL_TEXT,
   applyToPrefabWithUndo, revertOverridesWithUndo, revertRefusal, missingSourceRefusal, resolveInstanceContext, previewApply, describeEffect,
   type KeyEffect,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, effectiveDefaults, DEFAULT_OVERRIDES_NOTE, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
@@ -726,6 +726,7 @@ function reparentRefusalText(reason: Extract<ReparentPlan, { kind: 'refused' }>[
   switch (reason) {
     case 'restructure': return `${op}: refused to move or reorder ${id} — ${RESTRUCTURE_REFUSAL_TEXT} ${id} is part of a prefab instance: the prefab supplies it (a member, a nested prefab, or a node the prefab added), and only objects the scene added move inside an instance.`;
     case 'collapsed-parent': return `${op}: refused to move ${id} under ${parentId} — ${COLLAPSED_PARENT_REFUSAL_TEXT}`;
+    case 'moved-member': return `${op}: refused to move ${id} under ${parentId} — the move would unpack a member around it, and ${MOVED_MEMBER_REFUSAL_TEXT}`;
     case 'resource': return `${op}: refused to move ${id} under ${parentId} — a resource entity (Time, Input, a config singleton) stays at the root and holds no children (#1248).`;
     case 'instance-member': return `${op}: refused to move ${id} under ${parentId} — ${parentId} belongs to another scene, and a prefab instance would be split across two scene files: something in ${id}'s subtree (${id} itself, or an entity under it) belongs to an instance that would stay behind, or a member of an instance in it lives outside the subtree. Move that instance's root instead, or unpack that instance first.`;
     default: return `${op}: refused to move ${id} under ${parentId} — the move is illegal (${reason === 'self-parent' ? 'an entity cannot be its own parent' : `${parentId} is a descendant of ${id}`}).`;
@@ -3037,6 +3038,10 @@ export function registerEditorAgentOps(): void {
     if (r.reason === 'switching') {
       // #1750: refused, not queued — the world on screen is not the one the editor's path names yet.
       throw new OpRefusal(partialOr('REFUSED_BY_OP'), `save-all: the SCENE was NOT saved — a scene is still loading, so the editor's scene path does not describe the world on screen yet. Save again once it's open.${landed.length ? ` The ${landed.length} parked item(s) WERE written (${landed.join(', ')}).` : ''}${droppedNote}`);
+    }
+    if (r.reason === 'unsavable') {
+      // #2001 S8b review L2: a mark only a reload clears — "stop Play / retry" sent an agent round a loop that cannot end.
+      throw new OpRefusal(partialOr('REFUSED_BY_OP'), `save-all: the SCENE was NOT saved — ${r.error ?? 'the world is marked unsavable'}. Stop and retry do not clear it: reopen the scene (modoki_load_scene), which discards the unsaved edits in it.${landed.length ? ` The ${landed.length} parked item(s) WERE written (${landed.join(', ')}).` : ''}${droppedNote}`);
     }
     if (r.reason === 'playing') {
       // The SCENE half only. Parked asset docs already flushed above (#259) — say so, or an agent

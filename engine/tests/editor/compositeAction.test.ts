@@ -12,6 +12,8 @@ import {
   EntityAttributes, Transform, spawnEntity,
 } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { followedBy } from '../../packages/modoki/src/editor/undo/compositeAction';
+import { type UndoAction } from '../../packages/modoki/src/editor/undo/undoManager';
 import {
   runAsCompositeAction, composeUndoActions, isCapturingActions,
   pushAction, setActionCallback, clearHistory, undo, redo, canUndo, canRedo,
@@ -386,5 +388,24 @@ describe('composeUndoActions', () => {
     ], { label: 'B' })!;
     await expect(act.undo()).rejects.toThrow(AggregateError);
     expect(ran).toEqual(['c', 'a']); // the failure did not abort the remaining undos
+  });
+});
+
+// #2001 S8b: the Assets panel's Create Prefab re-wrapped its action as { label, undo, redo } to refresh its listing,
+// dropping every other field the stack reads (its check, its kind, the scenes it dirties).
+// Mutation: `followedBy` builds { label, undo, redo } without spreading `action` — every field assertion here goes red.
+describe('followedBy: an action with a step after it is still that action', () => {
+  it('keeps every field the stack reads, and runs `after` once each direction has run', async () => {
+    const ran: string[] = [];
+    const check = { undo: () => null, redo: () => null };
+    const action: UndoAction = {
+      label: 'Save prefab "X"', kind: '!batch', check, affectedScenes: ['s1'],
+      undo: async () => { ran.push('undo'); }, redo: async () => { ran.push('redo'); },
+    } as UndoAction;
+    const wrapped = followedBy(action, () => ran.push('after'));
+    expect(wrapped).toMatchObject({ label: action.label, kind: '!batch', check, affectedScenes: ['s1'] });
+    await wrapped.undo();
+    await wrapped.redo();
+    expect(ran).toEqual(['undo', 'after', 'redo', 'after']);
   });
 });

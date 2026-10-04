@@ -17,8 +17,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 import { makeFuzzBackend } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, startRun, settle, authored, piOf } from './prefabFuzz/harness';
 import { getTraitByName } from '../../packages/modoki/src/runtime/core/ecs/traitRegistry';
-import { writeTraitField, findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
-import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
@@ -36,8 +35,8 @@ describe('one rotation axis applied with a per-key target takes the whole rotati
       && !e.guid?.startsWith('ffffffff-0000-4000-8002-'))!;
     const a = authored().find((e) => e.name === 'A' && piOf(e.id)?.rootInstanceId === nRoot().id)!;
     const tf = getTraitByName('Transform')!;
-    writeTraitField(a.id, tf, 'rx', 0.5);
-    markOverride(findEntity(a.id)!, 'Transform', 'rx');
+    writeTraitFieldWithUndo(a.id, tf, 'rx', 0.5); // the door: it records the override (#2001 S8b, the listing reads the record)
+    await settle();
     const rx = collectInstanceOverrideKeys(nRoot().id, getCachedPrefabSync(f.prefabs.P.guid)!).all
       .find((k) => k.endsWith('.Transform.rx'))!;
     expect(rx, 'premise: the listing offers A\'s rx').toBeTruthy();

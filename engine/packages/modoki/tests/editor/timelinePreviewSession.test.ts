@@ -27,6 +27,7 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/editor/scene/serialize', () => ({
+  isSceneLoadSwapping: () => false,
   registerBeforeSceneLoad: (fn: () => Promise<unknown> | null) => { h.beforeLoad = fn; },
   serializeScene: async () => {
     if (h.serializeGate) await h.serializeGate;

@@ -4,7 +4,6 @@
 
 import { absenceIsRemoval } from '../../runtime/loaders/overrideFate';
 import { rowAt } from '../../runtime/core/prefabRowAt';
-import { getOverrideMarkSet, restoreOverrideMarks } from '../../runtime/loaders/overrideMarks';
 import { expandsToRoot } from '../../runtime/loaders/prefabRoot';
 import { placedAnchor, translateLocalIds, translateCarried } from '../../runtime/loaders/memberTranslation';
 import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
@@ -26,9 +25,9 @@ import { writtenTraitKeys } from './traitDefault';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { asAddedNode, nodePlacement } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { rowPlaceholderOf, unresolvedRefOf, UnresolvedPrefabRef } from '../../runtime/core/unresolvedPrefabRef';
-import { keptUnusedRows, keptMemberOrphans, keptLegacyChannels, mergeOverrideMaps, nestedPathKey, memberPathIndex, nodeChannels, mapNodeChannels } from '../../runtime/loaders/loadSceneFile';
+import { mergeOverrideMaps, nestedPathKey, memberPathIndex, nodeChannels, mapNodeChannels } from '../../runtime/loaders/loadSceneFile';
 import { type OverrideMap, foldStructureLayers, frameKeyIndex, ownRootRow } from '../../runtime/loaders/prefabOverrides';
-import { nodeForward, nodeRowValues, chainLayer, layerAddedTraits, levelDoc, captureDoc, withKeptLegacy, withKeptLocalRecords, withKeptUnused, withMalformedBack, withKeptSlots, frameBase, type ForwardState, type LayerStructure } from './prefabBase';
+import { nodeForward, nodeRowValues, chainLayer, layerAddedTraits, levelDoc, captureDoc, withUnusedPart, frameBase, type ForwardState, type LayerStructure } from './prefabBase';
 import { parseMemberToken, memberToken, memberPathKey, memberPathLookup, type MemberStep } from '../../runtime/core/templateRefs';
 import { childrenBySibling, localToEcsGuid, type PrefabFile } from './prefab';
 import { getCachedPrefabSync, recoverTemplateKey } from './prefabCache';
@@ -36,6 +35,8 @@ import {
   bakingKeptState, baseTokenResolver, templateStatementOf, templateTokenizer, tokenizeRowMembers,
 } from './prefabTokens';
 import { captureInstanceOverrides, withOverridesFolded } from './prefabInstanceOverrides';
+import { overrideKeysOf } from '../instance/instanceOverrideView';
+import { keptFromRecord } from '../instance/instanceKeptState';
 import {
   captureInstanceMembers, foreignRow, frameMovesOf, instanceRowDomain, liveRowLocalIds, memberRowParents,
   rowParentDomain, unexpandedRowsOf,
@@ -72,20 +73,17 @@ export function captureRowChannels(rootEcs: number, source: string, childPrefab:
   const structureBaselines = new Map<string, InstanceStructureData>();
   const channels = captureNestedChannels(rootEcs, source, ref.ownedNested, { omitUnchanged: true, template: true, readOnly, ...(deferCompare ? { baselinesOut: structureBaselines } : {}) });
   const rowed = moveChannelsOntoRows(rootEcs, childPrefab, source, { nestedStructure: channels.nestedStructure }, {}, channels.frames, { template: true });
-  // R2 for this carrier: a row the load found no template node for was KEPT (`applyStoredMemberRows`, under the root's
-  // guid) and goes back out, as the scene writer puts its own back (`captureInstanceMembers`) — dropped, an inner
-  // template that restores the node would not get the edit back.
-  // ⚠️ ONLY where the kept rows were read from this very TEMPLATE (`keepsTemplateRows`). Under a scene root (Create
-  // Prefab over a scene instance, Apply's promotion of a reference node) they are SCENE rows — member guids, scene-guid
-  // nodes — and written into a template they would give every instance one guid (#1293, close-out re-review).
+  // R2 for this carrier is a BAKE's alone (below): a row no template node answers to is the instance's record's (#2001
+  // S8b), and a save writes it from there. A root whose rows are this very TEMPLATE's (`keepsTemplateRows`) bakes none.
   const eaMeta = getTraitByName('EntityAttributes');
   const rootGuid = eaMeta ? durableGuid((readTraitData(rootEcs, eaMeta) as { guid?: string } | null)?.guid) : '';
   const members: Record<string, SceneMemberRow> = { ...rowed.members };
   // …and a Create Prefab's BAKE (#1790, owner ruling D): the tree it swallows is a scene's, and what R2 kept for its roots
   // is Unity's "unused overrides", which travel with the instance into the new asset. `templateRowOf` takes the scene
-  // identity out, so #1293 holds; the identity stays in the scene (`settleSwallowedKeptState`).
-  const ownRows = keepsTemplateRows(rootEcs, rootGuid) || bakingKeptState;
-  const kept = ownRows ? keptMemberOrphans(rootGuid) ?? {} : {};
+  // identity out, so #1293 holds: written into a template, scene rows would give every instance one guid.
+  // A bake reads them from the instance's RECORD (#2001 S8b step 2, `instanceKeptState.ts`); a tree with none has none.
+  const fromRecord = bakingKeptState && !keepsTemplateRows(rootEcs, rootGuid) ? keptFromRecord(rootEcs) : undefined;
+  const kept = fromRecord?.orphans ?? {};
   // …but never a kept REMOVAL of a template node (`…/a+<key>: {removed}`) that a live node answers to (#2001 S6): the row
   // was kept when no node held the key, and a node does now (a scene-form round trip of a pre-v5 chain respawns the node
   // by guid and the key is recovered, #2116). Written back beside a node this save states nothing for, it removed the
@@ -101,7 +99,7 @@ export function captureRowChannels(rootEcs: number, source: string, childPrefab:
   }
   // …and the unused part of each live member's row (#1914 R4): an override or removal the member's template does not take.
   // Statements only, no identity, so a bake carries it as it is.
-  if (ownRows) Object.assign(members, withKeptUnused(members, rootGuid, rootEcs));
+  if (fromRecord) for (const [key, part] of Object.entries(fromRecord.unused)) members[key] = withUnusedPart(members[key], part, () => false);
   // …and its LEGACY path-keyed channels no live frame reaches (#1738 member 3, #1780): a pre-v5 template's row states a
   // nested frame's edits there, with no `nodeGuid` for a member row to carry them. Under the same guard, for the same
   // reason: under a scene root they are the scene's.
@@ -109,13 +107,13 @@ export function captureRowChannels(rootEcs: number, source: string, childPrefab:
   // A BAKE's legacy channels are the scene's: their structure goes through the template converter as the rows go through
   // `templateRowOf` — a node's guid out, a `moved` (a scene guid by value) dropped — or every instance stamps one guid
   // (#1293; #1790 close-out review F4).
-  const baked = bakingKeptState && !keepsTemplateRows(rootEcs, rootGuid) ? keptLegacyChannels(rootGuid) : undefined;
+  const baked = fromRecord?.legacy;
   const legacy = baked
     ? {
       nestedOverrides: baked.nestedOverrides ? { ...baked.nestedOverrides, ...ownLegacy.nestedOverrides } : ownLegacy.nestedOverrides,
       nestedStructure: baked.nestedStructure ? { ...toTemplateStructure(baked.nestedStructure), ...ownLegacy.nestedStructure } : ownLegacy.nestedStructure,
     }
-    : withKeptLegacy(ownLegacy, ownRows ? rootGuid : '');
+    : ownLegacy;
   return {
     channels: { ...channels, nestedOverrides: legacy.nestedOverrides }, structureBaselines,
     nestedStructure: legacy.nestedStructure,
@@ -158,12 +156,12 @@ function templateRowsOf(rows: Record<string, SceneMemberRow>): Record<string, Sc
   return Object.keys(out).length ? out : undefined;
 }
 
-/** Were the rows kept for the root `rootEcs` (guid `rootGuid`) read from the template being written? — the #1293 gate on
- *  R2's re-emit. Two carriers qualify, both only inside the prefab-edit world:
+/** Were the rows of the root `rootEcs` (guid `rootGuid`) read from the template being written? — the #1293 gate: a bake
+ *  reads no record of such a root, and a rebuild keys its rows (`prefabRebuild.ts`). Two carriers qualify, both only inside the prefab-edit world:
  *  - a prefab ROW (`isPrefabEditRow`): spawned as a scene entry under its row sentinel, whose rows the load read off
  *    that entry, or dropped in this session, whose rows only a Refresh's settle kept (#1568);
  *  - a TEMPLATE reference node that such a row's own statements declare (#1542): it stores no guid and derives one,
- *    and the load kept its rows under that (`keepTemplateNodeOrphans`). Its root carries a template key and sits
+ *    and its rows are stated under that. Its root carries a template key and sits
  *    below a row. A scene never holds one — a scene-form reference node stores a guid (#1438) — so the row ancestor
  *    is what separates the two. */
 export function keepsTemplateRows(rootEcs: number, rootGuid: string): boolean {
@@ -270,8 +268,8 @@ export function declaredTemplateKeys(written: Parameters<typeof templateKeysOf>[
  *  statements into the outer file, and a member ref inside it kept the edit world's live guid, naming nothing in any
  *  instance. Now: the row writer (`captureRowChannels`: frames per member, omitted when unchanged), tokenized in the
  *  node's OWN frame (the loaders open a token scope at its top call), climbing out of it only for a ref no frame inside
- *  can name (#1541, `templateTokenizer`'s `ownFrame`), then the shared finish. Its kept orphan rows go back out inside the prefab-edit world (#1542), under the guid its root derives:
- *  the load keeps them there (`keepTemplateNodeOrphans`), and `keepsTemplateRows` gates the re-emit.
+ *  can name (#1541, `templateTokenizer`'s `ownFrame`), then the shared finish. Its orphan rows go back out inside the prefab-edit world (#1542),
+ *  under the guid its root derives.
  *
  *  `readOnly` (a comparison, not a write): read each node's template key, never mint or stamp one. */
 function finishTemplateReferenceNode(
@@ -280,15 +278,9 @@ function finishTemplateReferenceNode(
   // The node's key before anything reads it: `keepsTemplateRows` and the climb out of the node (`templateFrameClimber`)
   // both ask it, and a Refresh respawns the node from a scene-form capture that carries none. The caller stamps it
   // anyway (`addedNodeIdentity`); after the capture was too late (#1541/#1542 close-out review).
-  if (!readOnly) {
-    // A scene-added reference node records its sibling order implicitly (F7), and the key stamped next makes it a
-    // template's copy, whose order is recorded like any field: so the order it records is stored as a mark first, or the
-    // row this writes leaves it out and the node goes back to its template root's order (#1947 placed one after a sibling).
-    const node = findEntity(ecsId);
-    const marked = node ? getOverrideMarkSet(node as never) : undefined;
-    if (node && marked?.has('EntityAttributes.sortOrder')) restoreOverrideMarks(node as never, ['EntityAttributes.sortOrder']);
-    addedNodeIdentity(ecsId, true);
-  }
+  // (A scene-added reference node's sibling order (F7, #1947) needs nothing here: the capture's key set was taken from the
+  // view before the key stamped next makes the node a template's copy, `withCaptureKeys`.)
+  if (!readOnly) addedNodeIdentity(ecsId, true);
   const ref = captureInstanceReference(ecsId, source, childPrefab, { template: true, readOnly });
   const rc = captureRowChannels(ecsId, source, childPrefab, ref, true, readOnly);
   const tokens = templateTokenizer(ecsId, filterAuthoringVisible(getAllEntities()), new Map(), new Map(), true);
@@ -502,7 +494,7 @@ function compactAddedTraitData(meta: TraitMeta, data: Record<string, unknown>): 
 
 /** Snapshot every trait on a live entity (full schema fidelity, like serialize),
  *  excluding PrefabInstance. Returns the trait bag + the entity's stable guid. */
-function snapshotAddedTraits(ecsId: number): { bag: Record<string, Record<string, unknown> | boolean>; guid: string } {
+export function snapshotAddedTraits(ecsId: number): { bag: Record<string, Record<string, unknown> | boolean>; guid: string } {
   const bag: Record<string, Record<string, unknown> | boolean> = {};
   let guid = '';
   const entity = findEntity(ecsId);
@@ -817,12 +809,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     // expansion of a DRAGGED-IN prefab was captured by nothing and came back on reload.
     const captured = captureNestedChannels(ecsId, source, ref.ownedNested, { template: opts.template, rows: opts.rows, frameEdits: opts.frameEdits, againstRecords: opts.againstRecords });
     for (const c of captured.consumedEcsIds) consumedEcsIds.add(c);
-    // A SCENE node is a stored root: what the load kept of its legacy channels goes back out with it (#1780). A template
-    // capture of one writes its scene statements nowhere (I8).
-    const nodeGuid = opts.template ? '' : durableGuid((readTraitData(ecsId, getTraitByName('EntityAttributes')!) as { guid?: string } | null)?.guid);
-    // A reached frame's kept structure records into its live slot, which then stays whole (#1933 S4, as an entry's).
-    const slots = withKeptSlots(captured.nestedStructure, nodeGuid);
-    const channels = withKeptLegacy({ ...captured, nestedStructure: slots.nestedStructure }, nodeGuid, slots.merged);
+    const channels = captured;
     // A template reference node's own moves ride the scene form unchanged: they are the template's statement, and the
     // moves captured above are measured against them (`prefabMoveTargets`), so a respawn without them lost the move (#1543).
     const handle = findEntity(ecsId);
@@ -842,7 +829,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
       const members = captureInstanceMembers(ecsId, childPrefab);
       return { ...node, ...(Object.keys(members).length ? { members } : {}) };
     }
-    const moved = moveChannelsOntoRows(ecsId, childPrefab, source, node, captureInstanceMembers(ecsId, childPrefab), channels.frames, { againstRecords: opts.againstRecords, frameEdits: opts.frameEdits, keepWholeSlots: slots.merged });
+    const moved = moveChannelsOntoRows(ecsId, childPrefab, source, node, captureInstanceMembers(ecsId, childPrefab), channels.frames, { againstRecords: opts.againstRecords, frameEdits: opts.frameEdits });
     const nonEmpty = <T,>(v: T | undefined): T | undefined =>
       v === undefined || (Array.isArray(v) ? v.length : Object.keys(v as object).length) ? v : undefined;
     // Stated against its record: what is left by localId goes into the numbering the load expands it in.
@@ -865,15 +852,15 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
       (moved.channels.overrides as Record<number, Record<string, Record<string, unknown>>> | undefined)?.[pi?.localId as number]?.EntityAttributes,
       readTraitData(ecsId, getTraitByName('EntityAttributes')!) as Record<string, unknown> | undefined,
     );
-    return withMalformedBack({
+    return {
       ...node,
       ...(Object.keys(placement).length ? { traits: { EntityAttributes: placement } } : {}),
       ...(lid && node.moved ? { moved: translateCarried(lid, {}, { moved: node.moved }).structure.moved } : {}),
       overrides: nonEmpty(ch.overrides), added: nonEmpty(ch.added),
       removed: nonEmpty(ch.removed), removedTraits: nonEmpty(ch.removedTraits),
       nestedOverrides: nonEmpty(moved.channels.nestedOverrides), nestedStructure: nonEmpty(moved.channels.nestedStructure),
-      ...(Object.keys(moved.members).length || keptUnusedRows(nodeGuid) ? { members: withKeptUnused(withoutRowParents(ecsId, moved.members, opts.dropParents), nodeGuid, ecsId) } : {}),
-    }, nodeGuid); // what the load kept as malformed (#1938 C-B step 2); a template capture has no nodeGuid
+      ...(Object.keys(moved.members).length ? { members: withoutRowParents(ecsId, moved.members, opts.dropParents) } : {}),
+    };
   };
 
   // Capture one non-member child as an AddedEntity (plain subtree OR nested-instance
@@ -1294,10 +1281,6 @@ export function moveChannelsOntoRows(
      *  statement at the node's root), node by node, and its root's row under {@link NODE_ROOT}. `live` is the frame's
      *  capture. Set by {@link referenceNodeRows}, whose rows reach into a template reference node. */
     asNode?: { live: InstanceStructure; base: LayerStructure };
-    /** Frames (structure path keys) whose slot carries a record the load kept as unused (#1933 S4, `withKeptSlots`): stated
-     *  whole, as the legacy slot, never on rows — a row cannot state a member the template has since deleted, and half on
-     *  rows and half in the slot would be one statement in two places. */
-    keepWholeSlots?: ReadonlySet<string>;
   } = {},
 ): { channels: InstanceChannels; members: Record<string, SceneMemberRow>; nodeUnstated?: boolean; rowFrames?: Map<string, number> } {
   const piMeta = getTraitByName('PrefabInstance');
@@ -1512,7 +1495,7 @@ export function moveChannelsOntoRows(
     for (const [path, live] of Object.entries(ch.nestedStructure)) {
       const f = frameOf(path);
       // A move no row can carry (`unrowed`) means this frame already has a member no row can key.
-      if (!f || Object.keys(live.moved ?? {}).length || opts.keepWholeSlots?.has(path)) { keep[path] = live; continue; }
+      if (!f || Object.keys(live.moved ?? {}).length) { keep[path] = live; continue; }
       if (!stateFrame(f, live, chainLayer(rootId, source, f.steps, undefined, opts.seed).structure)) keep[path] = live;
     }
     legacy.nestedStructure = Object.keys(keep).length ? keep : undefined;
@@ -1623,14 +1606,7 @@ export function captureInstanceReference(
   const overrides = edit?.overrides ? edit.overrides(liveOverrides) : liveOverrides;
   const liveStructure = captureInstanceStructure(rootInstanceId, prefab, opts);
   const edited = edit?.structure ? edit.structure(liveStructure) : liveStructure;
-  // The records the load kept as UNUSED for this root (#1914 R4), as the scene entry writer puts its own back: a scene
-  // node's always, a template one's only where they were read from the template being written (`keepsTemplateRows`, the
-  // #1293 gate R2's rows go through) or a bake carries them into it.
-  const eaMeta = getTraitByName('EntityAttributes');
-  const rootGuid = eaMeta ? durableGuid((readTraitData(rootInstanceId, eaMeta) as { guid?: string } | null)?.guid) : '';
-  const keptFrom = !opts.template || keepsTemplateRows(rootInstanceId, rootGuid) || bakingKeptState ? rootGuid : '';
-  const local = withKeptLocalRecords({ overrides, removedTraits: edited.removedTraits, removed: edited.removed, moved: edited.unrowed }, keptFrom, rootInstanceId, !!opts.template);
-  const structure = { ...edited, removedTraits: local.removedTraits ?? {}, removed: local.removed ?? [], unrowed: local.moved };
+  const structure = { ...edited, removedTraits: edited.removedTraits ?? {}, removed: edited.removed ?? [] };
   const memberEcsIds = new Set<number>();
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (PrefabInstanceMeta) {
@@ -1640,7 +1616,7 @@ export function captureInstanceReference(
   }
   return {
     source,
-    overrides: local.overrides && Object.keys(local.overrides).length ? local.overrides : undefined,
+    overrides: Object.keys(overrides).length ? overrides : undefined,
     added: structure.added.length ? structure.added : undefined,
     removed: structure.removed.length ? structure.removed : undefined,
     removedTraits: Object.keys(structure.removedTraits).length ? structure.removedTraits : undefined,
@@ -1717,7 +1693,7 @@ export function toTemplateStructure(paths: NestedStructurePaths | undefined, dec
  *    identity no reload reproduces — an earlier save stored it, or a Refresh kept it live, before the template
  *    re-parented the member — so it stays, and the node reads as edited and keeps it. Dropped, the node compared equal,
  *    the save left it to the template, and the member re-derived a new guid under every scene ref into it (close-out
- *    review). An ORPHAN row's guid (`keptMemberOrphans`: the template dropped the member) names nothing live, and
+ *    review). An ORPHAN row's guid (the template dropped the member) names nothing live, and
  *    keeping it pinned the node on every save, so it goes;
  *  - a member row's `name` (a row holding nothing else goes; a `parent`, a move, stays);
  *  - its own `name`, which no spawn applies (the root is named by the child prefab), so that goes from both sides;
@@ -2065,7 +2041,7 @@ function withBaseRemovals(n: AddedEntity): AddedEntity {
     const baseAdded = Object.keys(given).filter((t) => own?.[t] === undefined && !!getTraitByName(t));
     if (!baseAdded.length) continue;
     const gone = baseAdded.filter((t) => !e.has(getTraitByName(t)!.trait));
-    const marks = getOverrideMarkSet(e as Parameters<typeof getOverrideMarkSet>[0]);
+    const marks = overrideKeysOf(e as never);
     // The copy's statement of each live one, cut to its recorded fields.
     const cut = (bag: Record<string, Record<string, unknown>> | undefined) => {
       if (!bag) return bag;
@@ -2151,7 +2127,7 @@ export function nodeDiffDeps(keys: ReadonlyMap<string, string>): NodeDiffDeps {
     // The live node's own record (#1914 R3a): what the save writes of a template node's fields, and all it writes.
     recordedOf: (n) => {
       const e = n.guid ? findEntity(localToEcsGuid(n.guid)) : undefined;
-      return new Set(e ? getOverrideMarkSet(e) ?? [] : []);
+      return new Set(e ? overrideKeysOf(e) ?? [] : []);
     },
   };
 }

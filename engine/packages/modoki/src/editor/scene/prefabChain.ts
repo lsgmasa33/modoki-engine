@@ -9,7 +9,7 @@ import { nestedMoveRef } from './overrideKeyGrammar';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { isOwnedRoot } from '../../runtime/core/assetRefRules';
-import { getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../instance/instanceOverrideView';
 import { memberPathIndex } from '../../runtime/loaders/loadSceneFile';
 import { frameBase, layerAddedTraits, type FrameLayer } from './prefabBase';
 import { type PrefabFile } from './prefab';
@@ -32,7 +32,7 @@ export function memberOverrideKeys(
   const diffs = getOverrideValues(localId, currentTraits, base, rootInstanceId ? baseTokenResolver(rootInstanceId) : undefined);
   const moved = () => !!rootInstanceId && instanceMovedMembers(rootInstanceId, prefab)(entityId, !!diffs['Transform']);
   const entity = findEntity(entityId);
-  const marks = entity ? getOverrideMarkSet(entity) : null;
+  const marks = entity ? overrideKeysOf(entity) : null;
   const out = new Set<string>();
   for (const [traitName, fields] of Object.entries(recordedOverrides(diffs, marks, rowAt(base, localId), moved, currentTraits))) {
     for (const field of Object.keys(fields)) out.add(`${traitName}.${field}`);

@@ -167,6 +167,9 @@ setActionCallback(pushAction);
 vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => {}, removeItem: () => {} });
 
 const MID = 'aaaaaaaa-0000-4000-8000-000000001575';
+import { addChild, place } from '../../packages/modoki/src/editor/instance/instanceEdits';
+import { deriveInstanceMemberGuids } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+
 const G = (n: number) => `cccccccc-0000-4000-8000-${String(n).padStart(12, '0')}`;
 /** The instance roots' guids — what the scene snapshot carries them by. */
 const ROOT = { A: G(21), B: G(22) } as const;
@@ -286,6 +289,9 @@ beforeEach(() => {
   for (const inst of ['A', 'B'] as const) {
     const id = instantiatePrefabIntoWorld(getCurrentWorld(), midDoc() as never, 0, undefined, MID);
     for (const e of getCurrentWorld().entities) if (e.id() === id) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), guid: ROOT[inst] });
+    // Placed as a drop places it (#2001 S8b): its members' derived guids and the door's record, under the root's guid.
+    deriveInstanceMemberGuids(getCurrentWorld());
+    place(id!);
   }
   expect(getCurrentScenePath()).toBeNull(); // precondition: an untitled world
 });
@@ -324,7 +330,8 @@ describe('undoing an Apply made in an untitled scene rebuilds that world (#1575)
   });
 
   it('a promoted addition goes back to being the instance\'s own, and leaves the other instance', async () => {
-    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Extra', parentId: rootOf('A'), guid: G(99) }));
+    const extra = spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Extra', parentId: rootOf('A'), guid: G(99) }));
+    addChild(extra.id()); // linked as an Add Child links it (#2001 S8b)
     const before = await saved();
     await applyFromA((k) => k.added);
     expect(inInst('B', 'Extra')).not.toBe(0); // precondition: B gained the promoted member

@@ -15,7 +15,7 @@
  *
  *  Mutations (measured): the old row fold applying a row whose component names no member at the frame root
  *  (`foldMemberRowChannels`: `if (at) apply(…)` given an `else apply(rootLocalId, row, false)`) — the H case red, and
- *  only it (a top-level instance is built by the new fold); the row capture without the kept orphan rows
+ *  only it (a top-level instance is built by the new fold); the row capture without the kept orphan rows (before #2001 S8b deleted the kept stores)
  *  (`captureRowChannels`: `keptMemberOrphans(rootGuid) ?? {}` → `{}`) — "O's own prefab-edit save" red, and only it.
  *
  *  Driven through the prefab fuzzer's harness: the real backend route, SceneManager, both caches, prefab edit and the

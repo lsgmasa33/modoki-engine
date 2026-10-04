@@ -40,6 +40,14 @@ describe('toastForSave — the scene half', () => {
     expect(t.text).toBe('Save FAILED (write-failed: EACCES: permission denied) — nothing written to disk');
   });
 
+  // #2001 S8b review L2: a world marked unsavable is not a run mode — the toast says the mark, which names the way out.
+  // Mutation: drop the 'unsavable' branch in toastForSave — the last branch says "Save FAILED (unsavable…)".
+  it('a world marked unsavable says the mark, which names the reload, not Stop or Play', () => {
+    const t = toastForSave(scene({ scene: { saved: false, path: '/s.json', reason: 'unsavable', error: 'an instance has no record to write (the console names it) — reopen the scene before saving' } }));
+    expect(t.text).toBe('The scene was not saved: an instance has no record to write (the console names it) — reopen the scene before saving');
+    expect(t.kind).toBe('warn');
+  });
+
   it('a cancelled Save-As is INFO, not a failure — the user chose it', () => {
     const t = toastForSave(scene({ scene: { saved: false, path: null, reason: 'cancelled' } }));
     expect(t.kind).toBe('info');

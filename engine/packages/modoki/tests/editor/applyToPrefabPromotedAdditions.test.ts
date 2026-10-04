@@ -88,6 +88,15 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => TRAITS,
 }));
 
+// This world is hand-built and holds no instance records, so the door cannot say what a promotion leaves; the Apply would
+// refuse it (#2001 S8b, `canPromoteAdded`). Its records are not this file's subject — what the Apply writes is: the door
+// is told it can follow.
+vi.mock('../../src/editor/instance/instanceEdits', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  canPromoteAdded: () => true,
+  promoteAdded: () => true,
+}));
+
 let writtenContent: string | null = null;
 // @ts-expect-error mock global — write-file succeeds so apply runs to completion.
 global.fetch = vi.fn(async (url: string, init?: { body?: string }) => {

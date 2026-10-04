@@ -53,7 +53,7 @@ vi.stubGlobal('localStorage', memoryStorage());
 boot(be);
 
 const row = (localId: number, name: string, parentId: number, extra: Record<string, unknown> = {}) => ({
-  localId, name, nodeGuid: `9${String(localId).padStart(7, '0')}-0000-4000-8000-00000000${String(1872 * 10 + localId).padStart(4, '0')}`,
+  localId, name, nodeGuid: `9${String(localId).padStart(7, '0')}-0000-4000-8000-0000000${String(1872 * 10 + localId)}`,
   traits: { EntityAttributes: { name, parentId, guid: '' }, Transform: { x: 0, y: 0, z: 0 }, ...extra },
 });
 const fileText = (doc: unknown) => `${JSON.stringify(doc, null, 2)}\n`;

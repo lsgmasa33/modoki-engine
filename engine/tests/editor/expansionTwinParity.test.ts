@@ -41,7 +41,6 @@ import {
   instantiatePrefab, applyStructureByRootInstance,
 } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { frameRootDoc } from '../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -88,7 +87,6 @@ const install = (...docs: Array<{ id: string }>) => { for (const d of docs) { pr
 beforeEach(() => {
   setRunMode('stopped');
   prefabs.clear();
-  clearKeptMemberOrphans();
   install(qDoc(), pDoc(), oDoc(), hDoc());
   const prev = getCurrentWorld();
   setCurrentWorld(createWorld());

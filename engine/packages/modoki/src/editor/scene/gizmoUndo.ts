@@ -6,7 +6,7 @@
 
 import type { UndoAction } from '../undo/undoManager';
 import { fireDirtyListeners } from '../../runtime/core/renderDirty';
-import { markOverrideIfInstance, markStateOf, putMarksOnly, putFieldRows, type MarkState } from '../undo/overrideMarkWrites';
+import { markOverrideIfInstance, putFieldRows, requireRowRecords } from '../undo/overrideMarkWrites';
 import * as instanceEdits from '../instance/instanceEdits';
 
 /** Minimal entity surface the undo closures touch. `get` is `| undefined` because a koota handle's
@@ -36,9 +36,9 @@ export interface TransformUndoOptions {
    *  perceives the spatial edit — the changed field subset, old→new. Omit to skip
    *  journalling (the action then falls back to a bare `!edit`). */
   entityGuid?: string;
-  /** The Transform fields this drag marks as prefab-instance overrides: a deliberate edit, like the Inspector's. The
-   *  builder marks them when it is built, and its undo and redo put back each side's marks, so an undone drag is not
-   *  saved as an override pinned at the old pose (#1709). Omit to mark nothing. */
+  /** The Transform fields this drag records as prefab-instance overrides: a deliberate edit, like the Inspector's. The
+   *  builder records them when it is built, and its undo and redo put back each side's rows, so an undone drag is not
+   *  saved as an override pinned at the old pose (#1709). Omit to record nothing. */
   markFields?: readonly string[];
 }
 
@@ -50,29 +50,30 @@ const _resolvers = new WeakMap<UndoAction, () => number | null>();
  *  clobbered; both re-resolve the entity and no-op if it's gone. */
 export function buildTransformUndoAction(opts: TransformUndoOptions): UndoAction {
   const { label, trait, resolve, findEntity, before, after, entityGuid, markFields } = opts;
-  // Each side's marks and rows (#2046 S7.2, rule 8): undo and redo put them back exactly, recomputing nothing.
-  // The before rows come from a record fresh before the commit, or none (the drag already wrote live, so a re-seed would
-  // capture the dragged values, review F1): without them the step marks the records stale, as a step that keeps none.
-  type Side = { marks: MarkState; rows: ReturnType<typeof instanceEdits.rowsOf> | null };
+  // Each side's rows (#2046 S7.2, rule 8): undo and redo put them back exactly, recomputing nothing. The before rows come
+  // from the record as it stood before the commit, or none (the drag already wrote live, so rows read now would state the
+  // dragged values, review F1): without them (no record) the step puts back the values.
+  type Side = { fields: readonly string[]; rows: ReturnType<typeof instanceEdits.rowsOf> | null };
   let sides: { before: Side; after: Side } | undefined;
   const markId = markFields?.length ? resolve() : null;
   if (markId != null && markFields) {
-    const was: Side = { marks: markStateOf(markId, 'Transform', markFields), rows: instanceEdits.priorRowsOf([markId]) };
+    const was: Side = { fields: markFields, rows: instanceEdits.priorRowsOf([markId]) };
     for (const f of markFields) markOverrideIfInstance(markId, 'Transform', f);
-    sides = { before: was, after: { marks: markStateOf(markId, 'Transform', markFields), rows: was.rows && instanceEdits.rowsOf([markId]) } };
+    sides = { before: was, after: { fields: markFields, rows: was.rows && instanceEdits.rowsOf([markId]) } };
   }
   const apply = (fields: Record<string, number>, side?: Side) => {
     const id = resolve();
     if (id == null) return;
     const en = findEntity(id);
     if (!en?.has(trait)) return;
+    requireRowRecords(side?.rows);
     en.set(trait, { ...en.get(trait), ...fields });
-    if (side) { putMarksOnly(id, 'Transform', side.marks); putFieldRows([id], side.rows, 'Transform', Object.keys(side.marks)); }
+    if (side) putFieldRows([id], side.rows, 'Transform', side.fields);
     // A direct ECS write fires no dirty broadcast, and undo/redo has none of its own — so without
     // this the Game view (and anything else listening) kept the pre-undo position (#1141 sibling).
     fireDirtyListeners();
   };
-  const action: UndoAction = { label, undo: () => apply(before, sides?.before), redo: () => apply(after, sides?.after), ...(sides?.before.rows ? { maintainsRecords: true as const } : {}) };
+  const action: UndoAction = { label, undo: () => apply(before, sides?.before), redo: () => apply(after, sides?.after) };
   _resolvers.set(action, resolve);
   if (entityGuid) {
     action.kind = '!transform';
@@ -95,8 +96,6 @@ export function buildGroupTransformUndoAction(label: string, actions: UndoAction
     label,
     undo: () => { precheck(); for (const a of actions) a.undo(); },
     redo: () => { precheck(); for (const a of actions) a.redo(); },
-    // The group maintains the records only when every member does.
-    ...(actions.length && actions.every((a) => a.maintainsRecords) ? { maintainsRecords: true as const } : {}),
   };
   const members = actions.map((a) => a.journalPayload).filter(Boolean) as Record<string, unknown>[];
   if (members.length) {

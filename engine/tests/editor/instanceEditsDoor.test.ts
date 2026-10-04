@@ -19,30 +19,27 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { peekUndo } from '../../packages/modoki/src/editor/undo/undoManager';
 import {
   setActionCallback, pushAction, clearHistory, undo, redo, writeTraitFieldWithUndo, reparentEntity, duplicateEntity,
   addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo, createEntityWithUndo, deleteEntitiesWithUndo,
 } from '@modoki/engine/editor';
-import { clipEntity, pasteEntityCopy, snapshotEntity } from '../../packages/modoki/src/editor/undo/entityActions';
+import { clipEntity, pasteEntityCopy } from '../../packages/modoki/src/editor/undo/entityActions';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { writeTraitField } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
+import { preV5NodeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { fillInstanceStore } from '../../packages/modoki/src/runtime/prefab/instanceLoad';
-import { freshInstanceRecord, storedInstance } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { storedRecord, storedInstance, storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { instanceDrift } from '../../packages/modoki/src/editor/instance/instanceDrift';
-import { capturedRecordsOf, reseedFromCapture } from '../../packages/modoki/src/editor/instance/instanceSync';
+import { capturedRecordsOf } from '../../packages/modoki/src/editor/instance/instanceSync';
 import { captureEntrySide, rebuildEntrySide } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { inFieldGesture } from '../../packages/modoki/src/editor/undo/fieldGesture';
-import { s4Seams } from './prefabFuzz/s4Seams';
-import { listDiff } from './prefabFuzz/shadow';
-import type { OverrideList } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 import { setTemplateKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { allStoredRoots, instanceKeyMap } from '../../packages/modoki/src/editor/instance/instanceKeys';
-import { dropInstanceRecord, markStale, setInstanceRecord, unrecordedBy } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { dropInstanceRecord, liveStoredRootGuids, setInstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
-import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -104,7 +101,7 @@ const meta = (t: string) => getTraitByName(t)!;
 const rootId = () => getAllEntities().find((e) => e.guid === ROOT1)!.id;
 const byName = (name: string) => { const hits = getAllEntities().filter((e) => e.name === name); if (hits.length !== 1) throw new Error(`fixture: ${hits.length} named ${name}`); return hits[0]!.id; };
 const guidOf = (id: number) => getAllEntities().find((e) => e.id === id)!.guid;
-const rec = () => { const r = freshInstanceRecord(getCurrentWorld(), ROOT1); if (!r) throw new Error('no fresh record'); return r; };
+const rec = () => { const r = storedRecord(getCurrentWorld(), ROOT1); if (!r) throw new Error('no fresh record'); return r; };
 const row = (k: string) => rec().list.rows.get(k);
 const ownOf = (k: string) => (row(k)?.own ?? []).map((o) => o.guid);
 
@@ -121,7 +118,6 @@ beforeEach(async () => {
   setRunMode('stopped');
   clearHistory();
   prefabs.clear();
-  clearKeptMemberOrphans();
   const d = pDoc();
   prefabs.set(d.id, d); setPrefabCache(d.id, d as never);
   await load(scene());
@@ -149,7 +145,6 @@ describe('a file that parents a plain entity into an instance', () => {
   };
   it('links it on the root\'s row: the record stays fresh and states what the capture does', async () => {
     await load(withKid(ROOT1));
-    expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBeUndefined();
     expect(ownOf('/')).toEqual([KID]);
     matchesCapture();
   });
@@ -161,7 +156,6 @@ describe('a file that parents a plain entity into an instance', () => {
   });
   it('one parented to a plain entity links nothing', async () => {
     await load(withKid(OTHER));
-    expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBeUndefined();
     expect([...rec().list.rows.values()].some((r) => (r.own ?? []).some((o) => o.guid === KID))).toBe(false);
   });
 });
@@ -175,19 +169,14 @@ describe('a base scene\'s sourceScene stamp (#2028, § 10.4b)', () => {
     for (const e of getAllEntities()) if (e.guid !== OTHER) writeTraitField(e.id, meta('EntityAttributes'), 'sourceScene', BASE);
   };
   const stampOf = (id: number) => (findEntity(id)!.get(meta('EntityAttributes').trait) as { sourceScene?: string }).sourceScene;
-  it('the parsed record, a capture re-seed and a rebuild leave it out of the record; the rebuild keeps it live', () => {
+  it('the parsed record and a rebuild leave it out of the record; the rebuild keeps it live', () => {
     stamp();
     fillInstanceStore(getCurrentWorld(), JSON.parse(JSON.stringify(scene())) as SceneData);
-    expect(rec().placement.sourceScene).toBeUndefined();
-    markStale(getCurrentWorld(), 'test');
-    expect(reseedFromCapture(rootId())).toBe(true);
     expect(rec().placement.sourceScene).toBeUndefined();
     const side = captureEntrySide(rootId())!;
     expect(rebuildEntrySide(side)).toBeGreaterThan(0);
     expect(stampOf(rootId())).toBe(BASE);
     expect(stampOf(byName('C'))).toBe(BASE);
-    markStale(getCurrentWorld(), 'test');
-    expect(reseedFromCapture(rootId())).toBe(true);
     expect(rec().placement.sourceScene).toBeUndefined();
   });
 });
@@ -277,54 +266,6 @@ describe('components (§ 2.5)', () => {
   });
 });
 
-// #1829 on the re-seed (#2058, hunt seeds 8231 and 8413): a file states a component the base lacks PARTIALLY (an agent's
-// file-direct write) and the load marks only what it states. The old capture writes that component whole, so a record
-// re-seeded from it stated the rest too: its projection marked fields the live tree does not (P1), and S6's save would
-// write them. Mutation: return the re-seeded record untouched in `withoutUnstatedAddedFields` (instanceSync.ts) — the
-// first case goes red; the other two stay green.
-describe('a re-seed keeps what the file stated of an added component (#1829, #2058)', () => {
-  const withRotate = (bag: Record<string, unknown>): SceneData => {
-    const d = scene() as unknown as { entities: Record<string, unknown>[] };
-    d.entities[1]!.overrides = { 3: { Rotate3D: bag } };
-    return d as unknown as SceneData;
-  };
-  const rotateMarks = () => [...(getOverrideMarkSet(findEntity(byName('B'))! as never) ?? [])].filter((m) => m.startsWith('Rotate3D.')).sort();
-  const reseeded = () => { markStale(getCurrentWorld(), 'test'); expect(reseedFromCapture(rootId())).toBe(true); return row(key(3))?.traits?.Rotate3D; };
-  it('a field the file left out stays out, though the capture states it', async () => {
-    await load(withRotate({ speed: 2 }));
-    expect(row(key(3))?.traits?.Rotate3D).toEqual({ speed: 2 });
-    expect(rotateMarks()).toEqual(['Rotate3D.speed']);
-    // Non-vacuity: the capture the re-seed reads widens it (#1829).
-    expect(capturedRecordsOf(rootId())!.find((r) => r.rootGuid === ROOT1)!.list.rows.get(key(3))?.traits?.Rotate3D).toEqual({ axis: 'y', speed: 2 });
-    expect(reseeded()).toEqual({ speed: 2 });
-  });
-  // Accept side: a stated field at its default value is marked, so it is a statement and stays.
-  it('a field the file stated at its default stays', async () => {
-    await load(withRotate({ axis: 'y', speed: 2 }));
-    expect(rotateMarks()).toEqual(['Rotate3D.axis', 'Rotate3D.speed']);
-    expect(reseeded()).toEqual({ axis: 'y', speed: 2 });
-  });
-  // Why `baseHas` has no reachable accept case (#2058 review, finding 2): the capture states a component the base SUPPLIES
-  // by its marks alone, and a rotation stated in part is marked whole on load (one value, #1880 F5), so no unmarked field
-  // of one reaches the narrowing. This pins that premise; were it to break, `baseHas` is what keeps such a field.
-  it('a partial rotation on a component the base supplies is marked whole, so a re-seed keeps it whole', async () => {
-    const d = scene() as unknown as { entities: Record<string, unknown>[] };
-    d.entities[1]!.overrides = { 3: { Transform: { rx: 0.5 } } };
-    await load(d as unknown as SceneData);
-    const tfMarks = () => [...(getOverrideMarkSet(findEntity(byName('B'))! as never) ?? [])].filter((m) => m.startsWith('Transform.')).sort();
-    const captured = capturedRecordsOf(rootId())!.find((r) => r.rootGuid === ROOT1)!.list.rows.get(key(3))?.traits?.Transform;
-    markStale(getCurrentWorld(), 'test');
-    expect(reseedFromCapture(rootId())).toBe(true);
-    expect({ marks: tfMarks(), captured, reseeded: row(key(3))?.traits?.Transform }).toEqual({ marks: ['Transform.rx', 'Transform.ry', 'Transform.rz'], captured: { rx: 0.5, ry: 0, rz: 0 }, reseeded: { rx: 0.5, ry: 0, rz: 0 } });
-  });
-  // Accept side: a component a gesture added is recorded whole (`addComponent`), defaults included, and a re-seed keeps it so.
-  it('a component a gesture added keeps every field', () => {
-    addTraitToEntitiesWithUndo([byName('B')], meta('Rotate3D'));
-    expect(row(key(3))?.traits?.Rotate3D).toEqual({ axis: 'y', speed: 1 });
-    expect(reseeded()).toEqual({ axis: 'y', speed: 1 });
-  });
-});
-
 describe('children (§ 2.5)', () => {
   // Mutation: drop `instanceEdits.addChild` in `createEntityWithUndo`.
   it('a node created under a member is linked in that member\'s own', () => {
@@ -346,7 +287,7 @@ describe('children (§ 2.5)', () => {
   });
   it('a paste under a member is linked in its own', () => {
     const kid = createEntityWithUndo('Create', byName('A'), [{ name: 'EntityAttributes', data: { name: 'Kid', parentId: byName('A') } }, { name: 'Transform' }], () => {})!;
-    const pasted = pasteEntityCopy(snapshotEntity(kid)!, byName('B'), () => {});
+    const pasted = pasteEntityCopy(clipEntity(kid, 'copy')!, byName('B'), () => {})!;
     expect(ownOf(key(3))).toEqual([guidOf(pasted)]);
     matchesCapture();
   });
@@ -361,7 +302,7 @@ describe('a prefab placed (§ 3.2, the placement row; review § Census: a drop o
   it('a drop on a member mints the new instance\'s record (an empty list) and links it in the member\'s own', async () => {
     const q = qDoc(); prefabs.set(Q, q); setPrefabCache(Q, q as never);
     const id = await instantiatePrefabInstance(q as never, 'q.prefab.json', byName('A'));
-    const placed = freshInstanceRecord(getCurrentWorld(), guidOf(id)!);
+    const placed = storedRecord(getCurrentWorld(), guidOf(id)!);
     expect(placed?.source).toBe(Q);
     expect(placed?.list.rows.size).toBe(0);
     expect(placed?.placement.parent).toBe(''); // a reference node: its link places it (`parseReferenceNode`)
@@ -377,11 +318,11 @@ describe('a prefab placed (§ 3.2, the placement row; review § Census: a drop o
     expect(instanceKeyMap(rootId()).has(kid)).toBe(false);
     expect(instanceKeyMap(id).get(kid)).toBe('/a+k-x');
   });
-  // #2037 (hunt seed 1094): a copy holding an instance, landing under a scene-added reference node nested in an instance,
-  // is staged stale (S7 moves instance copies onto records). The record it changes is the NODE's, which owns one of its
-  // own inside Inst's (§ 2.5), so every enclosing record goes stale — and only those: an unrelated instance stays fresh.
-  // Mutations: mark `outermostStoredRoot` alone in `afterCopyImpl` (the node's record stays fresh); mark every record.
-  it('a copy holding an instance under a nested reference node stales every record enclosing it, and no other (#2037)', async () => {
+  // #2037 (hunt seed 1094) staged a copy that could not go on records stale (`afterCopy`), with every record enclosing it.
+  // Since #2001 S8b such a copy is REFUSED, before anything spawns: here a copy of QM3, a member of the Q3 node, whose
+  // record holds data the copy cannot restate (`copyRecordsOf` null for a member copy with held data).
+  // Mutations: drop the `!records` refusal in `duplicateEntity` / in `pasteEntityCopy` — each throws past the refusal.
+  it('a copy whose records cannot be restated for it is refused before anything spawns, and every record stays as it was', async () => {
     const Q3 = 'cccccccc-0000-4000-8000-000000002018';
     const q3 = { id: Q3, version: 5, name: 'Q3', rootLocalId: 1, entities: [
       { localId: 1, name: 'QR3', nodeGuid: 'eeeeeeee-0000-4000-8000-000000002023', traits: { EntityAttributes: { name: 'QR3', parentId: 0, guid: '', sortOrder: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
@@ -390,15 +331,37 @@ describe('a prefab placed (§ 3.2, the placement row; review § Census: a drop o
     const q = qDoc();
     prefabs.set(Q3, q3); setPrefabCache(Q3, q3 as never); prefabs.set(Q, q); setPrefabCache(Q, q as never);
     const node = await instantiatePrefabInstance(q3 as never, 'q3.prefab.json', byName('A'));
-    const unrelated = await instantiatePrefabInstance(q as never, 'q.prefab.json', 0);
-    await instantiatePrefabInstance(q as never, 'q.prefab.json', byName('QM3')); // the instance the copy will hold
+    await instantiatePrefabInstance(q as never, 'q.prefab.json', 0);
+    await instantiatePrefabInstance(q as never, 'q.prefab.json', byName('QM3'));
     const world = getCurrentWorld();
-    expect(storedInstance(world, guidOf(node)!)?.stale).toBeUndefined();
-    expect(storedInstance(world, guidOf(unrelated)!)?.stale).toBeUndefined();
-    duplicateEntity(byName('QM3'), () => {}); // QM3's frame root is not in the copy: a PLAIN node under QR3, holding the instance
-    expect(storedInstance(world, guidOf(node)!)?.stale).toBe('duplicateInstance');
-    expect(storedInstance(world, ROOT1)?.stale).toBe('duplicateInstance');
-    expect(storedInstance(world, guidOf(unrelated)!)?.stale).toBeUndefined();
+    storedInstance(world, guidOf(node)!)!.record.held = { pendingLegacy: { overrides: { 9: { Unknown: { a: 1 } } } } } as never;
+    const store = () => JSON.stringify([...storedInstances(world)], (_k, v: unknown) => v instanceof Map ? [...v] : v);
+    const before = { store: store(), count: getAllEntities().length };
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(duplicateEntity(byName('QM3'), () => {})).toBeNull();
+      expect(pasteEntityCopy(clipEntity(byName('QM3'), 'copy')!, 0, () => {})).toBeNull();
+      expect(errors.mock.calls.filter((c) => String(c[0]).includes('was not copied'))).toHaveLength(2);
+    } finally { errors.mockRestore(); }
+    expect(getAllEntities().length).toBe(before.count);
+    expect(store()).toBe(before.store);
+  });
+  // The same copy on records (#2001 S8b): its held instance gets a record of its own, and every record stays fresh.
+  // Mutation: return null from `copyRecordsOf` — the copy is refused, and no copied instance is seated.
+  it('the same copy, its records restatable, keeps every record fresh and seats the copied instance\'s', async () => {
+    const Q3 = 'cccccccc-0000-4000-8000-000000002018';
+    const q3 = { id: Q3, version: 5, name: 'Q3', rootLocalId: 1, entities: [
+      { localId: 1, name: 'QR3', nodeGuid: 'eeeeeeee-0000-4000-8000-000000002023', traits: { EntityAttributes: { name: 'QR3', parentId: 0, guid: '', sortOrder: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+      { localId: 2, name: 'QM3', nodeGuid: 'eeeeeeee-0000-4000-8000-000000002024', traits: { EntityAttributes: { name: 'QM3', parentId: 1, guid: '', sortOrder: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+    ] };
+    const q = qDoc();
+    prefabs.set(Q3, q3); setPrefabCache(Q3, q3 as never); prefabs.set(Q, q); setPrefabCache(Q, q as never);
+    await instantiatePrefabInstance(q3 as never, 'q3.prefab.json', byName('A'));
+    const held = await instantiatePrefabInstance(q as never, 'q.prefab.json', byName('QM3'));
+    const world = getCurrentWorld();
+    const copy = duplicateEntity(byName('QM3'), () => {})!;
+    const copiedHeld = getAllEntities().find((e) => e.parentId === copy && e.guid !== guidOf(held))!;
+    expect(storedInstance(world, copiedHeld.guid!)?.record.source).toBe(Q);
   });
   const handle = (id: number) => [...getCurrentWorld().entities].find((e) => e.id() === id)!;
   // Mutation: run `instanceKeyMap`'s template pass once (no fixpoint) — X is reached before T keys its member M.
@@ -420,8 +383,10 @@ describe('a prefab placed (§ 3.2, the placement row; review § Census: a drop o
     expect(keys.get(m)).toBe('/a+k-t/eeeeeeee-0000-4000-8000-000000002022');
     expect(keys.get(x)).toBe('/a+k-t/a+k-x');
   });
-  // Mutation: stop the climb at ANY unkeyed instance entity — a pre-v5 frame's unkeyed member is this instance's own.
-  it('a template-added node under this instance\'s UNKEYED member (a pre-v5 row) still keys here', async () => {
+  // A pre-v5 row's member is keyed by the identity the parse gives it (`preV5NodeGuid`, #2001 S8b), and a template-added
+  // node under it keys in its frame. Mutation: `instanceKeyMap` without `derivePreV5` — B is unkeyed (and X still keys,
+  // through the climb that takes a pre-v5 frame's unkeyed member as this instance's own).
+  it('a pre-v5 row\'s member keys by its derived identity, and a template-added node under it keys here', async () => {
     const d = pDoc();
     d.entities = d.entities.map((r) => (r.name === 'B' ? { ...r, nodeGuid: '' } : r));
     prefabs.set(d.id, d); setPrefabCache(d.id, d as never);
@@ -430,7 +395,7 @@ describe('a prefab placed (§ 3.2, the placement row; review § Census: a drop o
     const x = createEntityWithUndo('Create', b, [{ name: 'EntityAttributes', data: { name: 'X', parentId: b } }, { name: 'Transform' }], () => {})!;
     setTemplateKey(handle(x) as never, 'k-x');
     const keys = instanceKeyMap(rootId());
-    expect(keys.has(b)).toBe(false);
+    expect(keys.get(b)).toBe(`/${preV5NodeGuid(d.id, 3)}`);
     expect(keys.get(x)).toBe('/a+k-x');
   });
 });
@@ -444,11 +409,6 @@ describe('delete (rule 3, § 10.4)', () => {
     expect(row(key(3))).toMatchObject({ removed: true, traits: { Transform: { x: 4 } } });
     expect(row(`${key(3)}`)?.removed).toBe(true);
     expect(row(key(4))?.traits?.Transform).toEqual({ y: 2 });
-    // I25 for this case, through the fuzzer's seams: C (`/g4`) is under B (`/g3`) though its key is flat (§ 2.1).
-    // Mutation: ask `removedDescendants` by key prefix in s4Seams — C's kept row reads as the capture's miss.
-    const judged = s4Seams.judge!(rec());
-    expect('skip' in judged).toBe(false);
-    expect(listDiff(judged as OverrideList, s4Seams.captureList!(ROOT1)!)).toBeNull();
   });
   // Keys are flat within a frame, so "under the deleted member" is the live tree's, not a key prefix (review). Mutation:
   // `keyedSubtree` → the key-prefix test — C's row keeps a link to the deleted Kid.
@@ -488,7 +448,7 @@ describe('delete (rule 3, § 10.4)', () => {
   });
 });
 
-describe('reparent (review R4: markCompensatedTransform)', () => {
+describe('reparent (review R4: the keep-world pose)', () => {
   // Mutation: drop the `beginReparent` commit in `reparentEntity`.
   it('an instance root moved under a moved parent records its keep-world pose on "/" and its new placement', () => {
     expect(reparentEntity(rootId(), byName('Other'))).toBe(true);
@@ -506,81 +466,49 @@ describe('reparent (review R4: markCompensatedTransform)', () => {
 });
 
 // Hub, 2026-10-02: a template-added REFERENCE node's root is a supplied node of its frame and owns no record. The editor's
-// keys and the store's unrecorded scan both say so. Mutation: drop `!templateKeyOf` in `ownsRecord` (instanceKeys.ts) or
-// in `liveStoredRootGuids` (instanceStore.ts).
+// keys and the store's list of live stored roots both say so. Mutation: drop `!templateKeyOf` in `ownsRecord`
+// (instanceKeys.ts) or in `liveStoredRootGuids` (instanceStore.ts).
 describe('who owns a record', () => {
-  it('a stored root carrying a template key owns no record: not a record-owning root, never "unrecorded"', () => {
+  it('a stored root carrying a template key owns no record: not a record-owning root', () => {
     const root = rootId();
     expect(allStoredRoots()).toContain(root);
-    dropInstanceRecord(getCurrentWorld(), ROOT1);
-    markStale(getCurrentWorld(), 'probe');
-    expect(unrecordedBy(getCurrentWorld(), ROOT1)).toBe('probe');
     setTemplateKey(findEntity(root) as never, 'k-ref');
     expect(allStoredRoots()).not.toContain(root);
   });
-  it('…and the store does not list a template-keyed root as unrecorded', async () => {
+  it('…and the store does not list a template-keyed root among the live roots a record is kept for', async () => {
+    expect(liveStoredRootGuids(getCurrentWorld()), 'premise').toContain(ROOT1);
     setTemplateKey(findEntity(rootId()) as never, 'k-ref');
     dropInstanceRecord(getCurrentWorld(), ROOT1);
-    markStale(getCurrentWorld(), 'probe');
-    expect(unrecordedBy(getCurrentWorld(), ROOT1)).toBeUndefined();
+    expect(liveStoredRootGuids(getCurrentWorld())).not.toContain(ROOT1);
   });
 });
 
 // A throw inside the door (a parser or fold defect) must not fail the gesture. Mutation: export `rowsOfImpl` unshielded —
 // the write throws out of `writeTraitFieldWithUndo` (since #2046 S7.2 the first door call a field write makes is `rowsOf`).
-describe('the shield: the door never fails a gesture', () => {
-  it('a door that throws reports, marks the record stale, and the write and its undo still land', async () => {
+// #2001 S8b (hub decision A): the door is no longer a shadow. A throw inside it fails the gesture, rolled back
+// (`instanceRollback.ts`): it propagates, the gesture pushes no undo entry, and no record is left stale for a re-seed.
+// Mutation: catch and swallow the throw in `shielded` again — the write does not throw (red).
+describe('the shield: a door that throws fails the gesture', () => {
+  it('a door that throws rolls back and propagates: no undo entry', async () => {
     setInstanceRecord(getCurrentWorld(), { ...rec(), list: null as never });
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const top = peekUndo()?.label;
     try {
-      expect(() => writeTraitFieldWithUndo(byName('A'), meta('Transform'), 'x', 7)).not.toThrow();
-      expect((readTraitData(byName('A'), meta('Transform')) as { x: number }).x).toBe(7);
-      expect(errors.mock.calls.some((c) => /^\[instanceEdits\] \w+ threw; the records are marked stale/.test(String(c[0])))).toBe(true);
-      await undo();
-      expect((readTraitData(byName('A'), meta('Transform')) as { x: number }).x).toBe(0);
+      expect(() => writeTraitFieldWithUndo(byName('A'), meta('Transform'), 'x', 7)).toThrow();
+      expect(errors.mock.calls.some((c) => /^\[instanceRollback\] the instance door's \w+ threw part-way/.test(String(c[0])))).toBe(true);
+      expect(peekUndo()?.label, 'no undo entry').toBe(top);
     } finally { errors.mockRestore(); }
-  });
-});
-
-describe('stale marks: an undo step that does not maintain the records', () => {
-  // Mutation: drop `markStale` in `undoStep`.
-  it('leaves every record stale, and the next door write re-seeds it from the capture first', async () => {
-    writeTraitFieldWithUndo(byName('A'), meta('Transform'), 'x', 7);
-    // An op S7 has not moved: its undo writes live state the records do not follow.
-    const a = byName('A');
-    pushAction({ label: 'raw', undo: () => writeTraitField(a, meta('Transform'), 'x', 0), redo: () => {} });
-    await undo();
-    expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBe('undo');
-    writeTraitFieldWithUndo(byName('B'), meta('Transform'), 'x', 1);
-    // The re-seed read the live tree (the raw undo's x = 0, still marked), not the stored record's x = 7.
-    expect(row(key(2))?.traits).toEqual({ Transform: { x: 0 } });
-    expect(row(key(3))?.traits?.Transform).toEqual({ x: 1 });
-  });
-});
-
-describe('a coalesced chain maintains the records only when both halves do', () => {
-  // Mutation: drop the flag merge in `pushAction`'s coalesce branch — the merged entry keeps the first half's flag, its
-  // redo (the second half's) leaves the records as they were, and the undo after it reads them as fresh.
-  it('a maintaining field write merged with a raw one leaves the records stale on undo', async () => {
-    const a = byName('A');
-    writeTraitFieldWithUndo(a, meta('Transform'), 'x', 7);
-    pushAction({ label: 'raw', undo: () => {}, redo: () => {}, coalesceKey: `field:${a}:Transform.x` });
-    await undo();
-    expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBe('undo');
   });
 });
 
 // #2046 S7.2 (rule 8): a field step's undo and redo put back the EXACT rows it found and left, and the records stay fresh.
 describe('undo of a field edit restores the exact list', () => {
-  // Mutation: drop `maintainsRecords` from `writeTraitFieldWithUndo`'s entry — the undo marks the records stale.
   it('the undo leaves the record fresh with the row it found, the redo with the row it left', async () => {
     writeTraitFieldWithUndo(byName('A'), meta('Transform'), 'x', 7);
     const left = structuredClone(row(key(2)));
     await undo();
-    expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBeUndefined();
     expect(row(key(2))).toBeUndefined();
     await redo();
-    expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBeUndefined();
     expect(row(key(2))).toEqual(left);
   });
   // Mutation: `putRows` without its fold patch — the undo shows the value the field had before the edit (0), not the
@@ -629,7 +557,7 @@ describe('a duplicate or paste of an instance carries its records (#2046 S7.4)',
     return walk(root)!;
   };
   const tfOf = (id: number) => readTraitData(id, meta('Transform')) as { x: number; y: number };
-  const recOf = (guid: string) => freshInstanceRecord(getCurrentWorld(), guid);
+  const recOf = (guid: string) => storedRecord(getCurrentWorld(), guid);
   /** The template's B, retuned: a change the undo stack does not hold (a saved prefab edit, an outside edit). */
   const retuneB = (y: number) => {
     const d = pDoc();
@@ -679,7 +607,7 @@ describe('a duplicate or paste of an instance carries its records (#2046 S7.4)',
     const clip = clipEntity(rootId(), 'copy')!;
     expect(clip.records?.size, 'premise: the clipboard carries the record').toBe(1);
     retuneB(7);
-    const pasted = pasteEntityCopy(clip.snapshot, 0, () => {}, clip.records);
+    const pasted = pasteEntityCopy(clip, 0, () => {})!;
     const pg = guidOf(pasted)!;
     expect(tfOf(memberOf(pasted, 'B'))).toMatchObject({ x: 4, y: 7 });
     expect(strip(recOf(pg)! as never)).toEqual(strip(rec() as never));

@@ -18,17 +18,26 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
   getCachedPrefab: (ref: string) => prefabs.get(ref),
   loadModelTemplates: async () => {},
 }));
+/** Files the Create Prefab command writes: each lands in the loader's documents. */
+vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  postWriteFile: async (_path: string, content: string) => {
+    const doc = JSON.parse(content) as { id?: string };
+    if (doc.id) prefabs.set(doc.id, doc);
+    return { ok: true, json: async () => ({}), text: async () => '' } as Response;
+  },
+}));
 
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData, type SceneEntityEntry,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { tagEntityTreeAsInstance } from '../../packages/modoki/src/editor/scene/prefabLink';
+import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -123,7 +132,7 @@ function templateWithout(name: string): PrefabFile {
   return file;
 }
 
-beforeEach(() => { setRunMode('stopped'); prefabs.clear(); clearKeptMemberOrphans(); });
+beforeEach(() => { setRunMode('stopped'); prefabs.clear(); });
 afterAll(() => { getCurrentWorld()?.destroy(); });
 
 describe('gesture: REFRESH (refreshInstances) — the instance re-expands from a changed template', () => {
@@ -268,9 +277,9 @@ describe('gesture: UNDO / REDO RESPAWN — delete an instance, put it back', () 
     const badgeGuid = guidOf('Badge');
     const badgeNode = rowOf(template, 'Badge').nodeGuid!;
 
-    const { snapshotEntity, respawnFromSnapshot, copySnapshot } = await import('../../packages/modoki/src/editor/undo/entityActions');
-    const fresh = copySnapshot(snapshotEntity(idOf('Root'))!);
-    respawnFromSnapshot(fresh, 0);
+    // Through the gesture (Duplicate): it places the copy on records of its own, which a bare respawn does not.
+    const { duplicateEntity } = await import('../../packages/modoki/src/editor/undo/entityActions');
+    expect(duplicateEntity(idOf('Root'), () => {})).toBeTruthy();
 
     const saved = await serializeScene() as unknown as { entities: SceneEntityEntry[] };
     const guids = saved.entities.filter((e) => !!e.prefab).map((e) => e.members?.[`/${badgeNode}`]?.guid);
@@ -363,10 +372,10 @@ describe('gesture: CREATE PREFAB — a live tree becomes an instance of a new pr
       ],
     } as unknown as SceneData);
 
-    const file = serializePrefab(idOf('Root'), PREFAB)!;
-    prefabs.set(PREFAB, file);
-    setPrefabCache(PREFAB, file as never);
-    tagEntityTreeAsInstance(idOf('Root'), PREFAB, file);
+    // Create Prefab as the panels run it: the command records the instance it makes (a bare tag records nothing).
+    const res = await createPrefabFromEntity(idOf('Root'), '/prefabs/CreatedGesture.prefab.json', 'Create Prefab', async () => true);
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(`fixture: ${JSON.stringify(res)}`);
+    pushAction(res.action);
 
     // Whatever the tag did to the guids, the ref and the member must agree from here on.
     const badgeAfterTag = guidOf('Badge');

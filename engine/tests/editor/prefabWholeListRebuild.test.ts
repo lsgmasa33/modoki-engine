@@ -73,10 +73,19 @@ describe('#1891 seed 1233: a scene copy of a template reference node, in a WHOLE
     expect(hasRotate()).toBe(true);
   });
 
-  it('a no-op rebuild of the whole entry (HR) keeps it', () => {
+  // #2001 S8b: the rebuild is from HR's record. The scene states each copy keyless, by the guid the template key derives
+  // (a save before keys were written), and the load recovers the key from it, so the parse pairs it the same way: the copy
+  // of OR at QR (derived from HR's root) and, inside it, the copy of OR at M (derived from that copy's guid). Unpaired,
+  // either became a scene-added node of its own, and the rebuild re-minted every guid under it.
+  // Mutations (`parseInstanceRecord.ts`): `healedKey` returns '' → A is lost (re-minted); the copy's `inCopy` deriver
+  // dropped, or `restoreChainStructure` without `ctx.copy?.keys` → the inner copy's guids change.
+  it('a no-op rebuild of the whole entry (HR) keeps it, and every guid under it', () => {
+    const guids = () => getAllEntities().map((e) => `${e.name}:${e.guid}`).sort();
+    const before = guids();
     const doc = getCachedPrefabSync(HR) as PrefabFile;
     expect(refreshInstances(HR, [idOf(HR_ROOT)], doc, doc)).toBe(1);
     expect(hasRotate()).toBe(true);
+    expect(guids()).toEqual(before);
   });
 
   // #1880 F6e's measuring case: the copy is a stored root INSIDE HR, rebuilt by itself until F6e mapped it to its outermost

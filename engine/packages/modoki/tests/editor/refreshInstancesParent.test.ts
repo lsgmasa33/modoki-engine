@@ -39,7 +39,9 @@ function readTraitDataImpl(id: number, meta: any) {
   return out;
 }
 
-vi.mock('../../src/runtime/core/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); index.set(e.id(), e); return e; },
@@ -51,7 +53,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   // By the guid EntityAttributes holds: the refresh names the entries it rebuilt by guid (#2046 S7.3).
   findEntityByGuid: (g: string) => [...index.values()].find((e: any) => e.has(EntityAttributes) && e.get(EntityAttributes).guid === g),
 }));
-vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
   // The pre-capture snapshot of the tree's unkeyed nodes (#1884, `capturedKeys.ts`).
   captureEntityIdentity: () => () => true,
   getAllEntities: () => getAllEntitiesImpl(),
@@ -82,7 +85,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (name: string) => TRAITS.find((t) => t.name === name),
   getAllTraits: () => TRAITS,
 }));
-vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn() }));
+vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(), getCachedPrefab: () => undefined }));
 
 // write-file always succeeds so apply runs to completion.
 // @ts-expect-error mock global
@@ -109,6 +112,7 @@ describe('apply-to-prefab refresh preserves the instance parent', () => {
     // Instantiate the prefab UNDER the mount.
     const rootId = instantiatePrefab(prefab as any, mount.id());
     setPrefabSource(rootId, { id: SRC });
+    await placed(rootId); // the editor drop's door: a durable root guid, and its record (#2001 S8b)
     expect((index.get(rootId)!.get(EntityAttributes) as Record<string, unknown>).parentId).toBe(mount.id());
 
     // Edit a field on the instance, then apply it back → triggers a full refresh.
@@ -131,3 +135,9 @@ describe('apply-to-prefab refresh preserves the instance parent', () => {
     expect(widgets[0].parentId).toBe(mount.id());
   });
 });
+
+async function placed(root: number): Promise<void> {
+  const { ensureGuid } = await import('../../src/editor/undo/entityRef');
+  const { place } = await import('../../src/editor/instance/instanceEdits');
+  ensureGuid(root); place(root);
+}

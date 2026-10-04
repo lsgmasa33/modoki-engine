@@ -25,13 +25,12 @@ import { editorPrefabReader } from './instanceSync';
 const SKIP_TRAITS = new Set(['PrefabInstance', 'UnresolvedPrefabRef']);
 const SKIP_FIELDS: Record<string, ReadonlySet<string>> = { EntityAttributes: new Set(['guid', 'parentId']) };
 
-/** One line per difference between stored root `rootId`'s fresh record and its live tree; [] when it has none, or no
- *  fresh record. */
+/** One line per difference between stored root `rootId`'s record and its live tree; [] when it has none. */
 export function instanceDrift(rootId: number): string[] {
   const world = getCurrentWorld();
   const guid = guidOfEntity(rootId);
   const st = guid ? storedInstance(world, guid) : undefined;
-  if (!st || st.stale) return [];
+  if (!st) return [];
   const fold = foldInstance(editorPrefabReader, st.record);
   const under = (k: string) => [...fold.placeholders.keys()].some((p) => p === '/' || k === p || k.startsWith(`${p}/`));
   const live = new Map<string, number>();

@@ -42,7 +42,6 @@ describe('#2001 S6: an instance no record links is saved as an entry of its own'
     await settle();
     expect(getAllEntities().find((x) => x.id === h.id)!.parentId, 'premise: the move landed').toBe(a.id);
     const rec = storedInstance(getCurrentWorld(), p1Guid)!;
-    expect(rec.stale, 'premise: the owner\'s record is fresh').toBeUndefined();
     expect(JSON.stringify([...rec.record.list.rows.values()]), 'premise: and does not link the moved instance').not.toContain(hGuid);
 
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);

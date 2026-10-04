@@ -11,7 +11,7 @@ import { canEdit, getRunMode } from '../../runtime/core/playState';
 import { createTeardownToken } from '../../runtime/core/liveness';
 import { normScenePath } from '../../runtime/scene/scenePathKey';
 import { scenePathMoveKey, type PathMove } from '../utils/assetPaths';
-import { markStale } from '../../runtime/prefab/instanceStore';
+import { rollBack, takeStore } from '../instance/instanceRollback';
 import { peekCurrentWorld } from '../../runtime/core/ecs/worldRegistry';
 import type { StepCheck } from './stepCheck';
 
@@ -73,10 +73,6 @@ export interface UndoAction {
    *  for a reparent. Merged into the emitted event and snapshot-cloned at emit so the
    *  record is immutable. Plain serializable data only. */
   journalPayload?: Record<string, unknown>;
-  /** #2001 S7 (#2046): this action's undo and redo put back the exact instance records they change (rule 8,
-   *  `editor/instance/instanceHistory.ts`), so the store stays fresh after them. A step that FAILS still marks it stale:
-   *  it may have stopped partway. */
-  maintainsRecords?: true;
   /** Internal tag for coalescing consecutive selection-only actions */
   _isSelection?: boolean;
   /** This action's undo/redo/initial-apply writes straight to a FILE (e.g.
@@ -716,13 +712,6 @@ export function endActionCapture(frame: UndoAction[]): UndoAction[] {
   return frame;
 }
 
-/** Does running `action` (either way) leave the instance store's records exact? One that maintains them
- *  (`maintainsRecords`), a selection change, and an asset-file edit that rebuilds no live frame (#1857's
- *  `_rebasesLiveFrames`): the last two touch no instance at all (#2001 S8). Every other step marks them stale. */
-export function keepsRecords(action: Pick<UndoAction, 'maintainsRecords' | '_isSelection' | '_isFileDirect' | '_rebasesLiveFrames'>): boolean {
-  return !!action.maintainsRecords || !!action._isSelection || (!!action._isFileDirect && !action._rebasesLiveFrames);
-}
-
 /** Push a new action. Clears redo stack. */
 export function pushAction(action: UndoAction) {
   // Dropped inside a step's window (a closure's own push must not clear the redo stack it is about to land on). ⚠️ The
@@ -756,8 +745,6 @@ export function pushAction(action: UndoAction) {
         && _coalesce && _coalesce.key === action.coalesceKey
         && now - _coalesce.at <= COALESCE_MS) {
       top.redo = action.redo;     // advance to the latest value…
-      // The merged entry maintains the records only when both halves do: its undo is the first's, its redo the latest's.
-      if (!action.maintainsRecords) delete top.maintainsRecords;
       top.label = action.label;   // …keep the ORIGINAL undo (pre-chain state)
       if (edits) recordForward(top, action.affectedScenes ?? []); // …and a new state, leaving the chain's `before`
       // NOTE: we deliberately do NOT advance `top.detail` here. The `!edit` journal
@@ -1042,19 +1029,17 @@ export function undoStep(direction: 'undo' | 'redo'): Promise<UndoStepResult> {
     _coalesce = null; // any explicit undo/redo ends the current edit chain
     const action = (direction === 'undo' ? undoStack : redoStack).pop();
     if (!action) return { did: false, label: null, refused: null, failed: null, shortfall: null, dropped: false };
-    // …and stale BEFORE it runs too: a rebase inside the step reads the store (#2046 S7.3), and a record this step is
-    // about to leave behind must send it to the capture instead of reprojecting the step's work away.
-    const at = peekCurrentWorld();
-    if (at && !keepsRecords(action)) markStale(at, direction);
+    // A step that throws part-way rolls back to the records as they stood (#2001 S8b).
+    const taken = peekCurrentWorld() ? takeStore() : null;
     const { ok, failed, shortfall, dropped } = direction === 'undo'
       ? await runStep('Undo', action, () => action.undo(), redoStack, '!undo')
       : await runStep('Redo', action, () => action.redo(), undoStack, '!redo');
-    // #2001 S4: a step that does not maintain the instance list (S7 moves each onto records: "undo restores the exact
-    // list", rule 8) leaves every record stale, whatever it touched or refused (`runtime/prefab/instanceStore.ts`). One
-    // that does (`maintainsRecords`) leaves them fresh, unless it failed. The world current NOW (an undo can swap it),
-    // and none is made: no world, no records.
-    const world = peekCurrentWorld();
-    if (world && (!keepsRecords(action) || failed)) markStale(world, direction);
+    // Each step keeps the records itself (#2001 S8b): it puts back the exact ones it changes (rule 8),
+    // or changes none. Until S8b a step that did not say so marked every record stale here, before and after it, for the
+    // re-seed. A step that threw part-way rolls back (hub decision A: `instanceRollback.ts`): every record as it stood
+    // before the step, and each tree rebuilt from them; a REFUSAL applied nothing (I19), so the records it kept are still
+    // exact.
+    if (failed && !failed.refused && taken) rollBack(taken, `${direction === 'undo' ? 'Undo' : 'Redo'} "${action.label}"`, failed.error);
     return { did: ok, label: action.label, refused: null, failed, shortfall, dropped };
   });
 }

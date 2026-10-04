@@ -56,7 +56,12 @@ vi.mock('../../packages/modoki/src/editor/scene/prefabApply', async (importOrigi
     // installs the new prefab and REFRESHES every instance of it from the old one. Modelled so.
     applyToPrefabSelective: async () => {
       const { destroyEntity, getCurrentWorld } = await import('@modoki/engine/runtime');
+      const { promoteAdded } = await import('../../packages/modoki/src/editor/instance/instanceEdits');
       const world = getCurrentWorld();
+      // The applying tree's records follow the promotion (#2001 S8b): its link of `Mine` goes. No pin: here the member is
+      // a row of another name, so it is stated as the template's (the form an enclosing row's promotion takes, #1715).
+      const tops = getAllEntities().filter((e) => e.name === 'Mine').map((e) => e.id);
+      expect(promoteAdded(rootOf(getAllEntities().find((e) => e.id === tops[0])!.parentId), tops, new Map(), new Map(), null, KIT)).toBe(true);
       for (const e of world.entities) {
         const ea = getTraitByName('EntityAttributes')!;
         if (e.has(ea.trait) && (e.get(ea.trait) as { name: string }).name === 'Mine') destroyEntity(e, world);
@@ -64,8 +69,8 @@ vi.mock('../../packages/modoki/src/editor/scene/prefabApply', async (importOrigi
       install(kitAfter);
       const pi = getTraitByName('PrefabInstance')!;
       const roots = getAllEntities().filter((e) => (readTraitData(e.id, pi)?.rootInstanceId as number) === e.id && readTraitData(e.id, pi)?.source === KIT).map((e) => e.id);
-      // The instance applied FROM is named, as the real Apply names it (`appliedFrom`): it is rebuilt from its capture,
-      // every other one is reprojected from its record (#2046 S7.3).
+      // The instance applied FROM is named, as the real Apply names it (`appliedFrom`); every instance is reprojected from
+      // its record (#2046 S7.3).
       for (const id of roots) {
         const from = rootGuidOf(id) === ROOT ? [{ rootId: id, rootGuid: ROOT, fields: new Set<string>() }] : undefined;
         refreshInstances(KIT, [id], kitDoc as never, kitAfter as never, new Map(), from);
@@ -76,15 +81,17 @@ vi.mock('../../packages/modoki/src/editor/scene/prefabApply', async (importOrigi
 });
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData, writeTraitField,
-  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, findEntity, type SceneData,
+  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearHistory, setActionCallback, pushAction, undo, redo } from '@modoki/engine/editor';
+import { clearHistory, setActionCallback, pushAction, undo, redo, createEntityWithUndo, writeTraitFieldWithUndo } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { isSceneDirty, clearSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
-import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { storedInstance, dropInstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { storedText } from '../../packages/modoki/src/runtime/prefab/recordBank';
+import { storeStatesTheWorld } from '../../packages/modoki/src/editor/instance/instanceHistory';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { clearDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 
@@ -173,8 +180,10 @@ beforeEach(async () => {
   install(innerDoc);
   install(kitDoc);
   await load(sceneWith());
+  // A node the scene adds under the instance's Slot, through the door: linked on Slot's row (#2001 S8b).
   const slot = slotOf(ROOT);
-  getCurrentWorld().spawn(eaMeta().trait({ name: 'Mine', parentId: slot, guid: ADDED }), getTraitByName('Transform')!.trait());
+  createEntityWithUndo('Create', slot, [{ name: 'EntityAttributes', data: { name: 'Mine', parentId: slot, guid: ADDED } }, { name: 'Transform' }], () => {});
+  clearHistory();
   vi.spyOn(sceneManager, 'loadScene').mockImplementation(async () => ({ world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() }) as never);
   vi.spyOn(sceneManager, 'getCurrentBaseScene').mockReturnValue(null as never);
 });
@@ -224,8 +233,7 @@ describe('Apply to Prefab on a base\'s instance (#1431)', () => {
   it('undo/redo re-derive the OTHER base instances of the prefab too, keeping their own overrides', async () => {
     stampAll(BASE);
     const slot2 = () => slotOf(ROOT2);
-    writeTraitField(slot2(), getTraitByName('Transform')!, 'x', 7);
-    markOverride(findEntity(slot2())!, 'Transform', 'x');
+    writeTraitFieldWithUndo(slot2(), getTraitByName('Transform')!, 'x', 7);
     const x2 = () => readTraitData(slot2(), getTraitByName('Transform')!)?.x as number;
     await applyToPrefabWithUndo(rootId(), new Set(['+added.x']));
     expect(x2()).toBe(7); // precondition: the apply's own refresh kept it
@@ -238,14 +246,30 @@ describe('Apply to Prefab on a base\'s instance (#1431)', () => {
     expect(promoted().every((e) => sourceOf(e.id) === BASE)).toBe(true);
   });
 
-  // Mutation: capture with `guidForEntityId` instead of `ensureGuid` — a runtime guid is not carried
-  // by the rebuild, the root is not found again, and undo silently leaves the post-apply instance.
-  it('a base root holding NO durable guid is still found again (a durable one is minted)', async () => {
+  // #2001 S8b: the SNAPSHOT path (taken when the store cannot state the world: here ROOT2's record is stale) reloads the
+  // scene, which carries a kept base's records as they stood, the other side's, and the base re-derive rebuilds its trees
+  // from their captures without touching them. Each base root's record is seated back to that side's and its tree rebuilt
+  // from it. Before, every record was marked stale, before and after, and re-seeded from the live trees. MUTATION TARGET:
+  // drop the snapshot undo's (or redo's) `reseat` — ROOT keeps the other side's record (Mine linked, or not).
+  it('a snapshot undo and redo seat a base instance\'s record back to their side', async () => {
     stampAll(BASE);
-    const id = rootId();
-    writeTraitField(id, eaMeta(), 'guid', '');
-    await applyToPrefabWithUndo(id, new Set(['+added.x']));
+    const world = () => getCurrentWorld();
+    const before = storedText(storedInstance(world(), ROOT));
+    await applyToPrefabWithUndo(rootId(), new Set(['+added.x']));
+    const after = storedText(storedInstance(world(), ROOT));
+    expect(after, 'premise: the Apply changed the record (its link of Mine went)').not.toBe(before);
+    dropInstanceRecord(world(), ROOT2);
+    expect(storeStatesTheWorld(), 'premise: the undo takes the snapshot').toBe(false);
     await undo();
+    expect(storedText(storedInstance(world(), ROOT))).toBe(before);
     expect(mine()).toHaveLength(1);
+    dropInstanceRecord(world(), ROOT2);
+    await redo();
+    expect(storedText(storedInstance(world(), ROOT))).toBe(after);
+    expect(mine()).toHaveLength(0);
   });
+
+  // (#2001 S8b) The case of a base root holding NO durable guid is gone with the re-seed: the store keys every instance by
+  // its root's durable guid, so a root without one holds no record and its Apply cannot be had. No writer leaves a loaded
+  // root without one; the minted guid fed only the capture's side (`captureSide`), which step 6 retires.
 });

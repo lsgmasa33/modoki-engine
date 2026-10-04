@@ -35,6 +35,12 @@ import { isOwnedRoot, isMemberDerivation, parseSteps, type MemberPi } from '../.
 import { deriveMemberChain, repeatedTemplateKeys } from '../../runtime/loaders/memberPaths';
 import { templateKeysOf, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
 
+/** The editor's words for a gesture refused because it would unpack around a member an older version moved out of its
+ *  instance (#2001 S8b, owner ruling 2026-10-04): a Detach of that instance, or a move that would unlink that member (a
+ *  drop of the instance's root under it, #1450, or one carrying it out of the instance, #1447). The records cannot
+ *  follow that unpack; the gesture changes nothing. */
+export const MOVED_MEMBER_REFUSAL_TEXT = 'an older version moved a member of this prefab instance out of its instance; nothing was changed.';
+
 export const RESTRUCTURE_REFUSAL_TEXT = "Can't restructure a prefab instance: open the prefab to edit it, or unpack it first.";
 
 type Pi = { source?: string; rootInstanceId?: number; parentLocalId?: number };

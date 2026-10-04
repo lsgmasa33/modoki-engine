@@ -12,6 +12,12 @@ import { setCurrentWorld, registerEntity, indexEntityGuid } from '../../src/runt
 import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 import { serializeScene } from '../../src/editor/scene/serialize';
 import { setRunMode } from '../../src/runtime/core/playState';
+import { place } from '../../src/editor/instance/instanceEdits';
+
+/** Durable guids: an instance root is keyed by one in the store (#2001 S8b), and its record is minted by the drop's door
+ *  (`place`). A bare spawn holds no record, and the save refuses a tree with none. */
+const FISH = 'f1500000-0000-4000-8000-000000000001';
+const FISH_ROOT = 'f1500000-0000-4000-8000-000000000002';
 
 function registerAll() {
   registerTrait({
@@ -90,13 +96,14 @@ describe('serializeScene({ scene }) — target a named base (Phase 12, M1)', () 
       fields: { source: { type: 'string' }, localId: { type: 'number' }, rootInstanceId: { type: 'number', entityId: { onMissing: 'stripTrait' } }, parentLocalId: { type: 'number' } },
     });
     const ent = spawn(
-      EntityAttributes({ name: 'FishLike', guid: 'g-fish', sourceScene: 'base-guid-1' }),
+      EntityAttributes({ name: 'FishLike', guid: FISH, sourceScene: 'base-guid-1' }),
       Transform,
       PrefabInstance({ source: 'some-prefab-guid', localId: 1, rootInstanceId: 0, parentLocalId: 0 }),
     );
     // rootInstanceId matches the entity's own id — what A8's fix guarantees on every
     // real load, and what makes this entity a top-level instance root.
     (ent as any).set(PrefabInstance, { source: 'some-prefab-guid', localId: 1, rootInstanceId: ent.id(), parentLocalId: 0 });
+    place(ent.id());
     const scene = await serializeScene({ scene: { path: '/assets/scenes/Base.json', guid: 'base-guid-1' } });
     expect(scene.id).toBe('base-guid-1');
     expect(scene.entities.map((e) => e.name)).toContain('FishLike');
@@ -106,22 +113,25 @@ describe('serializeScene({ scene }) — target a named base (Phase 12, M1)', () 
   // on-disk entity ref — is now written as the root's own stable GUID instead of
   // its raw live ecs id, so it no longer churns across the arrival-path-dependent
   // id assignment Phase 0/1 measured.
-  it('a captured prefab root writes rootInstanceId as its OWN guid, not the raw ecs id', async () => {
+  it('a prefab root is written under its OWN guid, never the raw ecs id (scene v20: no rootInstanceId at all)', async () => {
     registerTrait({
       name: 'PrefabInstance', trait: PrefabInstance, category: 'component',
       fields: { source: { type: 'string' }, localId: { type: 'number' }, rootInstanceId: { type: 'number', entityId: { onMissing: 'stripTrait' } }, parentLocalId: { type: 'number' } },
     });
     const ent = spawn(
-      EntityAttributes({ name: 'FishLike', guid: 'g-fish-root', sourceScene: 'base-guid-1' }),
+      EntityAttributes({ name: 'FishLike', guid: FISH_ROOT, sourceScene: 'base-guid-1' }),
       Transform,
       PrefabInstance({ source: 'some-prefab-guid', localId: 1, rootInstanceId: 0, parentLocalId: 0 }),
     );
     (ent as any).set(PrefabInstance, { source: 'some-prefab-guid', localId: 1, rootInstanceId: ent.id(), parentLocalId: 0 });
+    place(ent.id());
     const scene = await serializeScene({ scene: { path: '/assets/scenes/Base.json', guid: 'base-guid-1' } });
-    const entry = scene.entities.find((e) => e.name === 'FishLike')!;
-    const pi = entry.traits.PrefabInstance as Record<string, unknown>;
-    expect(pi.rootInstanceId).toBe('g-fish-root');
-    expect(pi.rootInstanceId).not.toBe(ent.id());
+    const entry = scene.entities.find((e) => e.name === 'FishLike')! as unknown as { guid?: string; prefab?: string; traits?: Record<string, unknown> };
+    // Scene v20 (#2001 S6): the instance entry is written from its record, its identity the entry's own guid; no
+    // `PrefabInstance` trait (and so no `rootInstanceId`, raw or not) is written at all.
+    expect(entry.prefab).toBe('some-prefab-guid');
+    expect(entry.guid).toBe(FISH_ROOT);
+    expect(entry.traits?.PrefabInstance).toBeUndefined();
   });
 
   it('the default (no opts.scene) path is UNAFFECTED by the guard — a primary with a prefab instance still saves', async () => {
@@ -130,12 +140,13 @@ describe('serializeScene({ scene }) — target a named base (Phase 12, M1)', () 
       fields: { source: { type: 'string' }, localId: { type: 'number' }, rootInstanceId: { type: 'number', entityId: { onMissing: 'stripTrait' } }, parentLocalId: { type: 'number' } },
     });
     const ent = spawn(
-      EntityAttributes({ name: 'FishLike', guid: 'g-fish', sourceScene: '' }),
+      EntityAttributes({ name: 'FishLike', guid: FISH, sourceScene: '' }),
       Transform,
       PrefabInstance({ source: 'some-prefab-guid', localId: 1, rootInstanceId: 0, parentLocalId: 0 }),
     );
     // rootInstanceId must match the entity's own id to be treated as a top-level root.
     (ent as any).set(PrefabInstance, { source: 'some-prefab-guid', localId: 1, rootInstanceId: ent.id(), parentLocalId: 0 });
+    place(ent.id());
     await expect(serializeScene()).resolves.toBeTruthy();
   });
 });

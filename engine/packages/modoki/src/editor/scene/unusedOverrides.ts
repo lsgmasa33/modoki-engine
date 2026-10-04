@@ -6,76 +6,50 @@
  *  restore), a member removal, an added node, a re-parent, a legacy move. A row's `guid` and `name` are identity, not
  *  overrides (Unity's file has no such entry), so a row holding only them counts nothing.
  *
- *  What is counted is what the next save writes from the kept stores, read off the save's own projection (`unusedForSave`,
- *  #1938 C-B step 3):
- *   - each LIVE member's unused part, through the save's own predicate (`liveKeptUnused`): a removal of a component the
- *     member carries again is not written, and a member the instance deleted since takes its records with it;
- *   - each R2 orphan row (a member the template no longer declares, or one a lower layer removed: no live member holds
- *     its key, which is what makes it an orphan);
- *   - the legacy channels kept for the root: a localId record whose target is gone (a removal of a component the member
- *     carries again left out, #1933 L1), and a path-keyed frame no expansion reaches. */
+ *  What is counted is read off the instance's record (#2001 S8b): each record its fold reports unused (a target gone, a
+ *  field nothing persists, a component nothing registers; not one waiting on a missing prefab, which applies once it
+ *  returns, and not a held user node, which is scene content), less what a member the instance removed states besides
+ *  its removal; and each value no reader takes that the record holds (`held.unparsed`, a keyed node's too).
+ */
 
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { durableGuid } from '../../runtime/core/assetRefRules';
-import { type SceneMemberRow, type KeptLegacyChannels } from '../../runtime/loaders/loadSceneFile';
-import { unusedForSave, withUnusedPart } from './prefabBase';
+import { storedRecord } from '../../runtime/prefab/instanceStore';
+import { foldInstance } from '../../runtime/prefab/foldInstance';
+import type { InstanceRecord, UnusedCause } from '../../runtime/prefab/instanceRecord';
+import { editorPrefabReader } from '../instance/instanceSync';
 
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
-/** Records in a `{trait: {field: value}}` bag: each field, and a component stated with none (it adds the component). */
-function traitBagRecords(bag: unknown): number {
-  if (!isRecord(bag)) return 0;
+/** The causes a count states: a record whose target is gone, a field nothing persists, a component nothing registers.
+ *  Not one waiting on a missing prefab (it applies once that returns), and not a held user node (scene content). */
+const COUNTED: ReadonlySet<UnusedCause> = new Set(['gone', 'unknownField', 'unregistered']);
+
+/** Values no reader takes in a held `unparsed` tree: each leaf one. */
+function heldValues(held: unknown): number {
+  if (!isRecord(held)) return held === undefined ? 0 : 1;
   let n = 0;
-  for (const fields of Object.values(bag)) n += isRecord(fields) ? Math.max(1, Object.keys(fields).length) : 1;
+  for (const v of Object.values(held)) n += heldValues(v);
   return n;
 }
 
-/** Records one member row states, identity left out. */
-export function rowRecords(row: unknown): number {
-  if (!isRecord(row)) return 0;
-  let n = 0;
-  for (const [k, v] of Object.entries(row)) {
-    if (k === 'guid' || k === 'name') continue;
-    if (k === 'traits') n += traitBagRecords(v);
-    else if (k === 'traitRemovals') n += isRecord(v) ? Object.keys(v).length : 0;
-    else if (Array.isArray(v)) n += v.length; // `removedTraits` names; `added` / `own` nodes
-    else if (v !== undefined && v !== false) n += 1; // `removed: true`, `parent`
-  }
+/** The unused overrides record `rec` keeps (the module doc says what one is). A member the instance removed takes its
+ *  records with it: what its row (or a nested frame under it) states besides the removal is not counted. */
+export function recordUnusedOverrides(rec: InstanceRecord): number {
+  const removed = [...rec.list.rows].filter(([, row]) => row.removed === true).map(([k]) => k as string);
+  const underRemoved = (key: string) => removed.some((r) => key === r || key.startsWith(`${r}/`));
+  let n = foldInstance(editorPrefabReader, rec).unused.filter((u) => COUNTED.has(u.cause) && !underRemoved(u.key)).length;
+  n += heldValues(rec.held.unparsed);
+  for (const h of rec.held.keyedNodeHeld?.values() ?? []) n += heldValues(h.unparsed);
   return n;
 }
 
-/** Records the kept legacy channels state. */
-export function legacyRecords(legacy: KeptLegacyChannels | undefined): number {
-  if (!legacy) return 0;
-  let n = 0;
-  for (const bag of Object.values(legacy.overrides ?? {})) n += traitBagRecords(bag);
-  for (const names of Object.values(legacy.removedTraits ?? {})) n += Array.isArray(names) ? names.length : 0;
-  n += legacy.removed?.length ?? 0;
-  n += Object.keys(legacy.moved ?? {}).length;
-  n += legacy.malformed?.length ?? 0; // each value no reader takes (#1938 C-B step 2)
-  for (const frame of Object.values(legacy.nestedOverrides ?? {})) {
-    if (isRecord(frame)) for (const bag of Object.values(frame)) n += traitBagRecords(bag);
-  }
-  for (const st of Object.values(legacy.nestedStructure ?? {})) {
-    if (!isRecord(st)) continue;
-    n += Array.isArray(st.added) ? st.added.length : 0;
-    n += Array.isArray(st.removed) ? st.removed.length : 0;
-    if (isRecord(st.removedTraits)) for (const names of Object.values(st.removedTraits)) n += Array.isArray(names) ? names.length : 0;
-    n += isRecord(st.moved) ? Object.keys(st.moved).length : 0;
-  }
-  return n;
-}
-
-/** The unused overrides instance root `rootId` keeps (the module doc says what one is). 0 for an entity with no durable
- *  guid: the kept stores are keyed by it, so such a root keeps nothing. */
+/** The unused overrides instance root `rootId` keeps: its record's. 0 for a root with no record. */
 export function instanceUnusedOverrides(rootId: number): number {
   const ea = getTraitByName('EntityAttributes');
   const rootGuid = ea ? durableGuid((readTraitData(rootId, ea) as { guid?: string } | null)?.guid) : '';
-  if (!rootGuid) return 0;
-  const kept = unusedForSave(rootGuid, rootId);
-  let n = 0;
-  for (const { part, carried } of kept.rows) n += rowRecords(withUnusedPart(undefined, part as SceneMemberRow, carried));
-  for (const row of Object.values(kept.orphans)) n += rowRecords(row);
-  return n + legacyRecords(kept.legacy);
+  const rec = rootGuid ? storedRecord(getCurrentWorld(), rootGuid) : undefined;
+  return rec ? recordUnusedOverrides(rec) : 0;
 }

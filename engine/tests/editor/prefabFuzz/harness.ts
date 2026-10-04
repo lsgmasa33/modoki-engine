@@ -22,9 +22,8 @@ import { _resetSceneAdoptionForTests, adoptionsSettled } from '../../../packages
 import { isWorldReplacementInFlight } from '../../../packages/modoki/src/editor/scene/authoringSettle';
 import { _resetPrefabEditSessionRows, isEditingPrefab } from '../../../packages/modoki/src/editor/scene/prefabEdit';
 import { useEditorStore } from '../../../packages/modoki/src/editor/store/editorStore';
-import { clearKeptMemberOrphans } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { clearReservedLocalIds } from '../../../packages/modoki/src/runtime/core/localIdCounter';
-import { getOverrideMarkSet } from '../../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { rowPlaceholderOf, unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { REF_FIELDS_BY_TRAIT } from '../../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { CAPTURE_FORM_SCENE_VERSION } from '../../../packages/modoki/src/runtime/core/version';
@@ -243,7 +242,6 @@ export async function startRun(be: FuzzBackend, setupNest: (f: Fixture) => Promi
   _resetSceneAdoptionForTests();
   _resetPrefabEditSessionRows();
   clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own run
-  clearKeptMemberOrphans();
   clearReservedLocalIds(); // #1933 S5: a replayed key reuses the fixture's guids
   useEditorStore.setState({ editingPrefab: null, showToast: () => {} } as never);
   be.reset();
@@ -410,7 +408,7 @@ export function worldTree(): Record<string, unknown> {
       return !!meta && (readTraitData(e.id, meta) as Record<string, unknown> | null)?.[field] === '';
     };
     const marks = ent && e.traits.includes('PrefabInstance')
-      ? [...(getOverrideMarkSet(ent as never) ?? [])].filter((m) => e.traits.includes(m.split('.')[0]) && !blankRef(m)).sort()
+      ? [...(overrideKeysOf(ent as never) ?? [])].filter((m) => e.traits.includes(m.split('.')[0]) && !blankRef(m)).sort()
       : [];
     const rowPlaceholder = ent ? rowPlaceholderOf(ent as never) : undefined;
     const unresolved = ent ? unresolvedRefOf(ent as never) ?? rowPlaceholder : undefined;

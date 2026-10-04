@@ -171,6 +171,7 @@ import { useEditorStore } from '../../packages/modoki/src/editor/store/editorSto
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { enterPlay, stopPlay, type PlayOutcome } from '../../packages/modoki/src/editor/scene/playMode';
 import { getPlayState } from '../../packages/modoki/src/runtime/core/playState';
+import { setInstanceRecord, storedInstance } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { worldHasUnsavedEdits } from '../../packages/modoki/src/editor/scene/serialize';
 import { pushAction, canUndo, undoLabel, undoDepth, swapHistory, undo, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 
@@ -834,6 +835,17 @@ describe('#1703: Play is refused while a leave repair runs, whichever route runs
     await exit;
     expect(outcome).toMatchObject({ kind: 'refused', reason: 'load-landed' });
     expect(getPlayState()).toBe('stopped');
+  });
+
+  it('Exit in place marks no record of the world it stays in stale (#2001 S8b)', async () => {
+    await editingWithNoReturnScene();
+    const world = getCurrentWorld();
+    setInstanceRecord(world, { rootGuid: 'root-2201' } as never);
+    expect(await exitPrefabEditing()).toBeNull();
+    expect(getCurrentWorld(), 'premise: the session ended in place').toBe(world);
+    // MUTATION TARGET: mark the store when the leave had no scene to go back to (the old `staleAroundUnless` kept test),
+    // or before it starts, and this reads 'prefabLeave': the next write re-seeds a record the edits kept through the door.
+    expect(storedInstance(world, 'root-2201')).toBeDefined();
   });
 
   it('ACCEPT SIDE: with the repair done, Play starts', async () => {

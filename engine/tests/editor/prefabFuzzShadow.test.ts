@@ -1,11 +1,8 @@
-/** #2009: the fuzzer's checks against the #2001 instance model, P1 and I25 (`prefabFuzz/shadow.ts`), held to both sides
- *  BEFORE the model exists. Nothing implements the store, the parser or the projection yet (S1 landed its types only), so
- *  each check runs here through FAKE seams: a fake door that records what the capture reads and one that misses a write, a
- *  fake projection that is the live instance and one that is not. Each check must pass on the first and fail on the second;
- *  a check that cannot fail on a broken model guards nothing (docs/falsifiable-tests.md).
- *
- *  The fake capture reads an instance root's MARKED fields off the live world (today's override marks), into the `"/"`
- *  row — fresh objects on every call, as a real `parse(captureInstanceEntry(live))` builds them. */
+/** #2009: the fuzzer's checks against the #2001 instance model (`prefabFuzz/shadow.ts`): the store's coverage and P1,
+ *  held to both sides through FAKE seams: a store that covers every live stored root and one that lacks one, a fake
+ *  projection that is the live instance and one that is not. Each check must pass on the first and fail on the second;
+ *  a check that cannot fail on a broken model guards nothing (docs/falsifiable-tests.md). (I25's cases went with I25,
+ *  #2001 S8b.) */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'fs';
@@ -24,11 +21,10 @@ import { markUnresolved } from '../../packages/modoki/src/runtime/core/unresolve
 import { setTemplateKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { runOps, checksRun, consoleErrors, foldCheck } from './prefabFuzz/runner';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
-import { installShadow, listDiff, liveStoredRoots, type ShadowSeams } from './prefabFuzz/shadow';
+import { installShadow, liveStoredRoots, type ShadowSeams } from './prefabFuzz/shadow';
 import type { Op } from './prefabFuzz/ops';
 import { readTraitData, findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { findEntityByGuid } from '../../packages/modoki/src/runtime/core/ecs/world';
-import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
 import type { InstanceRecord, OverrideList, SceneTargetRecord } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 
 const be = makeFuzzBackend();
@@ -47,20 +43,6 @@ const record = (rootGuid: string, l: OverrideList): InstanceRecord => ({ rootGui
 
 const liveRoots = liveStoredRoots;
 
-/** The fake capture: the root's marked fields, read off the live world into the `"/"` row. */
-function captureList(rootGuid: string): OverrideList | null {
-  const ent = findEntityByGuid(rootGuid);
-  if (!ent) return null;
-  const traits: Record<string, Record<string, unknown>> = {};
-  for (const m of [...(getOverrideMarkSet(ent as never) ?? [])].sort()) {
-    const [trait, field] = m.split('.') as [string, string];
-    const meta = getTraitByName(trait);
-    const data = meta ? readTraitData(ent.id(), meta) as Record<string, unknown> | null : null;
-    if (data) (traits[trait] ??= {})[field] = data[field];
-  }
-  return list({ '/': Object.keys(traits).length ? { guid: rootGuid, traits } : { guid: rootGuid } });
-}
-
 /** An Inspector edit of Transform.x on the FIRST entity with a Transform (the O1 instance root, loaded first). */
 const editRoot: Op = { kind: 'editField', u: [0, 0, 0.9, 0, 0, 0, 0, 0] };
 const copyAny: Op = { kind: 'copy', u: [0, 0, 0, 0, 0, 0, 0, 0] };
@@ -75,95 +57,16 @@ async function run(seams: ShadowSeams, ops: Op[]) {
   return { failure: r.failure, counted, trace: r.trace };
 }
 
-describe('#2009 I25 (the shadow): a record equals the capture, modulo identity pins, after an op whose door exists', () => {
-  it('listDiff: pins are not overrides, a pins-only row is no record, own order is not a difference, and a value, a row or an own node is', () => {
-    const a = list({ '/': { guid: 'g1', name: 'A', traits: { Transform: { x: 1 } } }, '/n1': { guid: 'g2' } });
-    expect(listDiff(a, list({ '/': { guid: 'other', traits: { Transform: { x: 1 } } } }))).toBeNull();
-    expect(listDiff(a, list({ '/': { traits: { Transform: { x: 2 } } } }))).toMatch(/Transform/);
-    expect(listDiff(a, list({ '/': { traits: { Transform: { x: 1 } } }, '/n2': { removed: true } }))).toMatch(/n2/);
-    const own = (...g: string[]) => list({ '/': { own: g.map((guid) => ({ guid })) } });
-    expect(listDiff(own('a', 'b'), own('a', 'b'))).toBeNull();
-    // An added node's order is its own sortOrder, scene content (plan § 3, the m_AddedGameObjects row): `own` is a set.
-    expect(listDiff(own('a', 'b'), own('b', 'a'))).toBeNull();
-    expect(listDiff(own('a', 'b'), own('a', 'c'))).not.toBeNull();
-    expect(listDiff(own('a', 'b'), own('a'))).not.toBeNull();
-  });
-
-  it('listDiff refuses to compare a record with itself (§ 10.5): the same list, or a row the store owns', () => {
-    const a = list({ '/': { traits: { Transform: { x: 1 } } } });
-    expect(() => listDiff(a, a)).toThrow(/compared the record with itself/);
-    expect(() => listDiff(a, { rows: new Map([['/', a.rows.get('/')!]]) })).toThrow(/row \/ is the store's own object/);
-  });
-
-  it('a door that records what the capture reads passes; one that missed the write fails; an op with no door is not compared', async () => {
-    // The good door: the store holds what the capture read when the op landed (a copy, never the capture's own object).
-    const good: ShadowSeams = { records: () => liveRoots().map((g) => record(g, structuredClone(captureList(g)!))), captureList, doors: new Set(['copy', 'editField']) };
-    const ok = await run(good, [copyAny, editRoot]);
-    expect(ok.failure, ok.failure ? `${ok.failure.check}: ${ok.failure.detail}` : '').toBeUndefined();
-    expect(ok.counted).toEqual(expect.arrayContaining(['I25 after copy', 'I25 after editField']));
-
-    // The broken door: the store froze at the first op and missed the edit. Red, on the root, naming the field.
-    let frozen: readonly InstanceRecord[] | null = null;
-    const missed: ShadowSeams = { records: () => (frozen ??= good.records()), captureList, doors: new Set(['copy', 'editField']) };
-    const bad = await run(missed, [copyAny, editRoot]);
-    expect(bad.failure?.check).toBe('I25 the record is not the capture');
-    expect(bad.failure?.op).toMatch(/^editField/);
-    expect(bad.failure?.detail).toMatch(/Transform/);
-
-    // The same gap after an op with no door yet is the step's known gap: not compared, and counted as such.
-    frozen = null;
-    const noDoor = await run({ ...missed, doors: new Set(['copy']) }, [copyAny, editRoot]);
-    expect(noDoor.failure, noDoor.failure ? `${noDoor.failure.check}: ${noDoor.failure.detail}` : '').toBeUndefined();
-    expect(noDoor.counted).toContain('I25 after editField: not compared (no door yet)');
-  }, 60_000);
-
+describe('#2009: the store covers every live stored root', () => {
   it('a store that lacks a live stored instance fails, rather than comparing nothing and counting it as run', async () => {
-    expect(liveStoredRoots().length).toBeGreaterThan(0);
-    const empty = await run({ records: () => [], captureList, project: async () => undefined, doors: new Set(['copy']) }, [copyAny]);
+    const empty = await run({ records: () => [], project: async () => undefined }, [copyAny]);
     expect(empty.failure?.check).toBe('a live stored instance has no record');
-    const oneShort = await run({ records: () => liveStoredRoots().slice(1).map((g) => record(g, structuredClone(captureList(g)!))), captureList, doors: new Set(['copy']) }, [copyAny]);
+    expect(liveStoredRoots().length).toBeGreaterThan(0);
+    const oneShort = await run({ records: () => liveStoredRoots().slice(1).map((g) => record(g, list({}))) }, [copyAny]);
     expect(oneShort.failure?.check).toBe('a live stored instance has no record');
-  }, 60_000);
-
-  // #2014 (S4's staging): `unrecorded` excuses a live root an op S7 has not moved created without the door — named and
-  // counted — and nothing else.
-  it('unrecorded: a missing root the seam names is excused and counted; one it does not name still fails', async () => {
-    // Read at check time: every run boots fresh guids.
-    const short = () => liveStoredRoots().slice(1).map((g) => record(g, structuredClone(captureList(g)!)));
-    const first = () => liveStoredRoots()[0];
-    const excused = await run({ records: short, captureList, doors: new Set(['copy']), unrecorded: (g) => (g === first() ? 'paste' : undefined) }, [copyAny]);
-    expect(excused.failure, excused.failure ? `${excused.failure.check}: ${excused.failure.detail}` : '').toBeUndefined();
-    expect(excused.counted).toContain('shadow: a live stored root unrecorded by paste');
-    const other = await run({ records: short, captureList, doors: new Set(['copy']), unrecorded: (g) => (g === first() ? undefined : 'paste') }, [copyAny]);
-    expect(other.failure?.check).toBe('a live stored instance has no record');
-  }, 60_000);
-
-  // #2014: `judge` skips a record that says nothing (a stale one, which the door re-seeds from the capture), counted per
-  // reason, and otherwise the list it returns is what is compared — still checked against the capture reading the store.
-  it('judge: a skipped record is not compared and is counted; a judged list is compared; the store-self check still holds', async () => {
-    let frozen: readonly InstanceRecord[] | null = null;
-    const good = () => liveRoots().map((g) => record(g, structuredClone(captureList(g)!)));
-    const missed: ShadowSeams = { records: () => (frozen ??= good()), captureList, doors: new Set(['copy', 'editField']) };
-    const skipped = await run({ ...missed, judge: () => ({ skip: 'stale (apply)' }) }, [copyAny, editRoot]);
-    expect(skipped.failure, skipped.failure ? `${skipped.failure.check}: ${skipped.failure.detail}` : '').toBeUndefined();
-    expect(skipped.counted).toContain('I25 not compared: stale (apply)');
-    expect(skipped.counted).not.toContain('I25 compared a record');
-    // A judge that hands back the frozen list as a fresh copy: compared, and red on the missed edit.
-    frozen = null;
-    const judged = await run({ ...missed, judge: (rec) => ({ rows: new Map([...rec.list.rows].map(([k, r]) => [k, { ...r }])) }) }, [copyAny, editRoot]);
-    expect(judged.failure?.check).toBe('I25 the record is not the capture');
-    expect(judged.counted).toContain('I25 compared a record');
-    // And it is the JUDGED list that is compared, not `rec.list`: a judge that applies the rules' side (here, all of it:
-    // what the capture reads) turns the same frozen store green.
-    frozen = null;
-    const applied = await run({ ...missed, judge: (rec) => structuredClone(captureList(rec.rootGuid)!) }, [copyAny, editRoot]);
-    expect(applied.failure, applied.failure ? `${applied.failure.check}: ${applied.failure.detail}` : '').toBeUndefined();
-    // A judge that translates the list is still checked against a capture that returns the STORE's own rows.
-    let store: InstanceRecord[] | null = null;
-    const held = () => (store ??= good());
-    const selfRead = await run({ records: held, captureList: (g) => held().find((r) => r.rootGuid === g)!.list, doors: new Set(['copy']), judge: (rec) => ({ rows: new Map([...rec.list.rows].map(([k, r]) => [k, { ...r }])) }) }, [copyAny]);
-    expect(selfRead.failure?.check).toBe('shadow check threw');
-    expect(selfRead.failure?.detail).toMatch(/compared the record with itself/);
+    const all = await run({ records: () => liveStoredRoots().map((g) => record(g, list({}))) }, [copyAny]);
+    expect(all.failure, all.failure ? `${all.failure.check}: ${all.failure.detail}` : '').toBeUndefined();
+    expect(all.counted).toContain('shadow: the store covers every live stored root');
   }, 60_000);
 
   it('a template-added reference node\'s root owns no record (hub, 2026-10-02): the store need not cover it', async () => {
@@ -203,17 +106,6 @@ describe('#2009 I25 (the shadow): a record equals the capture, modulo identity p
     expect(foldCheck(be, await serializeScene() as never).length).toBe(2);
   }, 60_000);
 
-  it('a capture that returns the store\'s own list fails the step as a harness error, not a pass', async () => {
-    const store = new Map<string, OverrideList>();
-    const seams: ShadowSeams = {
-      records: () => liveRoots().map((g) => record(g, store.get(g) ?? store.set(g, captureList(g)!).get(g)!)),
-      captureList: (g) => store.get(g) ?? null,
-      doors: new Set(['copy']),
-    };
-    const r = await run(seams, [copyAny]);
-    expect(r.failure?.check).toBe('shadow check threw');
-    expect(r.failure?.detail).toMatch(/compared the record with itself/);
-  }, 60_000);
 });
 
 describe('#2009 P1: each record\'s projection is its live instance', () => {
@@ -224,7 +116,7 @@ describe('#2009 P1: each record\'s projection is its live instance', () => {
   };
   it('a projection that is the live instance passes and is counted; one that moves a root fails, naming the field', async () => {
     const records = () => liveRoots().map((g) => record(g, list({})));
-    const ok = await run({ records, project: async (rec) => ({ live: tree(rec), projected: tree(rec) }), doors: new Set() }, [copyAny]);
+    const ok = await run({ records, project: async (rec) => ({ live: tree(rec), projected: tree(rec) }) }, [copyAny]);
     expect(ok.failure, ok.failure ? `${ok.failure.check}: ${ok.failure.detail}` : '').toBeUndefined();
     expect(ok.counted).toContain('P1');
 
@@ -235,18 +127,18 @@ describe('#2009 P1: each record\'s projection is its live instance', () => {
       projected[rec.rootGuid]!.traits.Transform.y = 42;
       return { live, projected };
     };
-    const bad = await run({ records, project: drift, doors: new Set() }, [copyAny]);
+    const bad = await run({ records, project: drift }, [copyAny]);
     expect(bad.failure?.check).toBe('P1 the projection of a record is not its live instance');
     expect(bad.failure?.detail).toMatch(/Transform\/y/);
   }, 60_000);
 
   it('a record the seam does not compare is counted under its reason, and a nested one (with its owner) not at all', async () => {
     const records = () => liveRoots().map((g) => record(g, list({})));
-    const skipped = await run({ records, project: async () => ({ skip: 'stale (test)' }), doors: new Set() }, [copyAny]);
+    const skipped = await run({ records, project: async () => ({ skip: 'stale (test)' }) }, [copyAny]);
     expect(skipped.failure).toBeUndefined();
     expect(skipped.counted).toContain('P1 not compared: stale (test)');
     expect(skipped.counted).not.toContain('P1');
-    const nested = await run({ records, project: async () => undefined, doors: new Set() }, [copyAny]);
+    const nested = await run({ records, project: async () => undefined }, [copyAny]);
     expect(nested.counted.filter((k) => k.startsWith('P1') && !k.startsWith('P1 by the fold'))).toEqual([]);
   }, 60_000);
 
@@ -256,7 +148,7 @@ describe('#2009 P1: each record\'s projection is its live instance', () => {
     expect(r.failure).toBeUndefined();
     // P1 by the FOLD needs no seam (S1's parser and S2's fold are real), so it runs; the seam checks do not.
     const grew = [...checksRun].filter(([k, n]) => n > (before.get(k) ?? 0)).map(([k]) => k);
-    expect(grew.filter((k) => /^(I25|P1|shadow)/.test(k) && !k.startsWith('P1 by the fold'))).toEqual([]);
+    expect(grew.filter((k) => /^(P1|shadow)/.test(k) && !k.startsWith('P1 by the fold'))).toEqual([]);
     expect(grew).toContain('P1 by the fold');
     expect(grew).toContain('P1 by the fold: a scene-added reference node');
   }, 60_000);

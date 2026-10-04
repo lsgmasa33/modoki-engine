@@ -21,20 +21,24 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
   getCachedPrefab: (ref: string) => prefabs.get(ref),
   loadModelTemplates: async () => {},
 }));
+/** Files the Create Prefab command writes (#1778's tests drive the command itself): each lands in the loader's documents. */
+vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  postWriteFile: async (_path: string, content: string) => {
+    const doc = JSON.parse(content) as { id?: string };
+    if (doc.id) prefabs.set(doc.id, doc);
+    return { ok: true, json: async () => ({}), text: async () => '' } as Response;
+  },
+}));
 
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { setActionCallback, pushAction, clearHistory, serializeScene, reparentEntity, createEntityWithUndo, writeTraitFieldWithUndo } from '@modoki/engine/editor';
-import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setActionCallback, pushAction, clearHistory, serializeScene, reparentEntity, createEntityWithUndo, writeTraitFieldWithUndo, undo, redo } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
-import {
-  tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids,
-} from '../../packages/modoki/src/editor/scene/prefabLink';
+import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { keptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -46,8 +50,6 @@ const BUTTON = 'dddddddd-0000-4000-8000-000000000004';
 const LABEL = 'dddddddd-0000-4000-8000-000000000005';
 const INNER = 'dddddddd-0000-4000-8000-0000000000c1';
 const NESTED = 'dddddddd-0000-4000-8000-000000000006';
-const PREFAB = 'dddddddd-0000-4000-8000-00000000000f';
-const PREFAB2 = 'dddddddd-0000-4000-8000-00000000001f';
 const LEAFP = 'dddddddd-0000-4000-8000-0000000000c2';
 const REFNODE = 'dddddddd-0000-4000-8000-000000000007';
 const PLAIN = 'dddddddd-0000-4000-8000-000000000008';
@@ -141,15 +143,13 @@ const baseScene = (holderRefs: string[] = []): SceneData => ({
   ],
 } as unknown as SceneData);
 
-/** Create Prefab, exactly as both callers do it: serialize the live tree, then tag it
- *  (`assetOps.createPrefabFromEntity`, `agentEditorOps` `prefab {action:'create'}`). */
-function createPrefabFrom(rootPath: string, target: string = PREFAB): PrefabFile {
-  const rootId = idAt(rootPath);
-  const file = serializePrefab(rootId, target)!;
-  prefabs.set(target, file);
-  setPrefabCache(target, file as never);
-  tagEntityTreeAsInstance(rootId, target, file);
-  return file;
+/** Create Prefab as the panels run it (`assetOps.createPrefabFromEntity`): the command, its step pushed. It records the
+ *  instance it makes; a bare `tagEntityTreeAsInstance` leaves a tree holding no record, which the save refuses. */
+let created = 0;
+async function createPrefabFrom(rootPath: string): Promise<void> {
+  const res = await createPrefabFromEntity(idAt(rootPath), `/prefabs/Created1461-${++created}.prefab.json`, 'Create Prefab', async () => true);
+  if (!res || res === 'declined' || 'refused' in res) throw new Error(`fixture: ${JSON.stringify(res)}`);
+  pushAction(res.action);
 }
 
 type Entry = { prefab?: string; guid?: string; members?: Record<string, { name?: string; parent?: string }> };
@@ -162,7 +162,7 @@ beforeEach(() => {
   prefabs.set(INNER, innerDoc);
   setPrefabCache(INNER, innerDoc as never);
 });
-afterAll(() => { setPrefabCache(INNER, null); setPrefabCache(LEAFP, null); setPrefabCache(PREFAB, null); setPrefabCache(PREFAB2, null); getCurrentWorld()?.destroy(); });
+afterAll(() => { setPrefabCache(INNER, null); setPrefabCache(LEAFP, null); getCurrentWorld()?.destroy(); });
 
 describe('a member moved inside an instance made by Create Prefab in the same session (#1461)', () => {
 
@@ -171,7 +171,7 @@ describe('a member moved inside an instance made by Create Prefab in the same se
    *  nobody has thought of yet — and cannot pass by recomputing the fix's own derivation. */
   it('every member already carries the guid the reload derives for it', async () => {
     await load(baseScene());
-    createPrefabFrom('Holder/Root');
+    await createPrefabFrom('Holder/Root');
     const members = ['Holder/Root/Panel', 'Holder/Root/Label', 'Holder/Root/Panel/Button'];
     const before = members.map((p) => [p, guidAt(p)] as const);
 
@@ -185,7 +185,7 @@ describe('a member moved inside an instance made by Create Prefab in the same se
    *  derives it through the OUTER anchor and the whole path instead. */
   it('a member of an owned nested instance keeps the identity the reload gives it', async () => {
     await load(baseScene());
-    createPrefabFrom('Holder/Root');
+    await createPrefabFrom('Holder/Root');
     const leaf = guidAt('Holder/Root/Panel/Nested/Leaf');
 
     await load(await saved() as unknown as SceneData);
@@ -200,7 +200,7 @@ describe('a member moved inside an instance made by Create Prefab in the same se
    *  wrongly renamed one would go unnoticed. */
   it('an added node under a member keeps its own guid — the stamp does not touch it', async () => {
     await load(baseScene());
-    createPrefabFrom('Holder/Root');
+    await createPrefabFrom('Holder/Root');
     const added = createEntityWithUndo('add', idAt('Holder/Root/Panel'), [
       { name: 'EntityAttributes', data: { name: 'Added', parentId: idAt('Holder/Root/Panel') } },
       { name: 'Transform', data: { x: 0, y: 0, z: 0 } },
@@ -217,7 +217,7 @@ describe('a member moved inside an instance made by Create Prefab in the same se
   it('a ref into a member still resolves after the reload', async () => {
     await load(baseScene());
     await load(baseScene([BUTTON])); // Holder's UIAction aims at Button, before it is a member
-    createPrefabFrom('Holder/Root');
+    await createPrefabFrom('Holder/Root');
 
     await load(await saved() as unknown as SceneData);
 
@@ -261,7 +261,7 @@ describe.each([
   it('the reference node, its member and the plain node already hold the guids the reload gives them', async () => {
     await setup();
     const kidBefore = guidAt(KID_PATH);
-    createPrefabFrom('Holder/Root');
+    await createPrefabFrom('Holder/Root');
     const paths = [REF_PATH, KID_PATH, PLAIN_PATH];
     const before = paths.map(guidAt);
     // Where a row states the guid, identity does not move: a ref to LKid in ANOTHER file keeps resolving.
@@ -275,7 +275,7 @@ describe.each([
 
   it('a ref to each of them still resolves after save + reopen', async () => {
     await setup();
-    createPrefabFrom('Holder/Root');
+    await createPrefabFrom('Holder/Root');
 
     await load(await saved() as unknown as SceneData);
 
@@ -285,8 +285,8 @@ describe.each([
 
 /** #1778: a reference node the scene added inside a held instance carries a kept ORPHAN member row (R2: a row naming a
  *  node LEAFP no longer declares, kept in case that template edit is undone). Create Prefab's stamp renames the node to
- *  its derived guid (#1758), and the kept-orphan store is keyed by the root's guid — left under the old one, the next
- *  save looked under the new one and dropped the row for good. The store now follows the rename (`applyGuidRemap`). */
+ *  its derived guid (#1758). The row lives in the node's record (#2001 S8b), which the command moves with the rename and
+ *  its undo seats back; before, it sat in a store keyed by the old guid, and the next save looked under the new one. */
 describe('Create Prefab keeps a swallowed reference node\'s kept orphan row (#1778)', () => {
   const REF_PATH = 'Holder/Root/Panel/Nested/Leaf/LRoot';
   const ORPHAN = 'ffffffff-0000-4000-8000-0000000017f9';
@@ -305,19 +305,16 @@ describe('Create Prefab keeps a swallowed reference node\'s kept orphan row (#17
     // Control: before Create Prefab, a plain save writes the orphan row.
     expect(JSON.stringify(await saved()), 'fixture: the orphan is written before Create Prefab').toContain(ORPHAN);
   };
-  /** Create Prefab as both callers do it, keeping the rename for the undo (`assetOps`: unstamp, then untag). */
-  const create = () => {
-    const rootId = idAt('Holder/Root');
-    const file = serializePrefab(rootId, PREFAB)!;
-    prefabs.set(PREFAB, file);
-    setPrefabCache(PREFAB, file as never);
-    return { rootId, file, remap: tagEntityTreeAsInstance(rootId, PREFAB, file) };
+  /** Create Prefab as the panels run it: the command, its step pushed. */
+  const create = async () => {
+    const res = await createPrefabFromEntity(idAt('Holder/Root'), '/prefabs/Created1778.prefab.json', 'Create Prefab', async () => true);
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(`fixture: ${JSON.stringify(res)}`);
+    pushAction(res.action);
   };
 
-  /** Mutation: drop the re-key in `applyGuidRemap` — both assertions go red (the row stays under REFNODE). */
   it('the next save writes the orphan row, and it survives save + reopen + save', async () => {
     await setup();
-    create();
+    await create();
     expect(guidAt(REF_PATH), 'fixture: the stamp renamed the node').not.toBe(REFNODE);
 
     expect(JSON.stringify(await saved())).toContain(ORPHAN);
@@ -325,21 +322,19 @@ describe('Create Prefab keeps a swallowed reference node\'s kept orphan row (#17
     expect(JSON.stringify(await saved())).toContain(ORPHAN);
   });
 
-  /** Mutations: drop the re-key — the rows never left REFNODE, so the undo lines pass and the redo's save goes red;
-   *  COPY the rows to the new guid instead of moving them — the undo's "nothing left under the new guid" line goes red. */
-  it('undo puts the rows back under the node\'s old guid, and redo moves them to the new one again', async () => {
+  it('undo puts the row back under the node\'s old guid, and redo keeps it', async () => {
     await setup();
-    const { rootId, file, remap } = create();
+    await create();
     const renamed = guidAt(REF_PATH);
 
-    unstampMemberGuids(remap);
-    untagEntityTreeAsInstance(rootId, PREFAB);
+    expect(await undo()).toBe(true);
     expect(guidAt(REF_PATH)).toBe(REFNODE);
-    expect(keptMemberOrphans(REFNODE)?.['/eeeeeeee-0000-4000-8000-0000000017f0']?.guid).toBe(ORPHAN);
-    expect(keptMemberOrphans(renamed)).toBeUndefined();
+    // The node is written inside the held instance's own list, so the file is read whole: the row, and no trace of the rename.
+    const back = JSON.stringify(await saved());
+    expect(back).toContain(ORPHAN);
+    expect(back).not.toContain(renamed);
 
-    tagEntityTreeAsInstance(rootId, PREFAB, file);
-    expect(guidAt(REF_PATH)).toBe(renamed);
+    expect(await redo()).toBe(true);
     expect(JSON.stringify(await saved())).toContain(ORPHAN);
   });
 });

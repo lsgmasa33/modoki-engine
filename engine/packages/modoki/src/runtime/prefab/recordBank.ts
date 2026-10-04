@@ -10,25 +10,23 @@
  *    edit, a discarded edit the file never got), and
  *  - its fold is the parse's (the live tree the load projected from the parse is then the banked record's projection
  *    too, so no tree is rebuilt).
- * Every other record the reloaded entries state is marked stale by the leaver's op, as every record was before S7.6: an
- * entry rewritten while away, a root the bank does not hold, and a fold that differs — the save states more than the list
- * (it writes a scene-stated component whole), which a template change while away (a prefab edit) turns into a different
- * tree. Seating that list would need the tree reprojected; S8 closes the case, its file being written from the list.
- * A banked record that was stale is not seated either. One bank per key; the load of that key takes it, whichever route loads it.
+ * Every other record the reloaded entries state keeps the load's parse, fresh (#2001 S8b): an entry rewritten while away,
+ * a root the bank does not hold, a fold that differs (a template change while away, a prefab edit), and a banked record
+ * that was stale. The parse is the record of the text the load spawned the tree from, so it is that tree's record exactly,
+ * as any load's is; before S8b it was marked stale by the leaver's op, and re-seeded from the capture of that same tree.
+ * One bank per key; the load of that key takes it, whichever route loads it.
  */
 import type { World } from 'koota';
 import type { SceneEntityEntry } from '../loaders/loadSceneFile';
 import type { InstanceRecord, PrefabReader } from './instanceRecord';
 import { foldInstance } from './foldInstance';
-import { markStale, setInstanceRecord, storedInstance, storedInstances, type StoredInstance } from './instanceStore';
+import { setInstanceRecord, storedInstance, storedInstances, type StoredInstance } from './instanceStore';
 
 export interface RecordBank {
   /** The world's stored instances, cloned when banked. */
   stored: Map<string, StoredInstance>;
   /** Each top-level entry the banked text holds, by its guid, as JSON. */
   entries: Map<string, string>;
-  /** The leaver's op, for the stale mark of a record not seated. */
-  by: string;
 }
 
 const banks = new Map<string, RecordBank>();
@@ -48,23 +46,26 @@ export function cloneInstanceStore(world: World): Map<string, StoredInstance> {
   return stored;
 }
 
+/** A stored instance as comparable text, its Maps and Sets as their entries: equal text, the same record and stale mark. */
+export const storedText = (s: StoredInstance | undefined): string =>
+  JSON.stringify(s, (_k, v: unknown) => v instanceof Map ? [...v.entries()] : v instanceof Set ? [...v] : v) ?? '';
+
 /** `world`'s stored instances now ({@link cloneInstanceStore}), less every one that differs from `before` (a clone taken
  *  when the caller began serializing). The serialize awaits, and an edit can land meanwhile: a record taken after it
  *  would state an edit the banked text may not, which neither comparison catches when the fold is unchanged (#2046 S7
  *  close-out review). A record left out is not seated: the load keeps its parse, stale. */
 export function steadyRecords(before: ReadonlyMap<string, StoredInstance>, world: World): Map<string, StoredInstance> {
-  const text = (s: StoredInstance | undefined) => JSON.stringify(s, (_k, v: unknown) => v instanceof Map ? [...v.entries()] : v instanceof Set ? [...v] : v);
   const out = new Map<string, StoredInstance>();
-  for (const [g, s] of cloneInstanceStore(world)) if (text(s) === text(before.get(g))) out.set(g, s);
+  for (const [g, s] of cloneInstanceStore(world)) if (storedText(s) === storedText(before.get(g))) out.set(g, s);
   return out;
 }
 
 /** Bank `stored` ({@link cloneInstanceStore}) for the next load of `key`, with the entries the world serialized to.
  *  Returns the bank, for {@link dropRecordBank}. */
-export function bankInstanceRecords(key: string, stored: Map<string, StoredInstance>, entries: readonly SceneEntityEntry[] | undefined, by: string): RecordBank {
+export function bankInstanceRecords(key: string, stored: Map<string, StoredInstance>, entries: readonly SceneEntityEntry[] | undefined): RecordBank {
   const byGuid = new Map<string, string>();
   for (const e of entries ?? []) { const g = entryGuid(e); if (g) byGuid.set(g, entryText(e)); }
-  const bank = { stored, entries: byGuid, by };
+  const bank = { stored, entries: byGuid };
   banks.set(key, bank);
   return bank;
 }
@@ -93,10 +94,16 @@ export function takeRecordBank(key: string): RecordBank | undefined {
   return b;
 }
 
-/** The fold as comparable text: every Map and Set spread, in insertion order (the fold's own, deterministic). */
+/** The fold as comparable text: every Map and Set spread, in insertion order (the fold's own, deterministic) — except the
+ *  links under each anchor, by guid. The save writes a row's `own` nodes in sibling order, not in the order the links were
+ *  made (`serializeInstanceRecord.ts` `ownNodes`), so the parse of the banked text lists them in another order than a
+ *  record whose links a gesture made after a reorder (hunt seed 9306): the same nodes under the same anchors, which the
+ *  projection places by their own sibling order either way. */
 function foldText(read: PrefabReader, rec: InstanceRecord): string | null {
   try {
-    return JSON.stringify(foldInstance(read, rec), (_k, v: unknown) => v instanceof Map ? [...v.entries()] : v instanceof Set ? [...v] : v);
+    const fold = foldInstance(read, rec);
+    const anchors = new Map([...fold.anchors].map(([k, refs]) => [k, [...refs].sort((a, b) => a.guid.localeCompare(b.guid))]));
+    return JSON.stringify({ ...fold, anchors }, (_k, v: unknown) => v instanceof Map ? [...v.entries()] : v instanceof Set ? [...v] : v);
   } catch { return null; }
 }
 
@@ -119,13 +126,10 @@ function withStatedPins(banked: InstanceRecord, parsed: InstanceRecord): Instanc
 export function adoptBankedRecords(world: World, bank: RecordBank, entry: SceneEntityEntry, rootGuids: readonly string[], read: PrefabReader): void {
   const g = entryGuid(entry);
   const same = !!g && bank.entries.get(g) === entryText(entry);
-  const unseated: string[] = [];
   for (const rootGuid of rootGuids) {
     const banked = same ? bank.stored.get(rootGuid) : undefined;
     const parsed = storedInstance(world, rootGuid);
-    const want = banked && !banked.stale && parsed ? foldText(read, banked.record) : null;
+    const want = banked && parsed ? foldText(read, banked.record) : null;
     if (want !== null && want === foldText(read, parsed!.record)) setInstanceRecord(world, withStatedPins(structuredClone(banked!.record), parsed!.record));
-    else unseated.push(rootGuid);
   }
-  if (unseated.length) markStale(world, bank.by, unseated);
 }

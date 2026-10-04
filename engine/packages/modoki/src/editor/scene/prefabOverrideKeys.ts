@@ -31,7 +31,7 @@ import { getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegist
 import { readTraitData, getAllEntities } from '../../runtime/core/ecs/entityUtils';
 import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
-import { getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../instance/instanceOverrideView';
 import { isTemplateExcludedField, type PrefabFile } from './prefab';
 import { getCachedPrefabSync } from './prefabCache';
 import { baseTokenResolver } from './prefabTokens';
@@ -163,7 +163,7 @@ export function collectInstanceOverrideTree(rootInstanceId: number, prefab: Pref
     // Only what the save writes (#1717): the member's record (`recordedOverrides`), so a value that differs with no record
     // is neither listed nor applied, and a recorded value equal to its base is listed, as the save keeps it (#1914).
     const valueDiffs = getOverrideValues(localId, currentTraits, base, resolveBase);
-    const diffs = recordedOverrides(valueDiffs, getOverrideMarkSet(entity), rowAt(base, localId), () => movedOf(ecsId, !!valueDiffs['Transform']), currentTraits);
+    const diffs = recordedOverrides(valueDiffs, overrideKeysOf(entity), rowAt(base, localId), () => movedOf(ecsId, !!valueDiffs['Transform']), currentTraits);
     if (Object.keys(diffs).length === 0) return;
 
     // Entity display name: prefer live EntityAttributes.name; fall back to prefab name.

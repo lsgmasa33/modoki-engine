@@ -9,6 +9,7 @@
  *     per-copy override on the nested child (the design plan's "risk R3", fixed). */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { record, clearRecorded } from '../helpers/recordedView';
 import { setRunMode as setRunModeForAuthoring } from '../../src/runtime/core/playState';
 import { createWorld, trait } from 'koota';
 
@@ -70,7 +71,12 @@ function deleteEntitiesImpl(ids: number[]) {
   for (const id of toDelete) { index.get(id)?.destroy(); index.delete(id); }
 }
 
-vi.mock('../../src/runtime/core/ecs/world', () => ({
+// The record's override list, stated by the test (a fake ECS has no record store): `../helpers/recordedView.ts`.
+vi.mock('../../src/editor/instance/instanceOverrideView', async (orig) =>
+  (await import('../helpers/recordedView')).withRecordedView(await orig()));
+vi.mock('../../src/runtime/core/ecs/world', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),
@@ -80,7 +86,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   unregisterEntity: (e: any) => index.delete(e.id()),
   destroyEntity: (e: any) => { ((e: any) => index.delete(e.id()))(e); e.destroy(); },
 }));
-vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
   // The pre-capture snapshot of the tree's unkeyed nodes (#1884, `capturedKeys.ts`).
   captureEntityIdentity: () => () => true,
   getAllEntities: () => getAllEntitiesImpl(),
@@ -110,7 +117,9 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
 }));
 vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(), getCachedPrefab: () => undefined }));
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
-  newGuid: () => 'gen-guid',
+  onFontInvalidated: () => () => {},
+  // Distinct per mint: two instances' records are keyed by their root guids, so one shared guid would merge them.
+  newGuid: (() => { let n = 0; return () => `aaaaaaaa-0000-4000-8000-${String(++n).padStart(12, '0')}`; })(),
   registerAsset: vi.fn(),
   getGuidForPath: () => undefined,
   isGuid: (s: string) => typeof s === 'string' && s.includes('-'),
@@ -124,8 +133,7 @@ global.fetch = vi.fn(async () => ({ ok: true, json: async () => ({}) }));
 beforeEach(async () => {
   testWorld = createWorld();
   index.clear();
-  const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
-  clearAllOverrideMarks();
+  clearRecorded();
 });
 const getModule = () => Promise.all([import('../../src/editor/scene/prefabApply'), import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate'), import('../../src/editor/scene/prefabSerialize')]).then(([m0, m1, m2, m3]) => ({ ...m0, ...m1, ...m2, ...m3 }));
 
@@ -187,7 +195,6 @@ describe('nested override serialization', () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource, serializePrefab } = await getModule();
     setPrefabCache(INNER, innerPrefab as any);
     setPrefabCache(OUTER, outerPrefab as any);
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
 
     const outerRoot = instantiatePrefab(outerPrefab as any);
     setPrefabSource(outerRoot, { id: OUTER });
@@ -195,7 +202,7 @@ describe('nested override serialization', () => {
     // Override the nested child I2's Transform.x on THIS instance only.
     const innerRoot = innerRootUnder();
     const i2 = memberByLocal(innerRoot, 2);
-    writeTraitFieldImpl(i2, TRAITS[0], 'x', 5); markOverride(index.get(i2), 'Transform', 'x');
+    writeTraitFieldImpl(i2, TRAITS[0], 'x', 5); record(index.get(i2), 'Transform', 'x');
 
     const out = serializePrefab(outerRoot, OUTER)!;
     const ref = out.entities.find((e) => e.prefab)!;
@@ -214,22 +221,23 @@ describe('inner-prefab edit refreshes all inner copies, preserving per-copy over
     const { instantiatePrefab, setPrefabCache, setPrefabSource, applyToPrefabSelective } = await getModule();
     setPrefabCache(INNER, innerPrefab as any);
     setPrefabCache(OUTER, outerPrefab as any);
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
 
     // Two independent outer instances → two inner copies.
     const outerA = instantiatePrefab(outerPrefab as any); setPrefabSource(outerA, { id: OUTER });
+    await placed(outerA); // the editor drop's door: a durable root guid, and its record (#2001 S8b)
     const m2A = memberByLocal(outerA, 2);
     const outerB = instantiatePrefab(outerPrefab as any); setPrefabSource(outerB, { id: OUTER });
+    await placed(outerB);
 
     // Copy A: override the nested child I2.x = 5.
     const innerA = innerRootUnder(m2A);
     const i2A = memberByLocal(innerA, 2);
-    writeTraitFieldImpl(i2A, TRAITS[0], 'x', 5); markOverride(index.get(i2A), 'Transform', 'x');
+    writeTraitFieldImpl(i2A, TRAITS[0], 'x', 5); record(index.get(i2A), 'Transform', 'x'); await edited(i2A); // through the door: the record holds it
 
     // Edit the INNER prefab base (via copy B's root I1.x = 9) and apply → this
     // rewrites the inner prefab and refreshes BOTH inner copies.
     const innerB = innerRootUnder(memberByLocal(outerB, 2));
-    writeTraitFieldImpl(innerB, TRAITS[0], 'x', 9); markOverride(index.get(innerB), 'Transform', 'x');
+    writeTraitFieldImpl(innerB, TRAITS[0], 'x', 9); record(index.get(innerB), 'Transform', 'x'); await edited(innerB);
     await applyToPrefabSelective(innerB, new Set(['1.Transform.x']));
 
     // Still exactly two inner copies (two I1 roots, two I2 children) — no orphan/dup.
@@ -251,17 +259,17 @@ describe('outer-prefab edit rebuilds the instance (risk R3: nested live override
     const { instantiatePrefab, setPrefabCache, setPrefabSource, applyToPrefabSelective } = await getModule();
     setPrefabCache(INNER, innerPrefab as any);
     setPrefabCache(OUTER, outerPrefab as any);
-    const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
 
     const outerRoot = instantiatePrefab(outerPrefab as any); setPrefabSource(outerRoot, { id: OUTER });
+    await placed(outerRoot); // the editor drop's door: a durable root guid, and its record (#2001 S8b)
     const m2 = memberByLocal(outerRoot, 2);
 
     // Live per-copy override on the nested child, plus an outer-member edit to apply.
     const innerRoot = innerRootUnder(m2);
     const i2 = memberByLocal(innerRoot, 2);
-    writeTraitFieldImpl(i2, TRAITS[0], 'x', 5); markOverride(index.get(i2), 'Transform', 'x');
+    writeTraitFieldImpl(i2, TRAITS[0], 'x', 5); record(index.get(i2), 'Transform', 'x'); await edited(i2); // through the door: the record holds it
     const m1 = memberByLocal(outerRoot, 1);
-    writeTraitFieldImpl(m1, TRAITS[0], 'x', 7); markOverride(index.get(m1), 'Transform', 'x');
+    writeTraitFieldImpl(m1, TRAITS[0], 'x', 7); record(index.get(m1), 'Transform', 'x'); await edited(m1);
 
     const rootBefore = index.get(outerRoot);
     await applyToPrefabSelective(outerRoot, new Set(['1.Transform.x']));
@@ -272,13 +280,8 @@ describe('outer-prefab edit rebuilds the instance (risk R3: nested live override
     expect(xsNamed('I1')).toHaveLength(1);
     expect(xsNamed('I2')).toHaveLength(1);
     const newRoot = (() => { let r = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { const p = pi as any; if (p.source === OUTER && p.rootInstanceId === e.id()) r = e.id(); }); return r; })();
-    // The APPLY's refresh rebuilt it, not only the commit's rebase: that refresh alone takes the applied field out of the
-    // clicked instance's override marks (#1469). Without this every assertion here also held with Apply's
-    // `refreshInstances` skipped, since the commit's `rebaseStaleInstances` rebuilds the frame anyway, applied mark and
-    // all (#1877). Mutation: skip `refreshInstances` in `commitApplyPlan` (`prefabApply.ts`).
+    // The Apply rebuilt the instance (#1469, #1877).
     expect(index.get(newRoot)).not.toBe(rootBefore);
-    const newM1 = memberByLocal(newRoot, 1);
-    expect([...(getOverrideMarkSet(index.get(newM1)) ?? [])]).not.toContain('Transform.x');
     const newM2 = memberByLocal(newRoot, 2);
     const newInner = innerRootUnder(newM2);
     expect(newInner).toBeGreaterThan(0); // nested copy hangs under the rebuilt M2
@@ -288,3 +291,14 @@ describe('outer-prefab edit rebuilds the instance (risk R3: nested live override
     expect(xsNamed('I2')).toEqual([5]);
   });
 });
+
+async function placed(root: number): Promise<void> {
+  const { ensureGuid } = await import('../../src/editor/undo/entityRef');
+  const { place } = await import('../../src/editor/instance/instanceEdits');
+  ensureGuid(root); place(root);
+}
+
+async function edited(id: number): Promise<void> {
+  const { setFields } = await import('../../src/editor/instance/instanceEdits');
+  setFields(id, 'Transform', ['x']);
+}

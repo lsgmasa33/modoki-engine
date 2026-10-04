@@ -22,6 +22,7 @@
  *  (`applyOverridesByRootInstance`) had no caller left and was deleted in #1914 R8, with its tests here. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { record, clearRecorded } from '../helpers/recordedView';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
@@ -75,7 +76,12 @@ function writeTraitFieldImpl(id: number, meta: any, field: string, value: unknow
   e.set(meta.trait, { ...e.get(meta.trait), [field]: value });
 }
 
+// The record's override list, stated by the test (a fake ECS has no record store): `../helpers/recordedView.ts`.
+vi.mock('../../src/editor/instance/instanceOverrideView', async (orig) =>
+  (await import('../helpers/recordedView')).withRecordedView(await orig()));
+beforeEach(() => clearRecorded());
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),
@@ -101,8 +107,6 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab
 beforeEach(async () => {
   testWorld = createWorld();
   index.clear();
-  const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
-  clearAllOverrideMarks();
 });
 
 const getModule = () => Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstanceOverrides'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
@@ -128,7 +132,6 @@ const animatorPrefab = () => ({
 /** An instance whose ROOT holds `fields` as a load leaves its recorded overrides: written, and recorded. */
 async function instanceWithOverrides(fields: Record<string, Record<string, unknown>>) {
   const { instantiatePrefab, setPrefabCache, setPrefabSource } = await getModule();
-  const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
   const prefab = animatorPrefab();
   setPrefabCache(CHILD, prefab as any);
   const root = instantiatePrefab(prefab as any);
@@ -137,7 +140,7 @@ async function instanceWithOverrides(fields: Record<string, Record<string, unkno
     const meta = TRAITS.find((t) => t.name === traitName)!;
     for (const [field, value] of Object.entries(values)) {
       writeTraitFieldImpl(root, meta, field, value);
-      markOverride(index.get(root), traitName, field);
+      record(index.get(root), traitName, field);
     }
   }
   return { root, prefab };
@@ -156,8 +159,7 @@ describe('overrides over SoA fields absent from meta.fields', () => {
     const { root, prefab } = await instanceWithOverrides({ Animator: { clip: 'skin' } });
     // Runtime read-back advances during play; it must not become an override.
     writeTraitFieldImpl(root, TRAITS[3], 'activeClip', 'skin');
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
-    markOverride(index.get(root), 'Animator', 'activeClip'); // even a stray mark must not persist it
+    record(index.get(root), 'Animator', 'activeClip'); // even a stray mark must not persist it
     const { captureInstanceOverrides } = await getModule();
     const captured = captureInstanceOverrides(root, prefab as any);
     expect(captured[1]?.Animator).not.toHaveProperty('activeClip');

@@ -20,13 +20,13 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo } from '@modoki/engine/editor';
 import { addTraitToEntitiesWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { buildPrefabEditScene, serializePrefabEditWorld, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
+import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { applyToPrefabSelective, previewApply } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { registerTrait } from '../../packages/modoki/src/runtime/core/ecs/traitRegistry';
 import { trait as kootaTrait } from 'koota';
@@ -38,6 +38,8 @@ import { liveMissingSource, missingComponentRows } from '../../packages/modoki/s
 import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { damagedPrefabReason } from '../../packages/modoki/src/runtime/core/damagedPrefabs';
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
+import { dropInstanceRecord, storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { whyWorldNotAuthored } from '../../packages/modoki/src/editor/scene/authoredWorld';
 import { instanceUnusedOverrides } from '../../packages/modoki/src/editor/scene/unusedOverrides';
 import { validateSceneData } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { collectInstanceOverrideListing } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
@@ -126,7 +128,6 @@ beforeEach(async () => {
   setRunMode('stopped');
   clearHistory();
   prefabs.clear();
-  clearKeptMemberOrphans();
   clearReservedLocalIds();
   install(pDoc());
 });
@@ -214,14 +215,20 @@ describe('a scene-added reference node\'s unused records are written back (#1914
 });
 
 describe('a prefab-edit save writes a reference ROW\'s unused records back (#1914 R4)', () => {
+  // The prefab-edit world is known by its path (`isPrefabEditWorld`), as the editor's is: its rows are written from their
+  // records (#2001 S8b step 5).
+  let editWorld: { mockRestore(): void } | undefined;
+  afterEach(() => { editWorld?.mockRestore(); editWorld = undefined; });
   const openInEditor = async (doc: PrefabFile): Promise<number> => {
     install(doc);
+    editWorld = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: `/__prefab-edit__/${doc.id}` } as never);
     await load(buildPrefabEditScene(doc) as SceneData);
     return getAllEntities().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!.id;
   };
   const nRow = (p: PrefabFile) => p.entities.find((e) => e.prefab === P)! as unknown as Record<string, unknown>;
 
-  // Mutation: in `captureRowChannels`, merge no unused part (drop the `withKeptUnused` line) — N's row loses B's field.
+  // Mutation (before #2001 S8b deleted the kept stores): in `captureRowChannels`, merge no unused part (drop the
+  // `withKeptUnused` line) — N's row loses B's field. The record holds the field now.
   it('a field no schema declares on a member row of N', async () => {
     const root = await openInEditor(oDoc({ members: { [`/${g(3)}`]: { traits: { Transform: { retiredField: 7 } } } } }));
     const out = serializePrefab(root, O)!;
@@ -233,6 +240,20 @@ describe('a prefab-edit save writes a reference ROW\'s unused records back (#191
     const root = await openInEditor(oDoc({ overrides: { 9: { Transform: { x: 9 } } } }));
     const out = serializePrefab(root, O)!;
     expect(nRow(out).overrides).toMatchObject({ 9: { Transform: { x: 9 } } });
+  });
+
+  // #2001 S8b review L1: a row of the open document with no record to write it from refuses the prefab save, as the scene
+  // save does. Before, it fell to the capture, which cannot state an unused part: N's row lost B's field, unsaid.
+  // Mutation: drop the refusal in `serializePrefabBody` (prefabSerialize.ts) — the save writes, red at 'refused'.
+  it('a row with no record refuses the prefab save and marks the world unsavable, writing nothing', async () => {
+    await openInEditor(oDoc({ members: { [`/${g(3)}`]: { traits: { Transform: { retiredField: 7 } } } } }));
+    const n = [...storedInstances(getCurrentWorld())].find(([, st]) => st.record.source === P)![0];
+    dropInstanceRecord(getCurrentWorld(), n);
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const out = serializePrefabEditWorld(O);
+    errors.mockRestore();
+    expect('error' in out ? out.error : 'written', 'refused').toMatch(/^instance "R" .*has no instance record to write/);
+    expect(whyWorldNotAuthored(), 'every writer of the live world refuses').toMatch(/no record to write/);
   });
 });
 
@@ -275,8 +296,7 @@ describe('the Apply/Revert dialog counts the unused overrides an instance keeps 
   const rootId = () => getAllEntities().find((e) => e.guid === ROOT1)!.id;
   const count = () => collectInstanceOverrideListing(rootId(), prefabs.get(P) as PrefabFile).unusedOverrides;
 
-  // Mutations: count a row's `guid` and `name` (`rowRecords` skips them) — 8; count no legacy channel (`legacyRecords`
-  // returns 0) — 4; count no orphan row — 5.
+  // Mutation: leave `unregistered` out of the counted causes — red (B's RetiredTrait).
   it('one per statement, of every kept kind; a row\'s identity is not an override', async () => {
     await load(scene({
       members: {
@@ -291,13 +311,12 @@ describe('the Apply/Revert dialog counts the unused overrides an instance keeps 
     expect(count()).toBe(6);
   });
 
-  // Mutation: count every kept part (`liveKeptUnused` keeps the part of a member that is not live) — 3.
+  // The member deleted by the editor's delete, which records the removal (#2001 S8b: the count reads the record, which a
+  // raw destroy never told). Mutation: count records under a removed row (`underRemoved` answers false) — 1.
   it('a member the instance deleted takes its records with it', async () => {
     await load(scene({ members: { [`/${g(3)}`]: { traits: { RetiredTrait: { speed: 2 } }, traitRemovals: { Rotate3D: true } } } }));
     expect(count()).toBe(2);
-    const world = getCurrentWorld();
-    const b = getAllEntities().find((e) => e.name === 'B')!.id;
-    for (const e of world.entities) if (e.id() === b) { destroyEntity(e, world); break; }
+    deleteEntitiesWithUndo([getAllEntities().find((e) => e.name === 'B')!.id]);
     expect(count()).toBe(0);
   });
 
@@ -471,9 +490,9 @@ describe('the #1914 close-out\'s untested carriers (#1933)', () => {
     expect(again.map((n) => n.members?.[`/${h(13)}`]?.parent)).toEqual([OTHER]);
   });
 
-  // Gap 2: `withKeptLegacy`'s `nestedOverrides` merge (#1914 R4) — a pre-v5 P has no nodeGuid, so N's members keep the
+  // Gap 2: `withKeptLegacy`'s `nestedOverrides` merge (#1914 R4; the record holds the channel since #2001 S8b) — a pre-v5 P has no nodeGuid, so N's members keep the
   // legacy path channel, and a live capture of N's frame meets the record the load kept as unused in that same frame.
-  // Mutation: merge path-level (`{ ...kept.nestedOverrides, ...channels.nestedOverrides }`) — B's retiredField and
+  // Mutation (before #2001 S8b deleted the kept stores): merge path-level (`{ ...kept.nestedOverrides, ...channels.nestedOverrides }`) — B's retiredField and
   // localId 9 go once B is edited. (Which side wins a leaf is not observable here: the kept part holds only what no live
   // capture can state, so the two never meet on one field.)
   it('gap 2: a live edit and a kept unused record in one legacy nested frame merge leaf by leaf', async () => {
@@ -529,7 +548,7 @@ describe('a localId a kept legacy record names is never handed out again (#1933 
   // P (v5, no `nextLocalId`) once had member 4; the scene still states it.
   const withGoneFour = () => scene({ overrides: { 4: { Transform: { x: 9 } } } });
 
-  // Mutation: drop the reservation in `unusedLocalRecords`' `has` — the counter reads 4.
+  // Mutation: drop the reservation in the parse (`parseInstanceRecord`'s `lidKey`) — the counter reads 4.
   it('the counter mints past it once a scene stating it is loaded', async () => {
     expect(localIdCounter(prefabs.get(P) as PrefabFile)).toBe(4);
     await load(withGoneFour());
@@ -538,7 +557,7 @@ describe('a localId a kept legacy record names is never handed out again (#1933 
 
   // The PATH-keyed channels (#1933 close-out review): a `nestedOverrides` key naming a frame row O no longer has is kept
   // whole, and its number reserved too, or a new reference row at 3 would expand a frame the record lands in. Mutation:
-  // drop the reservation in `legacyPathDoc` — the counter stays 3.
+  // drop the `onGone` reservation in the parse (`frameAtPath`'s caller) — the counter stays 3.
   it('a nested channel naming a gone frame row reserves that row\'s number', async () => {
     const o = oDoc({}) as unknown as { version: number; entities: unknown[] };
     o.version = 4; // before the mark: rows 1 and 2 only, so the counter derives 3
@@ -703,12 +722,10 @@ describe('a field recorded on a tag is kept as unused (#1933 L2)', () => {
   });
 });
 
-/** #1933 L1 / #1938 C-B step 3: the dialog's count reads the save's own projection (`unusedForSave`), so a kept legacy
- *  removal the member carries the component of again is neither written nor counted. */
+/** #1933 L1 / #1938 C-B step 3: a kept legacy removal the member carries the component of again is neither written nor
+ *  counted. The count reads the record (#2001 S8b), which the save writes, so the two agree. */
 describe('the count states what the save writes: a kept legacy removal of a component the member carries again (#1933 L1)', () => {
   const count = () => collectInstanceOverrideListing(getAllEntities().find((e) => e.guid === ROOT1)!.id, prefabs.get(P) as PrefabFile).unusedOverrides;
-  // Mutations: the count reads the legacy store raw (`legacyRecords(keptLegacyChannels(rootGuid))`) — red on the count
-  // after Add Component; drop the carried filter from `unusedForSave` — red on the count AND on the save.
   for (const version of [5, 4]) {
     it(`v${version} prefab: after Add Component the count is 0, the save writes no removal, and a reload counts 0`, async () => {
       install(pDoc((d) => { d.version = version; }));
@@ -799,6 +816,27 @@ describe('an unregistered component on an ordinary entity survives a save (#1933
     expect(plainOf(await saved()).traits.RetiredTraitN1bR).toEqual({ speed: 3, nested: { k: [1] } });
     await redo();
     expect(plainOf(await saved()).traits.RetiredTraitN1bR).toBeUndefined();
+  });
+
+  // #2001 S8b: on an instance ROOT the record holds the component too (its `/` row, where the parse keeps a root entry's
+  // extra components), and the save writes the record. Before, Remove emptied only the side table and the next save wrote
+  // the component back; the undo and redo then marked every record stale, and only the redo's re-seed dropped it.
+  // Mutations: skip `instanceEdits.dropMissingComponent` in the Remove — save 1 keeps it; drop the undo's seat
+  // (`seatAround` → plain `revert`) — the undone save lacks it.
+  it('#1944 on an instance root: Remove drops it from the record, undo puts it back, redo drops it again', async () => {
+    await load(scene({ traits: { EntityAttributes: { name: 'Inst', parentId: 0 }, RetiredRootN1b: { speed: 1, k: [2] } } }));
+    const id = getAllEntities().find((e) => e.guid === ROOT1)!.id;
+    const kept = async () => JSON.stringify(entryOf(await saved())).includes('"RetiredRootN1b":{"speed":1,"k":[2]}');
+    expect(await kept(), 'the load reads it into the record').toBe(true);
+    expect(removeMissingComponentWithUndo([id], 'RetiredRootN1b')).toBeNull();
+    expect(await kept()).toBe(false);
+    const { undo, redo } = await import('../../packages/modoki/src/editor/undo/undoManager');
+    await undo();
+    expect(await kept()).toBe(true);
+    await redo();
+    expect(await kept()).toBe(false);
+    await undo();
+    expect(await kept()).toBe(true);
   });
 
   // Mutations: drop `missing` from snapshotEntity — the copy has no row and saves without it; record nothing in
@@ -916,8 +954,9 @@ describe('a value in a shape no reader takes is kept as written (#1933 S3)', () 
     ['entry added a node with no traits', { added: [{ parentLocalId: 1, guid: NODE, name: 'Bare', children: [] }] }, ['added']],
   ];
   // Mutations: hand the entry to the settle unsplit (`entryRowsOf` keeps `entry`) — E8 crashes the load, the rest drop;
-  // keep nothing (`keepUnusedLegacy` drops `malformed`) — every case drops; never write it back (`withMalformedBack`
-  // returns the owner) — every case drops.
+  // the record's write-back off (`putHeld` skips `held.unparsed`) — every case drops; the count leaves the held values
+  // out — every case red on "counted". Since #2001 S8b the record alone holds and counts them
+  // (the kept-store copies, `keepUnusedLegacy` and `withMalformedBack`, are deleted).
   for (const [name, extra, path] of cases) {
     it(`${name}: kept verbatim, warned once, counted, and byte-stable`, async () => {
       await load(scene(extra));
@@ -949,6 +988,36 @@ describe('a value in a shape no reader takes is kept as written (#1933 S3)', () 
     const node = { parentLocalId: 1, guid: NODE, prefab: P, name: 'Ref', traits: { EntityAttributes: { name: 'Ref', parentId: 0, guid: NODE } }, children: [], removed: 'x4242' };
     const s = await twoSaves(scene({ added: [node] }));
     expect(JSON.stringify(entryOf(s))).toContain('"removed":"x4242"');
+  });
+
+  // #2012: a reference node carrying a template KEY and no guid is a supplied node of its frame with no record of its own
+  // (`recordsOf`): what it states is its owner's, on `<frame>/a+<key>` rows, and what it held of its own is its owner's
+  // `held.keyedNodeHeld`. A prefab document cannot hold one with a malformed value (admission refuses it), so the case is
+  // a scene file a hand or agent edit wrote. The first save writes the node's derived guid, and the reload reads it as a
+  // reference node with a record of its own (measured: so the second save is not byte-stable even with no value held);
+  // the value must survive both. Before #2012 the load crashed on it (`keepTemplateNodeOrphans`, deleted in #2001 S8b, read the channel unsplit).
+  // Mutations: recordsOf fills no keyedNodeHeld -> the count and the first save miss it; the writer puts none back -> the
+  // first save drops it; the count leaves a keyed node's held values out -> the count red.
+  it('a template-keyed reference node\'s own malformed value (no guid): kept on the node through two saves', async () => {
+    const node = { parentLocalId: 1, guid: '', key: 'k-r', prefab: P, name: 'Ref', traits: { EntityAttributes: { name: 'Ref', parentId: 0 } }, children: [], removed: 'x4242' };
+    await load(scene({ added: [node] }));
+    expect(instanceUnusedOverrides(getAllEntities().find((e) => e.guid === ROOT1)!.id), 'counted on its owner').toBe(1);
+    const s1 = await saved();
+    const keyed = (s: SceneData) => (entryOf(s).members as Record<string, { own?: Array<Record<string, unknown>> }>)['/']?.own?.find((n) => n.key === 'k-r');
+    expect(keyed(s1)?.removed, 'kept on the node').toBe('x4242');
+    await load(s1);
+    expect(keyed(await saved())?.removed).toBe('x4242');
+  });
+
+  // The same node stating its guid is a reference node with a record of its own (`keyedNodeFrame` is a guid-less node's):
+  // its value is held on that record, and the save is byte-stable.
+  it('a reference node stating a template key AND its guid: its own malformed value kept on the node, and byte-stable', async () => {
+    const node = { parentLocalId: 1, guid: NODE, key: 'k-r', prefab: P, name: 'Ref', traits: { EntityAttributes: { name: 'Ref', parentId: 0, guid: NODE } }, children: [], removed: 'x4242' };
+    await load(scene({ added: [node] }));
+    const s1 = await saved();
+    expect(JSON.stringify(entryOf(s1)), 'kept on the node').toContain('"removed":"x4242"');
+    await load(s1);
+    expect(JSON.stringify((await saved()).entities)).toBe(JSON.stringify(s1.entities));
   });
 
   // Close-out review #2. Mutations: hand the expansion the entry unsplit (`onInstantiatePrefab` gets `entry`'s channels) —
@@ -1017,7 +1086,7 @@ describe('a reached slot\'s records with no target are kept (#1933 S4)', () => {
     expect(JSON.stringify(s2.entities)).toBe(JSON.stringify(s1.entities));
   });
 
-  // Mutation: no merge before the move onto rows (`withKeptSlots` returns the live slots, nothing merged) — the kept slot
+  // Mutation (before #2001 S8b deleted the kept stores): no merge before the move onto rows (`withKeptSlots` returns the live slots, nothing merged) — the kept slot
   // goes in bare after it, replaces the frame's lists, and A gets back the Rotate3D O's row removes.
   it('a kept-only record beside the row\'s own removedTraits: A keeps its removal across save and reload', async () => {
     install(oDoc(ROT_REMOVED_ON_A));

@@ -33,11 +33,10 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 }));
 
 import {
-  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData, writeTraitField,
+  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { setActionCallback, pushAction, clearHistory, createEntityWithUndo, ensureGuid } from '@modoki/engine/editor';
 import { isRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
@@ -45,6 +44,7 @@ import {
   setPrefabCache, getCachedPrefabSync, setPrefabSource,
 } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { place } from '../../packages/modoki/src/editor/instance/instanceEdits';
 import { applyToPrefabSelective, previewApply } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { carryPromotedGuidsForTest } from '../../packages/modoki/src/editor/scene/prefabApplyStructure';
 import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
@@ -151,7 +151,6 @@ beforeEach(() => {
   clearHistory();
   writes.length = 0;
   prefabs.clear();
-  clearKeptMemberOrphans();
   vi.stubGlobal('fetch', async () => ({ ok: true, json: async () => ({ files: [] }), text: async () => '' }));
 });
 afterAll(() => { for (const id of [P, Q]) setPrefabCache(id, null); vi.unstubAllGlobals(); getCurrentWorld()?.destroy(); });
@@ -206,6 +205,7 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     expect(qRoot).toBeTruthy();
     setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
+    place(qRoot); // the drop's door: ROOT1's record links the new instance, as a drop's does
     await load(await serializeScene() as unknown as SceneData);
     const r1 = idOf(ROOT1);
     const qbGuid = guidOf(under(qRootGuid, 'QB'));
@@ -246,6 +246,7 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
     setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
+    place(qRoot); // the drop's door: ROOT1's record links the new instance, as a drop's does
     await load(await serializeScene() as unknown as SceneData);
     const r1 = idOf(ROOT1);
     const qbGuid = guidOf(under(qRootGuid, 'QB'));
@@ -370,6 +371,7 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
     setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
+    place(qRoot); // the drop's door: ROOT1's record links the new instance, as a drop's does
     await load(await serializeScene() as unknown as SceneData);
     const inner = add('Add Inner', idOf(qRootGuid), [{ name: 'EntityAttributes', data: { name: 'Inner', parentId: idOf(qRootGuid) } }]);
     const entityOf = (id: number) => getCurrentWorld().entities.find((e) => e.id() === id);
@@ -406,15 +408,15 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
     setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
+    place(qRoot); // the drop's door: ROOT1's record links the new instance, as a drop's does
     await load(await serializeScene() as unknown as SceneData);
     const inner = add('Add Inner', idOf(qRootGuid), [{ name: 'EntityAttributes', data: { name: 'Inner', parentId: idOf(qRootGuid) } }]);
     const entityOf = (id: number) => getCurrentWorld().entities.find((e) => e.id() === id);
     const added = under(qRootGuid, 'QA');
     const [qa1, qa2] = getAllEntities().filter((e) => e.name === 'QA' && e.id !== added).map((e) => e.id);
-    writeTraitField(qa1!, meta('Transform'), 'x', 5);
-    markOverride(entityOf(qa1!)!, 'Transform', 'x');
-    writeTraitField(qa2!, meta('Transform'), 'x', 9);
-    markOverride(entityOf(qa2!)!, 'Transform', 'x');
+    // Through the door, which records each override (#2001 S8b: the listing reads the record).
+    writeTraitFieldWithUndo(qa1!, meta('Transform'), 'x', 5);
+    writeTraitFieldWithUndo(qa2!, meta('Transform'), 'x', 9);
     const r1 = idOf(ROOT1);
     const keys = collectInstanceOverrideKeys(r1, getCachedPrefabSync(P2) as PrefabFile);
     expect([keys.added.length, keys.nested.length]).toEqual([1, 2]); // precondition
@@ -434,6 +436,7 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
     setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
+    place(qRoot); // the drop's door: ROOT1's record links the new instance, as a drop's does
     await load(await serializeScene() as unknown as SceneData);
     const inner = add('Add Inner', idOf(qRootGuid), [{ name: 'EntityAttributes', data: { name: 'Inner', parentId: idOf(qRootGuid) } }]);
     const innerGuid = guidOf(inner);
@@ -472,9 +475,11 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
     setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
+    place(qRoot); // the drop's door: ROOT1's record links the new instance, as a drop's does
     const rRoot = instantiatePrefab(getCachedPrefabSync(R) as PrefabFile, under(qRootGuid, 'QA'));
     setPrefabSource(rRoot, { id: R });
     const rRootGuid = ensureGuid(rRoot);
+    place(rRoot); // the second drop's door, as the first's
     await load(await serializeScene() as unknown as SceneData);
     const raGuid = guidOf(under(rRootGuid, 'RA'));
     const holder = idOf(HOLDER);
@@ -537,6 +542,7 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, idOf(ROOT1));
     setPrefabSource(qRoot, { id: Q });
     const qRootGuid = ensureGuid(qRoot);
+    place(qRoot); // the drop's door: ROOT1's record links the new instance, as a drop's does
     expect(isRuntimeGuid(guidOf(under(qRootGuid, 'QB')))).toBe(true); // precondition
     const r1 = idOf(ROOT1);
     const keys = collectInstanceOverrideKeys(r1, getCachedPrefabSync(P) as PrefabFile);

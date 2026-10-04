@@ -41,6 +41,7 @@ function readTraitDataImpl(id: number, meta: any) {
 }
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: () => () => {},
   // #1461: tagEntityTreeAsInstance now stamps member guids, and applyGuidRemap re-indexes each
   // renamed entity. This mock is an explicit list, so a new reachable export must be named here.
   indexEntityGuid: () => {},

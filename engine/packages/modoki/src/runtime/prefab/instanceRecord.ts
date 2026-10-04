@@ -146,6 +146,10 @@ export interface Placement {
   editorFolder?: string;
   /** Base-scene provenance: the scene FILE that saves this root (`EntityAttributes.sourceScene`). */
   sourceScene?: string;
+  /** The root's order is a RECORD of this list: its `"/"` row states it, or an edit set it.
+   *  What a template row states, which the prefab editor's save writes back (a template states a row's place in the row,
+   *  so only where it does). A scene root records its order always (F7) and does not read this. */
+  orderStated?: true;
 }
 
 /** A scene-owned added node's content, as the scene file states it (an inline node in `own`/`added`). */
@@ -180,6 +184,10 @@ export interface HeldData {
    *  scene content, never overrides — Remove Unused, Detach and unpack never delete them; unpack re-homes
    *  them under the unpacked root (§ 10.4, review L6). */
   heldOwn?: Map<RowKey, SceneOwnedNode[]>;
+  /** What a template-KEYED reference node this owner states (`recordsOf`) held of its own, by the `<frame>/a+<key>` row
+   *  key its interior is stated under: such a node has no record to hold it, so its owner does, and the writer puts it
+   *  back on the node (#2012). */
+  keyedNodeHeld?: Map<RowKey, TemplateHeldData>;
   /** A v19 file held `embeddedPrefabs` (§ 5.4, owner ruling B). Not read for expansion; a validator
    *  note only; dropped at the next save. */
   ignoredCopies?: true;

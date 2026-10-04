@@ -4,6 +4,7 @@
  *  NOT snap back to the prefab's name. Other members keep the prefab name. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { record, clearRecorded } from '../helpers/recordedView';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
@@ -37,7 +38,12 @@ function readTraitDataImpl(id: number, meta: any) {
   return out;
 }
 
+// The record's override list, stated by the test (a fake ECS has no record store): `../helpers/recordedView.ts`.
+vi.mock('../../src/editor/instance/instanceOverrideView', async (orig) =>
+  (await import('../helpers/recordedView')).withRecordedView(await orig()));
+beforeEach(() => clearRecorded());
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),
@@ -96,11 +102,10 @@ describe('EntityAttributes.name override on a prefab instance', () => {
     // Rename the child member (localId 2) on the live instance — mark it, exactly
     // as the editor's Hierarchy rename does (writeTraitFieldWithUndo → mark). An
     // override must be an explicit, marked edit, not a bare value divergence.
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     const child = getAllEntitiesImpl().find((e) => e.name === 'Flame')!;
     const e = index.get(child.id);
     e.set(EntityAttributes, { ...e.get(EntityAttributes), name: 'Flame Left' });
-    markOverride(index.get(child.id), 'EntityAttributes', 'name');
+    record(index.get(child.id), 'EntityAttributes', 'name');
 
     const ov = captureInstanceOverrides(root, prefab as any);
     expect(ov[2]?.EntityAttributes?.name).toBe('Flame Left');
@@ -135,7 +140,6 @@ describe('EntityAttributes.name override on a prefab instance', () => {
 
   it('DOES capture the same member when the user explicitly edited it (marked)', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource, captureInstanceOverrides } = await getModule();
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     setPrefabCache(P, prefab as any);
     const root = instantiatePrefab(prefab as any);
     setPrefabSource(root, { id: P });
@@ -144,7 +148,7 @@ describe('EntityAttributes.name override on a prefab instance', () => {
     const child = getAllEntitiesImpl().find((e) => e.name === 'Flame')!;
     const e = index.get(child.id);
     e.set(Transform, { ...e.get(Transform), x: 7 });
-    markOverride(index.get(child.id), 'Transform', 'x');
+    record(index.get(child.id), 'Transform', 'x');
 
     const ov = captureInstanceOverrides(root, prefab as any);
     expect(ov[2]?.Transform?.x).toBe(7);

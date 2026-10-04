@@ -17,6 +17,9 @@ import { newGuid, getGuidForPath, isGuid } from '../../runtime/loaders/assetMani
 import { mapStringValues, isStoredRoot, memberStepId, type MemberPi } from '../../runtime/core/assetRefRules';
 import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
 import { writeTemplateForm } from '../../runtime/prefab/templateFormDocument';
+import { recordToWrite, templateRowFromRecord } from '../instance/instanceTemplateRow';
+import { isPrefabEditWorld } from './prefabEditWorld';
+import { markWorldUnsavable, NO_RECORD_TO_WRITE, recordlessInstanceIn } from '../instance/instanceRollback';
 import type { PrefabDoc } from '../../runtime/prefab/instanceRecord';
 import { editorPrefabReader } from '../instance/instanceSync';
 import { localIdCounter, advanceLocalIdCounter } from '../../runtime/core/localIdCounter';
@@ -26,6 +29,7 @@ import {
   authoringEntitiesFor, collectTree, isTemplateExcludedField, type PrefabEntity, type PrefabFile,
 } from './prefab';
 import { wouldCreateCycle, getCachedPrefabSync } from './prefabCache';
+import { withCaptureKeys } from '../instance/instanceOverrideView';
 import {
   type NodeExits, templateTokenizer, withKeptStateBake, withNodeExits, withRewritingPrefab,
 } from './prefabTokens';
@@ -70,7 +74,9 @@ export function planPrefabRows(
         continue;
       }
       // TEMPLATE form: this is written into a prefab file (#1387).
-      const ref = captureInstanceReference(e.id, source, childPrefab, { template: true });
+      // A row its record writes (#2001 S8b step 5, `instanceTemplateRow.ts`) is captured read-only, for what it consumes.
+      const readOnly = !!recordToWrite(e.id);
+      const ref = captureInstanceReference(e.id, source, childPrefab, { template: true, readOnly });
       // The row is the OUTERMOST layer for its own nested rows within this file, so it carries their
       // edits itself — the same writer a scene entry and a reference node use (#1381). Captured from
       // the live expansion rather than passed through from the file, or an edit made in the prefab
@@ -78,7 +84,7 @@ export function planPrefabRows(
       // Each frame's structure per member and per node where it can be (#1533) — the scene writer's own split, so
       // an edit to one thing in a nested frame does not restate, and pin, what the inner prefabs put there. A frame
       // it cannot state that way stays whole in `nestedStructure`, compared by the no-op rule once tokenized.
-      const { channels, structureBaselines, nestedStructure, members, rowFrames } = captureRowChannels(e.id, source, childPrefab, ref, true);
+      const { channels, structureBaselines, nestedStructure, members, rowFrames } = captureRowChannels(e.id, source, childPrefab, ref, true, readOnly);
       nestedRefs.set(e.id, {
         ref, childPrefab, structureBaselines, nestedOverrides: channels.nestedOverrides,
         nestedStructure, ...(members ? { members } : {}), frames: channels.frames, ...(rowFrames ? { rowFrames } : {}),
@@ -307,6 +313,9 @@ function nodeGuidsFor(
   return Object.assign((ecsId: number) => carried.get(ecsId) ?? newGuid(), { carried: carried as ReadonlyMap<number, string> });
 }
 
+/** A prefab-edit row with no record to write it from: the prefab save refuses (`serializePrefabEditWorld`). */
+export class RecordlessRowError extends Error {}
+
 export function serializePrefab(
   selectedEntityId: number,
   existingId?: string,
@@ -314,8 +323,8 @@ export function serializePrefab(
 ): PrefabFile | null {
   // What the layers OUTSIDE the tree give its members is written into the new template's rows, as the tree showed it
   // (#1914): a layer's value is base, unmarked, and the capture reads marks. No-op in prefab edit (nothing encloses it).
-  return withRewritingPrefab(existingId, () => withKeptStateBake(!!opts?.bakeKeptState, () =>
-    withLeftBehindRecorded(selectedEntityId, () => serializePrefabBody(selectedEntityId, existingId, opts))));
+  return withCaptureKeys(selectedEntityId, () => withRewritingPrefab(existingId, () => withKeptStateBake(!!opts?.bakeKeptState, () =>
+    withLeftBehindRecorded(selectedEntityId, () => serializePrefabBody(selectedEntityId, existingId, opts)))));
 }
 
 function serializePrefabBody(
@@ -448,6 +457,33 @@ function serializePrefabBody(
     const nested = nestedRefs.get(entityInfo.id);
     if (nested) {
       const parentLocal = ecsToLocal.get(rowParent.get(entityInfo.id) ?? 0) || 0;
+      // The row is written from its record (#2001 S8b step 5, `instanceTemplateRow.ts`); the capture below is for a tree
+      // that holds no record.
+      // A reference node's ref out of its own root climbs as the plan's does (#1541): inside the written tree, or an exit marker.
+      const fromRecord = withNodeExits(exits, () => templateRowFromRecord(entityInfo.id, tokens));
+      if (fromRecord) {
+        tokens.adoptOrigins(exits.origins);
+        prefabEntities.push({
+          localId,
+          nodeGuid: nodeGuidOf(entityInfo.id),
+          name: entityInfo.name,
+          traits: { EntityAttributes: { name: entityInfo.name, parentId: parentLocal, guid: '' } },
+          prefab: nested.ref.source,
+          ...fromRecord.held,
+          ...(fromRecord.members ? { members: fromRecord.members } : {}),
+        } as PrefabEntity);
+        continue;
+      }
+      // A row of the document the prefab editor has open is written from its record, and one with none is refused, as the
+      // scene save refuses (`instanceSave.ts`): the capture below cannot state what only a record holds (an unused part, a
+      // held node, a held legacy statement), and wrote the row without it, unsaid (#2001 S8b review L1). Create Prefab in
+      // a scene still writes its rows from the capture.
+      if (isPrefabEditWorld()) {
+        const why = `${recordlessInstanceIn(entityInfo.id, true)} has no instance record to write`;
+        console.error(`[save] ${why}: the prefab save is refused, nothing is written, and the world is marked unsavable — reopen the prefab.`);
+        markWorldUnsavable(getCurrentWorld(), NO_RECORD_TO_WRITE);
+        throw new RecordlessRowError(why);
+      }
       const fin = finishRowChannels(tokens, entityInfo.id, nested);
       prefabEntities.push({
         localId,

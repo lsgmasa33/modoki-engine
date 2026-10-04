@@ -1475,7 +1475,8 @@ live world read node by node (`liveHierarchy` in `entityActions.ts`).
   `reparentEntity`, it reached agents as a success, a "nothing changed", or a half-applied call. The file route returns
   its own error. Unity calls zero scale "undefined results", so this is consistency, not
   parity.
-- **Marks, undo and redo follow the write.** `markCompensatedTransform` marks, on a stored instance root, each WRITTEN
+- **Records, undo and redo follow the write.** The reparent's record commit (`beginReparent` in
+  `instanceEdits.ts`, `markCompensatedTransform` before #2001 S8b) records, on a stored instance root, each WRITTEN
   key whose number changed, as Unity records an override only for a value that differs. A translation-only move of a
   mirrored root marks `x`/`y`; it used to pin the re-spelled `rz`/`sx`/`sy` as overrides, so later template rotation
   changes stopped reaching that instance. Undo restores only the written keys, so an edit made since to any other
@@ -1876,9 +1877,9 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   pin could not tell the difference, since a linked and an unpacked instance reload at the same
   paths; the tests now assert the link itself.
   A reparent keeps the world pose by rewriting the local Transform, and on an entity still linked to
-  an instance those values are OVERRIDES — which the save keeps only when marked. So
-  `reparentEntity` and `moveEntityToScene` mark the fields the compensation wrote and changed
-  (`markCompensatedTransform`, [§ A reparent keeps the world pose](#a-reparent-keeps-the-world-pose-writing-only-what-the-move-changes-1848)), and undo puts the prior marks back. Unmarked, a linked root dropped
+  an instance those values are OVERRIDES — which the save keeps only when recorded. So
+  `reparentEntity` and `moveEntityToScene` record the fields the compensation wrote and changed
+  (`beginReparent`, [§ A reparent keeps the world pose](#a-reparent-keeps-the-world-pose-writing-only-what-the-move-changes-1848)), and undo puts the prior record back. Unrecorded, a linked root dropped
   under a moved parent reloaded at the prefab's value, offset by the parent (#1436 review).
   A rebuild carries an owned root's `parentLocalId` across the respawn (the entry states it; `rebuildInstance` did it by hand before #1880 F7d). Without it, a
   refresh left the root unstamped, which the save reads as a user-added instance.
@@ -2052,16 +2053,11 @@ above reaches only an entry not yet migrated, of which the committed corpus now 
   is skipped while stopped), but a future one could. Conversely, mutating the object from
   `entity.get(Trait)` in place is not a write at all — **koota returns a copy** — so that pattern
   needs no coverage; it silently does nothing, which is its own bug when a game means it as one.
-- **Override marks are WORLD-scoped, not per-`loadSceneFile`-call.** A chain loads N
-  scene files into ONE staging world, so a per-call `clearAllOverrideMarks()` has the
-  primary wipe the marks the base just seeded — on *every* chain load, carry or not.
-  `loadSceneFile` takes `clearMarks` (default `true`, so every other caller is
-  unchanged); `SceneManager` clears once per staging world and passes `false` for its
-  chain and carry calls. Marks are keyed by the **packed entity** (#868), so a carried entity's
-  marks are read off its old-world entity and re-seeded onto the new one (`restoreOverrideMarks`),
-  and an editor respawn gets them from its `EntitySnapshot.marks` — never from whatever entity last
-  held the recycled index. Spawns still `clearOverrideMarks` first: nothing sweeps a dead entity's
-  marks before the swap, and koota's 8-bit generation repeats a packed value after 256 reuses.
+- **No override marks to carry (#2001 S8b).** A chain loads N scene files into ONE staging world, and the
+  override state used to be a per-entity mark store keyed by the packed entity (#868): a per-call clear wiped the
+  marks the base had just seeded, and every carry and editor respawn had to move them by hand. The store is deleted;
+  an instance's overrides are its record, keyed by its root's guid and parsed by each load, so neither a chain, a carry
+  nor a respawn has a mark to move or a recycled index to confuse.
 - **Editing a base file on disk while a level is open** does not hot-reload by guid
   alone (a base's guid doesn't change when its file does). `agentBridge` matches the
   changed path against every `getLoadedScenes()` entry and reloads via

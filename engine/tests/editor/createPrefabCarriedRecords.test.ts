@@ -1,5 +1,5 @@
 /** #1932 (E7 round 4, area 4a, R4-L1 finding 1): Create Prefab moves the records of the tree's NESTED frames into the new
- *  document, so the connected instance no longer states them (`clearCarriedRecords` in prefabLink.ts).
+ *  document, so the connected instance no longer states them (the record Create writes, `instanceEdits.ts`, holds identity only).
  *
  *  The capture writes a nested member's records into the new document's rows. The tag cleared only the entities it
  *  relinked, so a nested member kept its records, the scene restated them on every save, and a later edit of the new
@@ -29,10 +29,9 @@ import { getTraitByName, readTraitData } from '@modoki/engine/runtime';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { placePrefabFromPath } from '../../packages/modoki/src/editor/scene/prefabPlace';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
-import { writeTraitFieldWithUndo, deleteEntitiesWithUndo, addTraitToEntitiesWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
+import { writeTraitFieldWithUndo, deleteEntitiesWithUndo, addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { openPrefabForEditing, savePrefabEditReport, exitPrefabEditing } from '../../packages/modoki/src/editor/scene/prefabEdit';
-import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
-import { recordsOffBase } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { findEntityById as findEntity } from '../../packages/modoki/src/runtime/core/ecs/world';
 import { saveScene, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
 
@@ -45,7 +44,7 @@ boot(be);
 const tf = () => getTraitByName('Transform')!;
 const ea = () => getTraitByName('EntityAttributes')!;
 /** The records the save reads (F7's implied root order included: a role's, on both sides of every comparison here). */
-const records = (id: number) => [...(getOverrideMarkSet(findEntity(id) as never) ?? [])].sort();
+const records = (id: number) => [...(overrideKeysOf(findEntity(id) as never) ?? [])].sort();
 const x = (id: number) => (readTraitData(id, tf()) as { x: number }).x;
 const plainId = () => authored().find((e) => e.name === 'Plain')!.id;
 /** The entity named `name` in Plain's tree (the fixture's own O1/P1 instances hold members of the same names). */
@@ -102,8 +101,7 @@ async function create(newPath: string): Promise<void> {
 }
 
 describe('Create Prefab moves the nested frames\' records into the new prefab (#1932 R4-L1 finding 1)', () => {
-  // Mutation: `clearCarriedRecords` returns a no-op without clearing (today's `clearLinkedMarks`) — the records stay, the
-  // scene restates x 7, and the instance shows 7 after the new prefab's edit to 9.
+  // Mutation: the record Create writes carries each swallowed instance's rows whole (`rows.set(…, clone(row))`) — red.
   it('every record the new document carries is cleared, and nothing it shows is lost; the new prefab\'s edits then reach the instance, live and after a reload', async () => {
     const { f, newPath } = await setup('carried-e2e');
     const shown = treeValues();
@@ -139,7 +137,7 @@ describe('Create Prefab moves the nested frames\' records into the new prefab (#
     expect([x(under('M')), x(under('A'))]).toEqual([9, 12]);
   });
 
-  // Mutation: drop `undoCarried()` from the tag's undo — the undo leaves A and M without their records.
+  // Mutation: drop `seatSide(from)` from Create's undo (assetOps.ts) — the undo leaves A and M without their records.
   it('undo of Create puts back every record set exactly, and redo clears them again', async () => {
     const { newPath } = await setup('carried-undo');
     const before = treeRecords();
@@ -154,43 +152,9 @@ describe('Create Prefab moves the nested frames\' records into the new prefab (#
     expect(treeRecords()).toEqual(after);
   });
 
-  // The predicate the sweep keeps a record by. ⚠️ No route found leaves a captured record's value out of the new document
-  // (editorFolder, an added component and a removed child all reach a row), so the sweep's KEEP branch is defensive and the
-  // end-to-end case above stays green with it removed; this pins what it decides on. Mutation: `recordsOffBase` reports
-  // every record (or none) — red.
-  it('recordsOffBase: a record off its base is reported, one put back on its base (kept by F3) is not', async () => {
-    await startRun(be, async (fx) => {
-      await placePrefabFromPath(fx.prefabs.P.path, { tag: 'test', parentId: authored().find((e) => e.name === 'Plain')!.id });
-      await settle();
-    }, 'carried-predicate');
-    const m = under('M');
-    const base = x(m); // P's row for C states M.x = 4
-    expect(writeTraitFieldWithUndo(m, tf(), 'x', 7)).toBeNull();
-    expect([...(recordsOffBase(m) ?? [])]).toEqual(['Transform.x']);
-    expect(writeTraitFieldWithUndo(m, tf(), 'x', base)).toBeNull();
-    expect(records(m)).toEqual(['Transform.x']); // F3: the record stays…
-    expect([...(recordsOffBase(m) ?? [])]).toEqual([]); // …and the base now gives its value
-  });
-
-  // The tag branch's KEEP side (close-out re-review): a tag record whose base lacks the tag is the instance's own. A load
-  // seeds the record. Mutation: the tag branch reports no tag record (drop every one) — red.
-  it('recordsOffBase: a tag the base lacks is reported, so Create keeps it', async () => {
-    const f = await startRun(be, async (fx) => {
-      await placePrefabFromPath(fx.prefabs.P.path, { tag: 'test', parentId: authored().find((e) => e.name === 'Plain')!.id });
-      await settle();
-    }, 'carried-tag-keep');
-    expect(addTraitToEntitiesWithUndo([under('M')], getTraitByName('Persistent')!)).toBeNull();
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
-    await settle();
-    expect(records(under('M'))).toContain('Persistent.'); // premise: the load recorded it
-    expect([...(recordsOffBase(under('M')) ?? [])]).toContain('Persistent.');
-  });
-
-
   // A tag is a record too (the reviewer's close-out finding 1): the sweep kept every tag record, so the scene restated a
-  // tag the new document carries and the new prefab's edit removing it never reached the instance. Mutation: the tag
-  // branch of `recordsOffBase` reports every tag record (the pre-fix keep) — M keeps `Persistent.` and the tag stays.
+  // tag the new document carries and the new prefab's edit removing it never reached the instance. Mutation: as the
+  // first case (the swallowed rows carried whole) — M keeps `Persistent.` — red.
   it('a tag the new document carries leaves the instance too; the new prefab removing it reaches the instance, live and after a reload', async () => {
     const { f, newPath } = await setup('carried-tag');
     const tag = getTraitByName('Persistent')!;
@@ -204,7 +168,8 @@ describe('Create Prefab moves the nested frames\' records into the new prefab (#
     expect(records(under('M'))).toEqual([]);
     expect(await openPrefabForEditing({ path: newPath, name: 'NewPlain' }, { confirmDiscard: async () => true })).toBeFalsy();
     const inEdit = authored().filter((e) => e.name === 'M').map((e) => e.id).find((id) => findEntity(id)?.has(tag.trait))!;
-    findEntity(inEdit)!.remove(tag.trait);
+    // Removed as a user removes it (through the door): a prefab-edit save writes the row's record (#2001 S8b step 5).
+    expect(removeTraitFromEntitiesWithUndo([inEdit], tag)).toBeNull();
     expect((await savePrefabEditReport({})).saved).toBe(true);
     expect(be.read(newPath) ?? '').not.toContain('"Persistent"');
     await exitPrefabEditing();

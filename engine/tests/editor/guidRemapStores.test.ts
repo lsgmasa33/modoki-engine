@@ -38,6 +38,7 @@ import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
 import { startWatch, listWatches, clearWatch } from '../../app/debug/watch';
+import { place } from '../../packages/modoki/src/editor/instance/instanceEdits';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -254,6 +255,7 @@ describe('Create Prefab end to end, and undo refs left alone on purpose (#1785)'
     const at = (id: number) => getCurrentWorld().entities.find((e) => e.id() === id)!;
     at(hull).add(pi({ source: CHILD, localId: 1, rootInstanceId: hull }));
     at(bolt).add(pi({ source: CHILD, localId: 2, rootInstanceId: hull }));
+    place(hull); // a held instance holds its record, as a load or a drop leaves it (#2001 S8b)
     return { r, bolt, boltGuid: C };
   }
   afterEach(() => { setPrefabCache(CHILD, null); });

@@ -14,7 +14,10 @@ import { markSceneSaved, clearHistory, clearDirtyAssets, markAssetDirty, setCurr
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
-import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { setFields } from '../../packages/modoki/src/editor/instance/instanceEdits';
+import { markWorldUnsavable, NO_RECORD_TO_WRITE } from '../../packages/modoki/src/editor/instance/instanceRollback';
+import { getCurrentWorld } from '../../packages/modoki/src/runtime/core/ecs/world';
+
 
 /** Prefab-edit mode swaps in a synthetic world that `save-all` must not write. Entering it for real
  *  needs a mocked SceneManager (`prefabEditUnsavedProbe.test.ts`), so only the one predicate
@@ -129,6 +132,22 @@ describe('save-all while PLAYING — the scene half is refused; the code follows
     const err = await runAgentOp('save-all', {}).then(() => null, (e: unknown) => e as { code?: string; message?: string });
     expect(err).toMatchObject({ code: 'PARTIAL' });
     expect(err?.message).toMatch(/WERE written/);
+  });
+});
+
+// #2001 S8b review L2: a world marked unsavable (a tree with no record to write, a rollback that could not finish) was
+// answered as a run mode: "Stop Play, exit a preview, or retry" — none of which clears a mark only a reload clears.
+// Mutation: answer the mark as 'playing' again (serialize.ts's `isUnsavableMark` branch) — red here.
+describe('save-all on a world marked unsavable', () => {
+  beforeEach(() => { setCurrentScenePath('/assets/scenes/opcodes-unsavable.scene.json'); });
+
+  it('is refused with the mark\'s words and "reopen the scene", not the run-mode advice', async () => {
+    markWorldUnsavable(getCurrentWorld(), NO_RECORD_TO_WRITE);
+    const err = await runAgentOp('save-all', {}).then(() => null, (e: unknown) => e as { code?: string; message?: string });
+    expect(err).toMatchObject({ code: 'REFUSED_BY_OP' });
+    expect(err?.message).toContain(NO_RECORD_TO_WRITE);
+    expect(err?.message).toMatch(/reopen the scene \(modoki_load_scene\)/);
+    expect(err?.message).not.toMatch(/Stop Play/);
   });
 });
 
@@ -312,7 +331,7 @@ describe('prefab revert — the override keys named', () => {
     // As an editor write does (#1709): the value AND its override mark. A bare value that differs with no mark is not an
     // override, and is not listed (#1717).
     findEntity(r.rootId)!.set(Transform, { x: 5 });
-    markOverride(findEntity(r.rootId)!, 'Transform', 'x');
+    setFields(findEntity(r.rootId)!.id(), 'Transform', ['x']);
     // By guid: the instance root has one, so an `entityId` is refused (#1223 D2).
     const guid = (findEntity(r.rootId)!.get(EntityAttributes) as { guid: string }).guid;
     const o = await runAgentOp('prefab', { action: 'overrides', entityGuid: guid }) as { keys?: { all?: string[] } };

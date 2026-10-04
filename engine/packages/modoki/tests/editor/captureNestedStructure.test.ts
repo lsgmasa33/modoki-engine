@@ -42,6 +42,7 @@ function readTraitDataImpl(id: number, meta: any) {
 }
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),
@@ -80,8 +81,6 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab
 beforeEach(async () => {
   testWorld = createWorld();
   index.clear();
-  const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
-  clearAllOverrideMarks();
 });
 
 const getModule = () => Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabCapture'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));

@@ -7,18 +7,18 @@ import type { PrefabFile } from './prefab';
 import { captureInstanceOverrides } from './prefabInstanceOverrides';
 import { captureInstanceMembers } from './prefabMembers';
 import { captureInstanceStructure, captureNestedChannels, moveChannelsOntoRows, withoutRowParents, type FrameEdit } from './prefabCapture';
-import { withKeptLegacy, withKeptLocalRecords, withKeptUnused, withMalformedBack, withKeptSlots } from './prefabBase';
 
 /** The instance half of a scene entry, as the loader reads it — `SceneEntityEntry`'s own fields, so the two cannot drift.
  *  Each field is absent when it states nothing, as the save writes it. */
 export type InstanceEntry = Pick<SceneEntityEntry, 'overrides' | 'added' | 'removed' | 'removedTraits' | 'moved' | 'nestedOverrides' | 'nestedStructure' | 'members'>;
 
 /** Stored root `rootId` (of `source`) as the save states it, measured against `prefab` — the document the instance was
- *  EXPANDED from (`savedFrameDoc`, #1685), every nested frame against its own record. `rootGuid` keys the legacy channels
- *  the load kept for it (R2's legacy half). Synchronous over caches the caller has warmed (`preloadNestedPrefabs`).
+ *  EXPANDED from (`savedFrameDoc`, #1685), every nested frame against its own record. Synchronous over caches the caller
+ *  has warmed (`preloadNestedPrefabs`). It states the LIVE tree only: what the instance holds beyond it (unused records,
+ *  legacy channels no frame reaches, malformed values) is its record's, which the save writes from (#2001 S8b).
  *  `consumedEcsIds`: every live entity the entry states, so the caller does not write it again as an entity of its own. */
 export function captureInstanceEntry(
-  rootId: number, source: string, prefab: PrefabFile, rootGuid: string,
+  rootId: number, source: string, prefab: PrefabFile,
   /** A caller's edit of chosen frames' statements, made where the capture makes each one and before it goes onto rows —
    *  so a rebuild to a state the live tree does not show (an Apply's subtraction, a Revert's reduced set, #1880 F6) is
    *  still stated by the save's one writer. `frames`: by frame root ecs id, this root's own included; `dropParents`:
@@ -31,12 +31,11 @@ export function captureInstanceEntry(
   const live = captureInstanceStructure(rootId, prefab, { rows: true, frameEdits: edit.frames, dropParents: edit.dropParents, againstRecords: edit.againstRecords });
   const s = own?.structure ? own.structure(live) : live;
   const channels = captureNestedChannels(rootId, source, live.ownedNested, { rows: true, frameEdits: edit.frames, againstRecords: edit.againstRecords });
-  // The records the load kept as UNUSED go back first (#1914 R4): a localId the template has goes onto its row with the rest.
-  const local = withKeptLocalRecords({
+  const local = {
     overrides: own?.overrides ? own.overrides(captureInstanceOverrides(rootId, prefab)) : captureInstanceOverrides(rootId, prefab),
-    removedTraits: s.removedTraits, removed: s.removed, moved: s.unrowed ?? {},
-  }, rootGuid, rootId);
-  const unrowed = local.moved ?? {};
+    removedTraits: s.removedTraits, removed: s.removed,
+  };
+  const unrowed = s.unrowed ?? {};
   // A structure that states nothing is handed on as none at all, as the save always has: `[]` is not "nothing" to every
   // reader of a channel.
   const struct = s.added.length || local.removed?.length || Object.keys(local.removedTraits ?? {}).length || Object.keys(unrowed).length ? s : undefined;
@@ -47,16 +46,13 @@ export function captureInstanceEntry(
   // document puts the member, so a capture with no document can only carry the rows it is handed (`memberRowParents`).
   // Since Phase 4 the rows also carry every EDIT they can key (`moveChannelsOntoRows`): what is left in the localId
   // channels below is the root's own edits and what no row can address.
-  // A reached frame's kept structure records go into its live slot BEFORE the move onto rows, and that frame stays a
-  // whole slot (#1933 S4, F-CB2 (a)): a bare kept slot after it would replace the frame's lists.
-  const slots = withKeptSlots(channels.nestedStructure, rootGuid);
   const moved = moveChannelsOntoRows(rootId, prefab, source, {
     overrides: local.overrides,
     added: struct?.added, removed: struct ? local.removed : undefined, removedTraits: struct ? local.removedTraits : undefined,
-    nestedOverrides: channels.nestedOverrides, nestedStructure: slots.nestedStructure,
-  }, captureInstanceMembers(rootId, prefab), channels.frames, { againstRecords: edit.againstRecords, frameEdits: edit.frames, keepWholeSlots: slots.merged });
-  const members = withKeptUnused(withoutRowParents(rootId, moved.members, edit.dropParents), rootGuid, rootId);
-  const ch = withKeptLegacy(moved.channels, rootGuid, slots.merged);
+    nestedOverrides: channels.nestedOverrides, nestedStructure: channels.nestedStructure,
+  }, captureInstanceMembers(rootId, prefab), channels.frames, { againstRecords: edit.againstRecords, frameEdits: edit.frames });
+  const members = withoutRowParents(rootId, moved.members, edit.dropParents);
+  const ch = moved.channels;
   const entry: InstanceEntry = {};
   if (ch.overrides && Object.keys(ch.overrides).length) entry.overrides = ch.overrides;
   if (ch.added?.length) entry.added = ch.added;
@@ -66,6 +62,5 @@ export function captureInstanceEntry(
   if (ch.nestedOverrides && Object.keys(ch.nestedOverrides).length) entry.nestedOverrides = ch.nestedOverrides;
   if (ch.nestedStructure && Object.keys(ch.nestedStructure).length) entry.nestedStructure = ch.nestedStructure;
   if (Object.keys(members).length) entry.members = members;
-  // Last: what the load kept as malformed goes back where the entry states nothing (#1938 C-B step 2).
-  return { entry: withMalformedBack(entry, rootGuid), consumedEcsIds: [...live.consumedEcsIds, ...channels.consumedEcsIds] };
+  return { entry, consumedEcsIds: [...live.consumedEcsIds, ...channels.consumedEcsIds] };
 }

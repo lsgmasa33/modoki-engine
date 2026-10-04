@@ -25,7 +25,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
   },
 }));
 import { getTraitByName, getAllEntities, getCurrentWorld } from '@modoki/engine/runtime';
-import { markStale } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { dropInstanceRecord, storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { makeFuzzBackend } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, startRun, settle, piOf, unexpandedRows, flushWatcher, placeholderGuids, type Fixture } from './prefabFuzz/harness';
 import { deleteAssetFiles, deletionPathsFor } from '../../packages/modoki/src/editor/panels/assetOps';
@@ -41,6 +41,8 @@ import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/sc
 import { loadSceneFile, instantiatePrefabIntoWorld, type ExpansionReader, type SceneData } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { SCENE_FORMAT_VERSION, CAPTURE_FORM_SCENE_VERSION } from '../../packages/modoki/src/runtime/core/version';
+/** No record for any instance: what a stale store once stood for (#2001 S8b deleted the mark). */
+const dropAllRecords = (w: ReturnType<typeof getCurrentWorld>): void => { for (const g of [...storedInstances(w).keys()]) dropInstanceRecord(w, g); };
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
@@ -149,7 +151,7 @@ describe('#1934 S1: a load refuses an expansion that read with another reader', 
     const world = getCurrentWorld();
     const scene = { version: CAPTURE_FORM_SCENE_VERSION, resources: [], entities: [{ id: 1, prefab: f.prefabs.P.guid, guid: 'abcdabcd-0000-4000-8000-000000000001', traits: { EntityAttributes: { name: 'Probe', parentId: 0 } } }] } as unknown as SceneData;
     return loadSceneFile(scene, {
-      world, clearMarks: false, loadModels: false, read: opts.read,
+      world, loadModels: false, read: opts.read,
       fetchPrefab: async (r) => (getCachedPrefabSync(r) as object | null) ?? null,
       onInstantiatePrefab: (source, parentId, rootTf, _old, _x, overrides, structure, nestedOverrides, _g, _f, nestedStructure, load) => {
         const read = opts.expandWith(load?.read);
@@ -232,7 +234,7 @@ describe('#1939 item 2 (serious): an Apply undo\'s world swap, a nested prefab m
   // reload these cases pin is now its FALLBACK, taken when the store cannot state the world (a step since left the
   // records behind). Each case leaves them stale before its undo and redo (`stranded`) to reach it; the record path is
   // the last case.
-  const stranded = () => markStale(getCurrentWorld(), 'a step that did not maintain the records');
+  const stranded = () => dropAllRecords(getCurrentWorld());
   // Hunt seed 1268's route, directed. The Apply's snapshot is taken while Q is present, so it carries no copy of Q; Q is
   // trashed after (its frames shown as placeholders at once, #2056; the save carries its copy); the Apply's undo reloads the snapshot. Without the
   // carry, Q's frames came back unexpanded and the next save wrote no copy for them.

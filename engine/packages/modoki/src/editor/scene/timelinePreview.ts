@@ -32,7 +32,7 @@ import { beginWorldReplacement } from './authoringSettle';
 import { getEditVersion, setPreviewUndoSession, clearPreviewUndoSession, whenUndoIdle, beginPreviewRestore, finishPreviewRestore } from '../undo/undoManager';
 import { createTeardownToken } from '../../runtime/core/liveness';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
-import { staleAroundUnless } from '../../runtime/prefab/instanceStore';
+import { rollbackOnThrow } from '../instance/instanceRollback';
 import { movedSceneFile, type PathMove } from '../utils/assetPaths';
 import { toOpenProjectScenePath } from './openProjectScenePath';
 
@@ -488,7 +488,10 @@ onWorldSwap(() => {
 registerPosedWorldSource('a preview session is open', () => _snap !== null);
 registerPosedWorldSource('a preview restore is still landing', () => _restoresInFlight > 0);
 
-// #2001 S4 (#2014): an exit that keeps the posed world leaves values no record states, so it marks the store stale once it
-// finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`). One that restored the authored
-// world does not (#2046 S7.6): the reload took back its exact records, or parsed fresh ones from the snapshot.
-export const endTimelinePreviewSessionReporting = staleAroundUnless('stop', endTimelinePreviewSessionReportingUnmarked, (out) => out.reverted);
+// #2001 S4 (#2014) / S8b: an exit marks no record stale. One that restored the authored world took back its exact records
+// in the reload (#2046 S7.6), or parsed fresh ones from the snapshot. One that did not restore leaves no posed world for a
+// record to miss: a `restore: false` end runs on a world swap (the world is the new load's), a snapshot for another scene
+// means the scene changed, and no snapshot means no pose was seated. Even a posed world kept would keep its records, which
+// state the authored values a save writes; the old mark let the next write take the pose into them. A throw rolls back
+// (`instanceRollback.ts`).
+export const endTimelinePreviewSessionReporting = rollbackOnThrow('stop', endTimelinePreviewSessionReportingUnmarked);

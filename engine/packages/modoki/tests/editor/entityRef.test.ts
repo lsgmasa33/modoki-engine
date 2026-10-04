@@ -14,6 +14,7 @@ let testWorld: ReturnType<typeof createWorld>;
 const entityIndex = new Map<number, any>();
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   findEntityById: (id: number) => entityIndex.get(id),
   registerEntity: (e: any) => entityIndex.set(e.id(), e),

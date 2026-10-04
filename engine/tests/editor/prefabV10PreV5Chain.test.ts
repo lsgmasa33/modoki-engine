@@ -81,7 +81,7 @@ describe('#2001 S6: a v10 row about a pre-v5 nested prefab', () => {
   it('records on a v10 row that apply to nothing today are kept by every prefab-edit save, on the root row, a live member\'s row and a gone member\'s row', async () => {
     // Format rule: a record with no target (a member the nested prefab no longer has, a field or a component this build
     // does not know) is kept until Remove Unused, never dropped by a save.
-    // Mutations (both measured, this case red alone): `captureRowChannels` not putting the kept rows back (the loop over
+    // Mutations (both measured, this case red alone, before #2001 S8b deleted the kept stores): `captureRowChannels` not putting the kept rows back (the loop over
     // `keptMemberOrphans`) loses the root row's two values and the gone member's row; without `withKeptUnused` the live
     // member's unknown field is lost.
     const f = await startRun(be, async () => {}, 'v10-unused-kept');
@@ -114,11 +114,13 @@ describe('#2001 S6: a v10 row about a pre-v5 nested prefab', () => {
     expect(second).toBe(first);
   }, 60_000);
 
-  // ⚠️ KNOWN OPEN, #2116 (low, parked): the scene DOES state the node, as its own copy beside a removal of the
-  // template's, so the node stops following the prefab. The old capture states a pre-v5 frame as one whole legacy slot
-  // (unchanged by S6; a v19 scene wrote that slot as it was), and the v20 writer states the slot as rows. Stable: one
-  // node, and the second save's bytes are the first's. Pinned as it is; a fix turns the first assertion red.
-  it('a scene over a chain that is pre-v5 at every level: the node the prefab adds is pinned, once, and stays (#2116)', async () => {
+  // #2116: the scene states nothing about the node the prefab adds, so it keeps following the prefab. Before #2001 S8b the
+  // save re-seeded the tree from the old capture (the door could not key a pre-v5 frame's members), which states a
+  // pre-v5 frame as one whole legacy slot, and the v20 writer stated that slot as rows: the node as the scene's own copy
+  // beside a removal of the template's. The door now keys such a member by `preV5NodeGuid`, as the parse does, and the
+  // save writes the load's records. Stable: one node, and the second save's bytes are the first's.
+  // Mutation: `instanceKeyMap` without `derivePreV5` — the scene states the copy and the removal again.
+  it('a scene over a chain that is pre-v5 at every level: the node the prefab adds is not pinned, and stays once (#2116)', async () => {
     const f = await startRun(be, async () => {}, 'v10-prev5-all');
     const before = be.snapshot();
     for (const p of [f.prefabs.O, f.prefabs.P, f.prefabs.Q]) {
@@ -133,7 +135,7 @@ describe('#2001 S6: a v10 row about a pre-v5 nested prefab', () => {
     await settle();
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     const scene = be.read(f.scenePath)!;
-    expect([scene.includes('"Extra"'), scene.includes('a+k-extra')]).toEqual([true, true]);
+    expect([scene.includes('"Extra"'), scene.includes('a+k-extra')]).toEqual([false, false]);
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
     expect(authored().filter((e) => e.name === 'Extra').length).toBe(1);

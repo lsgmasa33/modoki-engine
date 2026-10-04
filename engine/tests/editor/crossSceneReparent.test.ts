@@ -15,12 +15,13 @@ import {
   createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, getCurrentWorld,
 } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved, serializeScene, undo, redo, planReparent } from '@modoki/engine/editor';
-import { getOverrideMarkSet } from '@modoki/engine/runtime';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { sceneMoveRefusal } from '../../packages/modoki/src/editor/undo/entityActions';
 import { detachRefusal } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { isSceneDirty, clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { PrefabInstance } from '../../packages/modoki/src/runtime/traits/PrefabInstance';
+import { storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
@@ -357,10 +358,15 @@ describe('a CREATE under a base entity is born in that base (#1429, owner option
     try {
       const { rootId: coin } = await runAgentOp('prefab', { action: 'instantiate', path: COIN }) as { rootId: number };
       // Slot sits at x=10 and the coin at the origin, so the move writes local x=-10: an override the base
-      // must save, or the coin reloads at Slot's origin. Mutation: drop the markCompensatedTransform call
-      // in moveEntityToScene's applyStamps.
+      // must save, or the coin reloads at Slot's origin. Mutation: pass no `compensated` pose to moveEntityToScene's
+      // `beginReparent` commit — red.
       liveOf(slot).set(Transform, { x: 10 });
+      // Every record, stale marks and all, as a string (a record's rows are a Map).
+      const store = () => JSON.stringify([...storedInstances(getCurrentWorld())], (_k, v: unknown) => (v instanceof Map ? [...v] : v));
+      const before = store();
       await runAgentOp('reparent-entity', { guid: attrs(coin).guid, parentGuid: attrs(slot).guid, moveToScene: true });
+      const after = store();
+      expect(after, 'premise: the move changed a record (Kit links the coin)').not.toBe(before);
       const live = getCurrentWorld().entities.find((e) => e.id() === coin)!;
       expect(attrs(coin)).toMatchObject({ parentId: slot, sourceScene: BASE });
       expect(live.has(PrefabInstance)).toBe(true);
@@ -373,11 +379,16 @@ describe('a CREATE under a base entity is born in that base (#1429, owner option
       expect(kitAdded).toEqual([expect.objectContaining({ prefab: 'c1436000-0000-4000-8000-000000000001', guid: attrs(coin).guid })]);
       expect(kitAdded[0]!.members?.['/']?.traits?.Transform?.x).toBeCloseTo(-10);
       expect(await namesIn()).not.toContain(attrs(coin).guid);
-      // Undo puts the coin's marks back as they were. Mutation: drop `restoreMarks` in moveEntityToScene's undo.
-      const marks = () => [...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === coin)!) ?? [])];
+      // Undo puts the coin's records back as they were. Mutation: the undo runs its stamps without `seatAround` — red.
+      const marks = () => [...(overrideKeysOf(getCurrentWorld().entities.find((e) => e.id() === coin)!) ?? [])];
       expect(marks()).toContain('Transform.x');
       await undo();
       expect(marks()).not.toContain('Transform.x');
+      // #2001 S8b: the undo and redo seat the exact records the move changed, fresh (before, both marked every record
+      // stale for the re-seed). Mutation: drop the undo's `seatAround` in moveEntityToScene — Kit's record keeps the link.
+      expect(store()).toBe(before);
+      await redo();
+      expect(store()).toBe(after);
     } finally { setPrefabCache(COIN, null); }
   });
 

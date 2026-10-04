@@ -22,6 +22,7 @@
  *  interiors. See docs/scene-loading.md § "Guid uniqueness is a PER-FILE rule". */
 
 import { trait } from 'koota';
+import { deriveGuid } from './assetRefRules';
 
 /** The slice of a koota entity handle these helpers touch — structural, so the loader's and the
  *  editor's own handle types both fit. */
@@ -30,6 +31,14 @@ type Handle = { has(t: unknown): boolean; get(t: unknown): unknown; set(t: unkno
 export const TemplateAddedKey = trait({ key: '' });
 
 export { addedKeyStep } from './assetRefRules';
+
+/** The template key a template write gives a SCENE node it states for the first time (a node the user added, which carries
+ *  a guid and no key): derived from that guid, so every write of the same node gives the same key and a re-save does not
+ *  re-key it (#2001 S8b step 5). A key minted per write rewrote the file each time, which the capture's stamp on the live
+ *  node used to prevent. */
+export function sceneNodeTemplateKey(guid: string): string {
+  return deriveGuid(`${guid}|templateKey`);
+}
 
 /** The template key a live entity carries, or `''`. */
 export function templateKeyOf(entity: Handle | undefined | null): string {

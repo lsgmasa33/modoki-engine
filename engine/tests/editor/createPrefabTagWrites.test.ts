@@ -11,9 +11,6 @@
  *    edit of the template the undo put back changes the tree's values, and linked anyway those values sat on rows
  *    written with the old ones, so a Save + reload reverted them. Mutation: `relinkedFramesCheck`'s check always null —
  *    red.
- *  - The tag clears the override marks of what it links. A Detach leaves its marks on the plain tree until a reload, and
- *    Create Prefab linked them as overrides equal to the values it had just written into the template, which pinned them
- *    against every later edit of the prefab. Mutation: drop the clear in `clearLinkedMarks` — red.
  *
  *  Driven through the prefab fuzzer's harness: the real backend route, SceneManager, both caches and the undo stack. */
 
@@ -37,13 +34,11 @@ import { placePrefabFromPath } from '../../packages/modoki/src/editor/scene/pref
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { emptySpecs } from '../../packages/modoki/src/runtime/scene/entityCreateSpecs';
 import { createEntityWithUndo, writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
-import { detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { frameRootDoc } from '../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { findEntityByGuid } from '../../packages/modoki/src/runtime/core/ecs/world';
-import { captureMarks } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';
 import { openPrefabForEditing, savePrefabEditReport, exitPrefabEditing } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { piOf } from './prefabFuzz/harness';
-import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { findEntityById as findEntity } from '../../packages/modoki/src/runtime/core/ecs/world';
 import { saveScene, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
@@ -155,36 +150,13 @@ describe("Create Prefab's tag and its undo (#1830)", () => {
     expect(piOf(findEntityByGuid(rootGuid)!.id())?.source).toBe(f.prefabs.Q.guid);
   });
 
-  it('a Detach, then Create Prefab: the linked tree carries none of the marks the Detach left, and the undo puts them back', async () => {
-    const f = await startRun(be, async () => {}, 'tagWrites-marks');
-    const qId = await placePrefabFromPath(f.prefabs.Q.path, { tag: 'test', parentId: 0 });
-    await settle();
-    const m = authored().find((e) => e.name === 'M' && e.parentId === qId)!;
-    const tf = getTraitByName('Transform')!;
-    expect(writeTraitFieldWithUndo(m.id, tf, 'x', 7)).toBeFalsy();
-    expect(captureMarks(m.id).keys).toContain('Transform.x');
-    detachPrefabInstanceWithUndo(qId!, 'Detach', 'test');
-    await settle();
-    // The Detach keeps its marks on the plain tree (its undo reads them, #1794): the premise of this case.
-    expect(captureMarks(m.id).keys).toContain('Transform.x');
-    const r = await createPrefabFromEntity(qId!, `${f.root}/prefabs/NewQ.prefab.json`, 'Save prefab "QR"', async () => false);
-    if (!r || r === 'declined' || 'refused' in r) throw new Error(`create: ${r && r !== 'declined' ? r.refused : r}`);
-    pushAction(r.action);
-    await settle();
-    // Written into the template as 7, so nothing overrides it.
-    const mNow = authored().find((e) => e.name === 'M' && e.parentId === qId)!;
-    expect(captureMarks(mNow.id).keys).toEqual([]);
-    expect((await undoStep('undo')).did).toBe(true);
-    await settle();
-    const mBack = authored().find((e) => e.name === 'M' && e.parentId === qId)!;
-    expect(captureMarks(mBack.id).keys).toContain('Transform.x');
-  });
-
   // Hunt seed 3297 (#1914 R6): a scene-added reference node's root records its sibling order (F7), and a load STORES that
   // record (the root's guid is not durable yet when the overrides apply). Create Prefab then makes the node a row of the
   // new template — a nested row (P, stamped) or that row's added node (Q, keyed by the capture) — which states its place,
-  // so a reload reads no record of it; the stored mark stayed, and save → reload was not the identity. Mutation: drop the
-  // `unmarkOverride(…, 'sortOrder')` loop in `clearLinkedMarks` — both roots keep the mark, and the reload disagrees.
+  // so a reload reads no record of it; the stored mark stayed, and save → reload was not the identity. Since #2001 S8b the
+  // order record is the role's (`recordsRootOrder`), so it goes with the role. Held twice, so one mutation alone stays
+  // green (measured): the view asks the rule only for a record's root row (`recordedFieldsOf`), and the rule asks
+  // `isStoredRoot` and the template key. Mutation: the view asks it for every member AND the rule drops both checks — red.
   it('Create Prefab takes the sibling-order record off the nodes it makes rows of the new template', async () => {
     const f = await startRun(be, async (fx) => {
       const plain = authored().find((e) => e.name === 'Plain')!;
@@ -201,7 +173,7 @@ describe("Create Prefab's tag and its undo (#1830)", () => {
       const r = child(authored().find((e) => e.name === 'Plain')!.id, 'R')!;
       return name === 'R' ? r : child(child(r.id, 'A')?.id, 'QR')!;
     };
-    const ordered = (name: 'R' | 'QR') => [...(getOverrideMarkSet(findEntity(rootOf(name).id)!) ?? [])].includes('EntityAttributes.sortOrder');
+    const ordered = (name: 'R' | 'QR') => [...(overrideKeysOf(findEntity(rootOf(name).id)!) ?? [])].includes('EntityAttributes.sortOrder');
     expect([ordered('R'), ordered('QR')], 'premise: both scene-placed roots record their order').toEqual([true, true]);
     const r = await createPrefabFromEntity(plain.id, `${f.root}/prefabs/NewPlain.prefab.json`, 'Save prefab "Plain"', async () => false);
     if (!r || r === 'declined' || 'refused' in r) throw new Error(`create: ${r && r !== 'declined' ? r.refused : r}`);

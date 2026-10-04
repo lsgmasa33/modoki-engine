@@ -1,7 +1,8 @@
 /** The #2007 oracle's comparison, shared by the corpus run (`foldInstanceOracle.test.ts`) and the fuzzer's saved scenes
  *  (`foldInstanceOracleFuzz.test.ts`): read an instance's LIVE tree by the keys the fold uses, and list every way it and
- *  `foldInstance(parse(entry))` disagree — nodes, parents, components, fields, placeholders, anchors, and the unused
- *  records against what today's load keeps for the save (`keptMemberOrphans`/`keptLegacyChannels`/`keptUnusedRows`).
+ *  `foldInstance(parse(entry))` disagree — nodes, parents, components, fields, placeholders and anchors. (It compared the
+ *  fold's unused records with the stores the load kept for the save, too, until #2001 S8b: the load fills none any more,
+ *  and the save writes the record's unused part itself, which the save → reload tests hold.)
  *
  *  A divergence is triaged against the rules, never forced. Where a rule CHANGES what the user sees, the change is
  *  applied to today's tree before the comparison (`translate`), as the rule states it, and the comparison stays exact. */
@@ -9,11 +10,11 @@
 import type { Entity } from 'koota';
 import { getCurrentWorld, getTraitByName } from '@modoki/engine/runtime';
 import { getAllTraits } from '../../packages/modoki/src/runtime/core/ecs/traitRegistry';
-import { keptMemberOrphans, keptLegacyChannels, keptUnusedRows, type SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import type { SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { instanceKeyMap } from '../../packages/modoki/src/editor/instance/instanceKeys';
 import { rowPlaceholderOf, unresolvedRefOf } from '../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { foldInstance } from '../../packages/modoki/src/runtime/prefab/foldInstance';
-import { parseInstanceRecord, preV5NodeGuid, frameOf, componentOf, type ParseOptions } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
+import { parseInstanceRecord, frameOf, componentOf, type ParseOptions } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { parseSteps } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { splitMalformedChannels } from '../../packages/modoki/src/runtime/loaders/malformedChannels';
 import { HELD_REMAINDER, type PrefabReader, type FoldedInstance, type UnusedRecord, type InstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
@@ -148,18 +149,6 @@ const leavesOfTraits = (traits: unknown, out: string[]) => {
     else out.push(`${t}.*`);
   }
 };
-/** A legacy channel set's statements, one leaf each, in the fold's leaf vocabulary. */
-const legacyLeaves = (c: Bag | undefined, out: string[]) => {
-  if (!c) return;
-  for (const byLid of Object.values((c.overrides ?? {}) as Bag)) leavesOfTraits(byLid, out);
-  for (const byRow of Object.values((c.nestedOverrides ?? {}) as Bag)) for (const byLid of Object.values(byRow as Bag)) leavesOfTraits(byLid, out);
-  for (const names of Object.values((c.removedTraits ?? {}) as Bag)) for (const n of names as string[]) out.push(`-${n}`);
-  for (const _ of (c.removed ?? []) as unknown[]) out.push('removed');
-  for (const _ of Object.keys((c.moved ?? {}) as Bag)) out.push('parent');
-  for (const s of Object.values((c.nestedStructure ?? {}) as Bag)) legacyLeaves(s as Bag, out);
-  for (const _ of (c.added ?? []) as unknown[]) out.push('own');
-  for (const _ of (c.malformed ?? []) as unknown[]) out.push('legacy');
-};
 /** `skip`'s `keyed`: the leaf is a legacy `added` element with a template key, a statement about a template-added node
  *  (a keyed copy), not a user-added node, though it reads as an `own` leaf too. */
 type LeafSkip = (key: string, leaf: string, keyed?: boolean) => boolean;
@@ -176,7 +165,7 @@ const rowLeaves = (rows: Record<string, Bag> | undefined, out: string[], skip: L
     for (const _ of (r.own ?? []) as unknown[]) if (!skip(key, 'own')) out.push('own');
   }
 };
-const unusedLeaf = (u: UnusedRecord): string => {
+export const unusedLeaf = (u: UnusedRecord): string => {
   const p = u.part;
   switch (p.kind) {
     case 'field': return `${p.trait}.${p.field}`;
@@ -185,123 +174,6 @@ const unusedLeaf = (u: UnusedRecord): string => {
     default: return p.kind;
   }
 };
-
-/** A kept row's leaves, each link with its guid (`pairUnused`'s `(applied)` reads it): `rowLeaves`' order, so its
- *  `added` links, then its `own`. `skip` is per row and leaf, and tells a keyed copy from a user node. */
-export function keptRowLeaves(key: string, r: Bag, skip: LeafSkip = () => false): { key: string; leaf: string; guid?: string }[] {
-  const leaves: string[] = [];
-  rowLeaves({ [key]: r }, leaves, skip);
-  const links = [...((r.added ?? []) as Bag[]).filter((n) => !skip(key, 'own', !!n?.key)), ...((r.own ?? []) as Bag[]).filter(() => !skip(key, 'own'))]
-    .map((n) => n?.guid as string | undefined);
-  let i = 0;
-  return leaves.map((leaf) => (leaf === 'own' ? { key, leaf, guid: links[i++] } : { key, leaf }));
-}
-
-/** The fold's unused records against what today's load keeps for the save, as two leaf multisets.
- *  - A record `unresolved` under a placeholder is kept by that placeholder's verbatim record, so it is not compared — on
- *    EITHER side: under a placeholder only the rules put there (`checkInstance`'s translation B: today expands a copy),
- *    today keeps the same records as unused rows or applies them to the copy, at a granularity a leaf multiset cannot
- *    match (#2009). What this cannot see, a fold that loses or misplaces a record under a placeholder, `placementDiverge`
- *    checks against the record by the rules (#2021).
- *  - A kept row at or under a member the record REMOVES is not compared, except its `removed` leaf and its links: the save
- *    drops a gone member's kept unused part (#1914 R4's fix), and so does the record. A user-added node there is not
- *    skipped: the record keeps it `heldNode` (design § 10.4b), and where today orphans the row (its member gone, or
- *    untargeted because an inner layer removed it, in a missing frame, or cut by the instance's own removal alone, #2035, #2038)
- *    it keeps the link and writes it back (#2032, hunt seed 178).
- *  - A kept-only line names its row, and a kept `removed` whose member the fold removed is marked `(applied)`: today
- *    books it twice (#2013). Without the key, "the fold applied it" and "the fold lost it" read the same (#2009 review). */
-export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceholders: ReadonlySet<string> = new Set(), removedRows: readonly string[] = [], projectsWhenRestored: (key: string) => boolean = () => false, memberInDocuments: (key: string) => boolean = () => true, held?: Bag, ruledKept: readonly string[] = []): string[] {
-  const kept: { key: string; leaf: string; guid?: string }[] = [];
-  const legacy: string[] = [];
-  legacyLeaves(keptLegacyChannels(rootGuid) as Bag | undefined, legacy);
-  for (const leaf of legacy) kept.push({ key: '(legacy)', leaf });
-  const skip: LeafSkip = (key, leaf, keyed) => keptLeafSkipped(key, leaf, livePlaceholders, removedRows, keyed);
-  for (const rows of [keptMemberOrphans(rootGuid), keptUnusedRows(rootGuid)] as (Record<string, Bag> | undefined)[]) {
-    for (const [key, r] of Object.entries(rows ?? {})) kept.push(...keptRowLeaves(key, r, skip));
-  }
-  // Today's kept copy of a link the rules now SHOW (#2018 (i), `checkRecord`), where today kept one.
-  for (const key of ruledKept) { const at = kept.findIndex((k) => k.key === key && k.leaf === 'own'); if (at >= 0) kept.splice(at, 1); }
-  const atPlaceholder = (u: UnusedRecord) => u.cause === 'unresolved' && [...livePlaceholders].some((k) => under(u.key, k));
-  const compared = fold.unused.filter((u) => !atPlaceholder(u));
-  // …on either side: a held LEGACY record there is today's kept legacy leaf, which names no row and so is not skipped by
-  // key above (#2028: a `nestedStructure` slot's node at a nested rule-B placeholder, kept verbatim for the save).
-  for (const u of fold.unused) {
-    if (!atPlaceholder(u) || u.part.kind !== 'legacy') continue;
-    // The held value at the record's path, re-wrapped in its channels, read as today's store reads it.
-    const path = u.part.path;
-    const chain: unknown[] = [held];
-    for (const step of path) chain.push((chain[chain.length - 1] as Bag | undefined)?.[step]);
-    let v: unknown = chain[path.length];
-    for (let i = path.length - 1; i >= 0; i--) v = Array.isArray(chain[i]) ? [v] : { [path[i]!]: v };
-    const leaves: string[] = [];
-    legacyLeaves(v as Bag, leaves);
-    for (const leaf of leaves) {
-      const at = kept.findIndex((k) => k.key === '(legacy)' && k.leaf === leaf);
-      if (at >= 0) kept.splice(at, 1);
-    }
-  }
-  // A held MEMBER ROW's record (part path `['members', k, field?, i?]`) is today's kept row, verbatim: paired as the
-  // leaves that row shows in today's store, at `k` (close-out review round 4).
-  const out: string[] = [];
-  const rest = compared.filter((u) => {
-    if (u.part.kind !== 'legacy' || u.part.path[0] !== 'members') return true;
-    const [, k, field, i] = u.part.path;
-    const row = ((held?.members ?? {}) as Bag)[k!] as Bag | undefined;
-    if (!row || typeof row !== 'object') return true;
-    const leaves: string[] = [];
-    rowLeaves({ [k!]: field === undefined ? row : { [field]: i === undefined ? row[field] : [(row[field] as unknown[])[Number(i)]] } }, leaves, skip);
-    for (const leaf of leaves) {
-      const at = kept.findIndex((e) => e.key === k && e.leaf === leaf);
-      if (at >= 0) kept.splice(at, 1); else out.push(`fold-only unused ${k} ${leaf} (${u.cause})`);
-    }
-    return false;
-  });
-  return [...out, ...pairUnused(rest, kept, (k) => fold.nodes.has(k as never), removedRows, projectsWhenRestored, memberInDocuments, (k) => (fold.anchors.get(k as never) ?? []).map((r) => r.guid))];
-}
-
-/** Which kept leaves {@link unusedDiverge} leaves out of the pairing, pure: everything under a live placeholder, and under a
- *  row the record removes everything but that row's own `removed` leaf and the user-added nodes linked on any row there.
- *  A keyed copy is skipped there like the rest: under the instance's own removal the fold holds it inert, unreported. */
-export function keptLeafSkipped(key: string, leaf: string, livePlaceholders: ReadonlySet<string>, removedRows: readonly string[], keyed = false): boolean {
-  return [...livePlaceholders].some((k) => under(key, k))
-    || (!(leaf === 'own' && !keyed) && removedRows.some((k) => under(key, k) && !(key === k && leaf === 'removed')));
-}
-
-/** The pairing half of {@link unusedDiverge}, pure: the fold's unused records against today's kept leaves, by row.
- *  `projected` is the fold's node set; `projectsWhenRestored(key)` re-folds the record with that row's removal turned
- *  into a restore; `memberInDocuments(key)` says a document the instance reaches still holds the row's member;
- *  `anchoredAt(key)` is the guids the fold links at that row. */
-export function pairUnused(foldUnused: readonly UnusedRecord[], keptIn: readonly { key: string; leaf: string; guid?: string }[], projected: (key: string) => boolean, removedRows: readonly string[], projectsWhenRestored: (key: string) => boolean, memberInDocuments: (key: string) => boolean = () => true, anchoredAt: (key: string) => readonly string[] = () => []): string[] {
-  const kept = [...keptIn];
-  const out: string[] = [];
-  for (const u of foldUnused) {
-    const leaf = unusedLeaf(u);
-    // By row; only a kept LEGACY leaf, which names no row, pairs by leaf alone (#2009 re-review: a cross-row fallback let
-    // one row's record consume another's kept leaf, and hide both).
-    let at = kept.findIndex((k) => k.key === u.key && k.leaf === leaf);
-    if (at < 0) at = kept.findIndex((k) => k.key === '(legacy)' && k.leaf === leaf);
-    if (at >= 0) kept.splice(at, 1);
-    else out.push(`fold-only unused ${u.key} ${leaf} (${u.cause})`);
-  }
-  for (const k of kept) {
-    // `(applied)`: the fold does not project a member it WOULD project were the removal a restore, so the removal is
-    // what took it out. A gone member does not project after the restore either (and an ambiguous one is projected
-    // already), so a fold that lost its "removed, gone" record cannot read as applied (#2009 re-reviews: that loss was waived as #2013, first unkeyed, then marked
-    // applied by a document-membership test, which an inner layer's removal also passes).
-    const applied = (k.leaf === 'removed' && removedRows.includes(k.key) && !projected(k.key) && projectsWhenRestored(k.key))
-      // A kept LINK the fold links at the same row, by guid: today keeps the row as an orphan and also spawns the node,
-      // the same double booking on a link (#1931 member 1: its orphan test misses a template member row's `own`, #2023).
-      // A link the fold lost, or links elsewhere, is not an application, and prints unmarked. The line names the guid,
-      // so a waiver can tie the fold's link at that row to this kept one and to nothing else.
-      || (k.leaf === 'own' && k.key !== '(legacy)' && !!k.guid && anchoredAt(k.key).includes(k.guid));
-    // `(unprojected)`: an own link on a row whose member no document holds any more (#2018's mechanism: the fold never
-    // registers it). A member a document still holds but a layer removed is HELD, and its link is the fold's `own
-    // heldNode` record; losing that is not #2018 (#2009 re-review), so it prints unmarked.
-    const unprojected = k.leaf === 'own' && k.key !== '(legacy)' && !projected(k.key) && !memberInDocuments(k.key);
-    out.push(`kept-only unused ${k.key} ${k.leaf}${applied ? (k.leaf === 'own' ? ` (applied ${k.guid})` : ' (applied)') : unprojected ? ' (unprojected)' : ''}`);
-  }
-  return out;
-}
 
 /** `key` is `k` or lies under it. */
 const under = (key: string, k: string) => k === '/' || key === k || key.startsWith(`${k}/`);
@@ -590,35 +462,8 @@ export function statedRootLid(owner: { traits?: unknown }): number | null {
  *  the entry or node as stored, which judges its root forms under a missing root; left out, the legacy `added` there
  *  stays unjudged (`placementDiverge`). `ownEntry`: see {@link translatedLive}. */
 export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: number, copies: ReadonlySet<string> = new Set(), owner?: StoredOwner, ownEntry?: (guid: string) => boolean): string[] {
-  const { fold, live, ruledKept } = translatedLive(rec, read, rootId, copies, ownEntry);
-  const removedRows = [...rec.list.rows].filter(([, r]) => r.removed).map(([k]) => k);
-  const projectsWhenRestored = (key: string): boolean => {
-    const rows = new Map(rec.list.rows);
-    rows.set(key as never, { ...rows.get(key as never)!, removed: false });
-    // A placeholder is a projected row too: the removal of a missing-prefab row is applied when it takes the placeholder.
-    const restored = foldInstance(read, { ...rec, list: { ...rec.list, rows } });
-    return restored.nodes.has(key as never) || restored.placeholders.has(key as never);
-  };
-  // The member guids the instance's documents hold. A template-added key (`a+…`) names no member guid, so it counts as
-  // held: the marker that needs its absence stays off, and a loss there goes red.
-  const nodeGuids = new Set<string>();
-  const seenDocs = new Set<string>();
-  const walk = (g: string): void => {
-    if (!g || seenDocs.has(g)) return;
-    seenDocs.add(g);
-    const got = read(g);
-    if (!('doc' in got)) return;
-    for (const row of got.doc.entities ?? []) {
-      if (typeof row.localId === 'number') nodeGuids.add(row.nodeGuid ?? preV5NodeGuid(g, row.localId));
-      if (typeof row.prefab === 'string') walk(row.prefab);
-    }
-  };
-  walk(rec.source);
-  const memberInDocuments = (key: string): boolean => {
-    const last = key.slice(key.lastIndexOf('/') + 1);
-    return last.startsWith('a+') || nodeGuids.has(last);
-  };
-  return [...diverge(fold, live), ...unusedDiverge(fold, rec.rootGuid, live.placeholders, removedRows, projectsWhenRestored, memberInDocuments, rec.held.pendingLegacy as Bag | undefined, ruledKept), ...placementDiverge(fold, rec, { read, owner })];
+  const { fold, live } = translatedLive(rec, read, rootId, copies, ownEntry);
+  return [...diverge(fold, live), ...placementDiverge(fold, rec, { read, owner })];
 }
 
 /** The live tree of the instance rooted at `rootId`, with the rules' visible changes applied to it (what
@@ -681,27 +526,12 @@ const canon = (v: unknown): unknown => {
   return v;
 };
 
-/** Today's kept stores for the instance `rootGuid`, as sorted `<row> <leaf>` lines: what the old save writes back. */
-export function keptLeavesOf(rootGuid: string): string[] {
-  const out: string[] = [];
-  const legacy: string[] = [];
-  legacyLeaves(keptLegacyChannels(rootGuid) as Bag | undefined, legacy);
-  for (const leaf of legacy) out.push(`(legacy) ${leaf}`);
-  for (const rows of [keptMemberOrphans(rootGuid), keptUnusedRows(rootGuid)] as (Record<string, Bag> | undefined)[]) {
-    for (const [key, r] of Object.entries(rows ?? {})) {
-      const leaves: string[] = [];
-      rowLeaves({ [key]: r }, leaves);
-      for (const leaf of leaves) out.push(`${key} ${leaf}`);
-    }
-  }
-  return out.sort();
-}
-
-/** The frozen form of one instance (design § 10.4b): its translated live tree ({@link translatedLive}) and today's kept
- *  stores, as one stable text. Equal texts mean the same nodes, parents, components and values (to `close`'s tolerance),
- *  the same placeholders and anchors, and the same kept records. EntityAttributes' `guid` is left out, as `diverge`
- *  leaves it out: identity is the derive's, and the S4 shadow checks it. */
-export function frozenForm(t: { live: Live; ruledKept: readonly string[] }, rootGuid: string): string {
+/** The frozen form of one instance (design § 10.4b): its translated live tree ({@link translatedLive}), as one stable
+ *  text. Equal texts mean the same nodes, parents, components and values (to `close`'s tolerance), and the same
+ *  placeholders and anchors. EntityAttributes' `guid` is left out, as `diverge` leaves it out: identity is the derive's,
+ *  and the S4 shadow checks it. (It held the stores the load kept for the save, too, until #2001 S8b: see
+ *  `foldOracleFrozen.test.ts`.) */
+export function frozenForm(t: { live: Live; ruledKept: readonly string[] }): string {
   const nodes = [...t.live.nodes.values()].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)).map((n) => {
     const traits: Bag = {};
     for (const [name, d] of Object.entries(n.traits)) {
@@ -713,5 +543,5 @@ export function frozenForm(t: { live: Live; ruledKept: readonly string[] }, root
     return [n.key, n.parent, traits];
   });
   const anchors = [...t.live.anchors].map(([k, gs]) => [k, [...gs].sort()]).sort((a, b) => ((a[0] as string) < (b[0] as string) ? -1 : 1));
-  return JSON.stringify(canon({ nodes, anchors, placeholders: [...t.live.placeholders].sort(), kept: keptLeavesOf(rootGuid), ruledKept: [...t.ruledKept].sort() }));
+  return JSON.stringify(canon({ nodes, anchors, placeholders: [...t.live.placeholders].sort(), ruledKept: [...t.ruledKept].sort() }));
 }

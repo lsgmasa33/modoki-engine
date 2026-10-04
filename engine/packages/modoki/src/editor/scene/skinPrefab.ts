@@ -119,7 +119,8 @@ export async function makeRigPrefabAsset(
   // save of the rig prefab since, an outside change) — the #1679 precondition, asked of memory.
   const action: UndoAction = {
     label,
-    // A parked document's edit that also rebuilds the live frames placed from it (undoManager.ts).
+    // A parked document's edit that also rebuilds the live frames placed from it (undoManager.ts). The park's rebase
+    // reprojects each of them from its records (`commitPrefabChanges`), so it keeps every record (#2001 S8b).
     _isFileDirect: true, _rebasesLiveFrames: true,
     undo: () => parkPrefabChanges([{ source: guid, doc: restored(), from: prefab }]),
     redo: () => parkPrefabChanges([{ source: guid, doc: prefab, from: restored() }]),

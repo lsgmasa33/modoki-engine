@@ -35,7 +35,6 @@ import {
   valuesEqual, warnInertPrefabSizes,
 } from './prefab';
 import { getCachedPrefabSync, getPrefabSource, preloadNestedPrefabsForSubtree, wouldCreateCycle } from './prefabCache';
-import { settleSwallowedKeptState } from './prefabTokens';
 import { collectComparableTraits } from './prefabInstanceOverrides';
 import { captureInstanceStructure, toTemplateNodes } from './prefabCapture';
 import { declaredTemplateKeys, flatKeyedSteps, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
@@ -49,8 +48,8 @@ import {
   carryPromotedGuids, deletePromotedNodes, insertAddedSubtree, movedRowsOf, promoteReferenceMoves,
   rehangPromotionSurvivors, snapshotPromotedGuids,
 } from './prefabApplyStructure';
-import { markStale } from '../../runtime/prefab/instanceStore';
-import { guidOfEntity, outermostStoredRoot, storedRootsUnder } from '../instance/instanceKeys';
+import * as instanceEdits from '../instance/instanceEdits';
+import { rollbackOnThrow } from '../instance/instanceRollback';
 import { editorPrefabReader } from '../instance/instanceSync';
 import { writeTemplateForm } from '../../runtime/prefab/templateFormDocument';
 import type { PrefabDoc, PrefabReader as PrefabDocReader } from '../../runtime/prefab/instanceRecord';
@@ -1313,14 +1312,28 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   // of every other frame of the source still built from the old document — all in the world the Apply began in (I11).
   // Several files are ONE step (#1692's `commitPrefabWrites`): U13's second file, or an override on an enclosing prefab,
   // lands with the frame's own or not at all.
+  // An added node is applied only when the instance's records can follow it (#2001 S8b): refused here, before any file is
+  // written, rather than written and left to a re-seed of the records from the live tree.
+  const promoting = liveAddedRootsToDelete.length > 0 || promotedRows.size > 0 || promotedRefRows.size > 0 || keyedPromotions.size > 0;
+  if (promoting && !instanceEdits.canPromoteAdded(rootInstanceId, liveAddedRootsToDelete, promotedRows, promotedRefRows, frameWrite ? newPrefab : null, source)) {
+    return { ...NOOP_APPLY, refused: 'an added node could not be applied: the instance\'s records do not state it as the scene\'s own, so nothing was applied. Save the scene, reopen it, and apply again.' };
+  }
   const committed = await commitPrefabWrites(plan.writes.map((w) => ({ source: w.source, doc: w.doc, expected: w.expected })), {
-    // Each refresh below marks stale what it rebuilds from the capture, and the export marks the applying tree (#2046 S7.3).
-    maintainsRecords: true,
+    // Each refresh below marks stale what it rebuilds from the capture (#2046 S7.3).
     rebuild: async () => {
       // Delete the live plain entities for applied additions BEFORE any refresh, so the re-instantiated prefab member
       // replaces them instead of duplicating. Before the loop, not in the frame's turn: an added node written only into an
       // ENCLOSING prefab (#1715) has no frame turn, and that prefab's capture re-spawned it beside its template twin.
       // Non-applied additions stay live and are re-captured + re-spawned by the refresh.
+      // A promotion changes the applying tree's structure. Its records follow it (`promoteAdded`, #2001 S8b), read before
+      // the delete below takes the nodes: a node written into the frame's own document is pinned as its new row, and one
+      // written on an enclosing prefab's row (#1715) only leaves the record's links, as its guid derives. One the records
+      // cannot follow was refused before the write (`canPromoteAdded`, above); failing here all the same (the records
+      // changed in the write's await), it throws, and the Apply rolls back.
+      if (promoting && !instanceEdits.promoteAdded(rootInstanceId, liveAddedRootsToDelete, promotedRows, promotedRefRows, frameWrite ? newPrefab : null, source)) {
+        throw new Error('the instance\'s records could not follow the promotion of its added nodes');
+      }
+      const offRecords = <T extends object>(list: readonly T[] | undefined): T[] | undefined => list && [...list];
       const survivors = deletePromotedNodes(liveAddedRootsToDelete);
       const follow = new Map<string, string>();
       // Every written file's instances, in the plan's order — innermost first — so each capture reads frames already
@@ -1329,7 +1342,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
       if (w.role === 'outer') {
         const roots = collectInstanceRoots(w.source);
         for (const rootId of roots) await preloadRebuildEntry(rootId);
-        refreshInstances(w.source, roots, w.expected, w.doc, new Map(), w.appliedFrom);
+        refreshInstances(w.source, roots, w.expected, w.doc, new Map(), offRecords(w.appliedFrom));
         continue;
       }
       // Every instance of this source, with NO exclusion — the clicked one goes through
@@ -1344,15 +1357,9 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
       // it rebuilds through (#1880 F7a) — beside what the commit warmed (the new file's own reference rows). A user-added
       // nested instance is not a row of newPrefab, so the file walk never reaches it (#1284).
       for (const rootId of rootsToRefresh) await preloadRebuildEntry(rootId);
-      refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, new Map(), [{ rootId: rootInstanceId, rootGuid: durableGuid(rootGuid), fields: appliedFields }, ...nestedApplied]);
+      refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, new Map(), offRecords([{ rootId: rootInstanceId, rootGuid: durableGuid(rootGuid), fields: appliedFields }, ...nestedApplied]));
       for (const [from, to] of carryPromotedGuids(rootGuid, promotedGuids)) follow.set(from, to);
       rehangPromotionSurvivors(survivors, follow);
-      // A promoted REFERENCE node's kept state went into its row (`insertAddedSubtree`'s bake); its identity stays in the
-      // scene, on the stored root it is now a member of (#1802, owner ruling D) — the settle Create Prefab runs, which finds
-      // each node by the guid `carryPromotedGuids` gave it back. Apply's undo reloads the scene from its snapshot.
-      // By guid: the refresh rebuilt the instance, so `rootInstanceId` may name nothing now.
-      const liveRoot = promotedRefRows.size && rootGuid ? localToEcsGuid(rootGuid) : 0;
-      if (liveRoot) settleSwallowedKeptState(liveRoot);
       }
       // A node written on an ENCLOSING prefab's row (#1715) is a template-keyed node there: every instance derives its
       // guid, and no row can pin it, so its refs follow it to the derived one — after the last refresh, which rebuilt it.
@@ -1406,20 +1413,8 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
 
 /** {@link applyToPrefabSelectiveUnmarked}, keeping the instance store's records true (#2046 S7.3). The fan-out reprojects
  *  every other tree from its record and marks stale the entries it rebuilt from the capture (`refreshInstances`); the
- *  applying tree is one of those (its applied records leave it by the capture's subtraction, U15), marked here too for
- *  what the Apply did to it outside the refresh (a promotion's keys, its survivors' re-hang). Every record when it
- *  throws part-way. */
-export const applyToPrefabSelective: typeof applyToPrefabSelectiveUnmarked = async (rootInstanceId, ...rest) => {
-  const world = getCurrentWorld();
-  const top = outermostStoredRoot(rootInstanceId) || rootInstanceId;
-  const entry = guidOfEntity(top);
-  // Every stored root in the entry NOW, by guid: a promoted scene-added instance is a row after the Apply.
-  const before = [top, ...storedRootsUnder(top)].map(guidOfEntity);
-  let out: ApplyResult;
-  try { out = await applyToPrefabSelectiveUnmarked(rootInstanceId, ...rest); } catch (err) { markStale(getCurrentWorld(), 'apply'); throw err; }
-  if (out.applied || out.landed) {
-    const id = findEntityByGuid(entry)?.id();
-    markStale(world, 'apply', [...before, ...(id ? storedRootsUnder(id).map(guidOfEntity) : [])]);
-  }
-  return out;
-};
+ *  applying tree's applied records leave it on records where they can be named (`subtractApplied`, #2001 S8b), and by
+ *  the capture's subtraction otherwise (U15). A promotion's records follow it (`promoteAdded`), or the Apply is refused
+ *  before it writes (#2001 S8b): nothing is left for a re-seed. One that throws part-way rolls back
+ *  (`instanceRollback.ts`, #2001 S8b): every record as it stood before it, each tree rebuilt from them. */
+export const applyToPrefabSelective: typeof applyToPrefabSelectiveUnmarked = rollbackOnThrow('Apply to Prefab', applyToPrefabSelectiveUnmarked);

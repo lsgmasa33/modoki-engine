@@ -53,6 +53,7 @@ function readTraitDataImpl(id: number, meta: any) {
 }
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),
@@ -92,6 +93,7 @@ vi.mock('../../src/runtime/ui/uiTreeStore', () => ({ markUIDirty: vi.fn() }));
 
 const fileServer = new Map<string, unknown>(); // guid -> prefab JSON
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
+  onFontInvalidated: () => () => {},
   newGuid: () => 'gen-guid',
   registerAsset: vi.fn(),
   getGuidForPath: () => undefined,

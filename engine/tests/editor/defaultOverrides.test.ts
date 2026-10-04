@@ -15,12 +15,22 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 }));
 
 import {
-  createTestWorld, type TestWorld, setPlayState, getTraitByName, writeTraitField, findEntity, getAllEntities, readTraitData,
+  createTestWorld, type TestWorld, setPlayState, getTraitByName, writeTraitField, getAllEntities, readTraitData,
 } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved } from '@modoki/engine/editor';
 import { setPrefabCache, setPrefabSource, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { place, setFields } from '../../packages/modoki/src/editor/instance/instanceEdits';
+import { ensureGuid } from '../../packages/modoki/src/editor/undo/entityRef';
+import { deriveInstanceMemberGuids } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { getCurrentWorld as worldNow } from '../../packages/modoki/src/runtime/core/ecs/world';
+
+/** Placed as a drop places it (#2001 S8b): its members' derived guids and the door's record, under the root's guid. */
+function seated(root: number): void {
+  deriveInstanceMemberGuids(worldNow());
+  place(root);
+}
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
-import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
@@ -71,10 +81,10 @@ beforeEach(() => {
 });
 afterEach(() => { game?.dispose(); game = undefined; setPrefabCache(P, null); setPrefabCache(U, null); setPrefabCache(O, null); });
 
-/** Set and mark (as an editor write does) `trait.field` = `value` on `id`. */
+/** Set and record (as an editor write does) `trait.field` = `value` on `id`. */
 function edit(id: number, trait: string, field: string, value: unknown): void {
   writeTraitField(id, getTraitByName(trait)!, field, value);
-  markOverride(findEntity(id)!, trait, field);
+  setFields(id, trait, [field]); // through the door, as the Inspector's write goes (#2001 S8b)
 }
 const byName = (name: string) => getAllEntities().find((e) => e.name === name)!.id;
 const read = (id: number, trait: string) => readTraitData(id, getTraitByName(trait)!) as Record<string, unknown>;
@@ -84,13 +94,14 @@ const templateRow = (src: string, localId: number) => getCachedPrefabSync(src)!.
 function pInstance(): { guid: string; root: number } {
   const root = instantiatePrefab(pDoc as never, 0);
   setPrefabSource(root, { id: P });
-  writeTraitField(root, getTraitByName('EntityAttributes')!, 'guid', 'g-p-root');
+  writeTraitField(root, getTraitByName('EntityAttributes')!, 'guid', 'dddddddd-0000-4000-8000-0000000d0001');
+  seated(root);
   edit(root, 'EntityAttributes', 'name', 'R copy');
   edit(root, 'EntityAttributes', 'sortOrder', 1);
   edit(root, 'Transform', 'x', 5);
   edit(root, 'Transform', 'rx', 0.5);
   edit(byName('A'), 'Transform', 'x', 7);
-  return { guid: 'g-p-root', root };
+  return { guid: 'dddddddd-0000-4000-8000-0000000d0001', root };
 }
 // The rx edit marks the WHOLE rotation (#1880 F5: rotation is one value, Unity's one quaternion), so rx, ry and rz are all
 // default overrides of the root.
@@ -184,9 +195,10 @@ describe('default overrides (#1831, Unity IsDefaultOverride)', () => {
     // Mutation: drop the empty-set refusal — the Apply runs on no keys and answers "nothing was written" with no reason.
     const root = instantiatePrefab(pDoc as never, 0);
     setPrefabSource(root, { id: P });
-    writeTraitField(root, getTraitByName('EntityAttributes')!, 'guid', 'g-p-root');
+    writeTraitField(root, getTraitByName('EntityAttributes')!, 'guid', 'dddddddd-0000-4000-8000-0000000d0001');
+    seated(root);
     edit(root, 'Transform', 'x', 5);
-    await expect(runAgentOp('prefab', { action: 'apply', entityGuid: 'g-p-root' }))
+    await expect(runAgentOp('prefab', { action: 'apply', entityGuid: 'dddddddd-0000-4000-8000-0000000d0001' }))
       // …and the root's sibling order, which every scene instance records (F7, #1914 R6: Unity's rootOrder).
       .rejects.toMatchObject({ code: 'REFUSED_BY_OP', options: [`${G(1)}.Transform.x`, `${G(1)}.EntityAttributes.sortOrder`] });
     expect(writes).toEqual([]);
@@ -196,14 +208,15 @@ describe('default overrides (#1831, Unity IsDefaultOverride)', () => {
     // Mutation: drop the UIAnchor / UIElement entries from DEFAULT_OVERRIDE_FIELDS — the root's rect is applied.
     const root = instantiatePrefab(uDoc as never, 0);
     setPrefabSource(root, { id: U });
-    writeTraitField(root, getTraitByName('EntityAttributes')!, 'guid', 'g-u-root');
+    writeTraitField(root, getTraitByName('EntityAttributes')!, 'guid', 'dddddddd-0000-4000-8000-0000000d0002');
+    seated(root);
     edit(root, 'UIAnchor', 'top', 12);
     edit(root, 'UIAnchor', 'pivotX', 0);
     edit(root, 'UIElement', 'width', 200);
     edit(root, 'UIElement', 'rotation', 15);
     edit(root, 'UIElement', 'scale', 2);
     edit(byName('Label'), 'UIElement', 'width', 80);
-    const res = await runAgentOp('prefab', { action: 'apply', entityGuid: 'g-u-root' }) as { appliedKeys: string[]; defaultOverridesLeft: string[] };
+    const res = await runAgentOp('prefab', { action: 'apply', entityGuid: 'dddddddd-0000-4000-8000-0000000d0002' }) as { appliedKeys: string[]; defaultOverridesLeft: string[] };
     expect([...res.defaultOverridesLeft].sort()).toEqual([
       `${G(11)}.EntityAttributes.sortOrder`, // F7: recorded on every scene instance root
       `${G(11)}.UIAnchor.pivotX`, `${G(11)}.UIAnchor.top`, `${G(11)}.UIElement.rotation`, `${G(11)}.UIElement.width`,
@@ -218,14 +231,15 @@ describe('default overrides (#1831, Unity IsDefaultOverride)', () => {
     // "may have stopped being a prefab instance" guess (review #1).
     const root = instantiatePrefab(pDoc as never, 0);
     setPrefabSource(root, { id: P });
-    writeTraitField(root, getTraitByName('EntityAttributes')!, 'guid', 'g-p-root');
+    writeTraitField(root, getTraitByName('EntityAttributes')!, 'guid', 'dddddddd-0000-4000-8000-0000000d0001');
+    seated(root);
     edit(root, 'Transform', 'x', 5);
     edit(root, 'EntityAttributes', 'editorFolder', 'Enemies');
-    await expect(runAgentOp('prefab', { action: 'apply', entityGuid: 'g-p-root' }))
+    await expect(runAgentOp('prefab', { action: 'apply', entityGuid: 'dddddddd-0000-4000-8000-0000000d0001' }))
       .rejects.toMatchObject({ code: 'REFUSED_BY_OP', message: expect.stringMatching(/only applicable overrides are its root's default overrides/) });
     expect(writes).toEqual([]);
     // Revert can act on the folder: it does, and leaves x.
-    const rv = await runAgentOp('prefab', { action: 'revert', entityGuid: 'g-p-root' }) as { newRootId: number; revertedKeys: string[] };
+    const rv = await runAgentOp('prefab', { action: 'revert', entityGuid: 'dddddddd-0000-4000-8000-0000000d0001' }) as { newRootId: number; revertedKeys: string[] };
     expect(rv.revertedKeys).toEqual([`${G(1)}.EntityAttributes.editorFolder`]);
     expect(read(rv.newRootId, 'Transform').x).toBe(5);
   });
@@ -234,18 +248,19 @@ describe('default overrides (#1831, Unity IsDefaultOverride)', () => {
     // Unity: "the position is not a default override if applying to A, but is if applying to B" (GetApplyTargets).
     const orId = instantiatePrefab(oDoc as never, 0);
     setPrefabSource(orId, { id: O });
+    ensureGuid(orId); seated(orId);
     const nRoot = byName('R');
-    writeTraitField(nRoot, getTraitByName('EntityAttributes')!, 'guid', 'g-n-root');
+    writeTraitField(nRoot, getTraitByName('EntityAttributes')!, 'guid', 'dddddddd-0000-4000-8000-0000000d0003');
     edit(nRoot, 'Transform', 'x', 4);
     // From N's own context, at its default target (P, its own prefab): left out, and named as such.
-    await expect(runAgentOp('prefab', { action: 'apply', entityGuid: 'g-n-root' }))
+    await expect(runAgentOp('prefab', { action: 'apply', entityGuid: 'dddddddd-0000-4000-8000-0000000d0003' }))
       .rejects.toMatchObject({ code: 'REFUSED_BY_OP', message: expect.stringMatching(/default overrides/) });
     // Mutation: ignore the target in `isDefaultOverrideAt` — `target: O` is refused the same way (review #2).
     // (`overrides` from N: its plan leaves the placement out, at P.)
-    const ov = await runAgentOp('prefab', { action: 'overrides', entityGuid: 'g-n-root' }) as { effects: Record<string, unknown>; defaultOverridesNote?: string };
+    const ov = await runAgentOp('prefab', { action: 'overrides', entityGuid: 'dddddddd-0000-4000-8000-0000000d0003' }) as { effects: Record<string, unknown>; defaultOverridesNote?: string };
     expect(Object.keys(ov.effects)).toEqual([]);
     expect(ov.defaultOverridesNote).toBeDefined();
-    const res = await runAgentOp('prefab', { action: 'apply', entityGuid: 'g-n-root', target: O }) as { appliedKeys: string[]; defaultOverridesLeft?: string[]; written: string[] };
+    const res = await runAgentOp('prefab', { action: 'apply', entityGuid: 'dddddddd-0000-4000-8000-0000000d0003', target: O }) as { appliedKeys: string[]; defaultOverridesLeft?: string[]; written: string[] };
     expect(res.appliedKeys).toEqual([`${G(1)}.Transform.x`]);
     expect(res.defaultOverridesLeft).toBeUndefined();
     expect(res.written).toEqual([O]);

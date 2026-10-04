@@ -744,70 +744,6 @@ describe('loadSceneFile', () => {
     });
   });
 
-  /** A9 defect 1 — the chain-order mark wipe.
-   *
-   *  `clearAllOverrideMarks()` defends against ecs-id reuse ACROSS WORLDS, but it
-   *  used to run unconditionally on every `loadSceneFile` CALL. That equivalence
-   *  ("one call == one world") died with base scenes: a chain loads N scene files
-   *  into ONE world, bases first and the primary last, so the primary's call wiped
-   *  the marks the base's call had just seeded — and every chained prefab instance
-   *  then serialized with EMPTY overrides, because `captureInstanceOverrides`
-   *  mark-gates every diff.
-   *
-   *  These two tests pin the MECHANISM (the flag). The wiring — SceneManager
-   *  clearing exactly once per staging world for a whole chain — is pinned in
-   *  sceneManagerBaseSceneChain.test.ts.
-   *  See docs/reviews/a9-carried-instance-overrides-investigation.md. */
-  describe('override-mark lifetime (A9 defect 1)', () => {
-    it('clears marks by default — an ordinary single-scene load is unchanged', async () => {
-      const { loadSceneFile } = await getLoader();
-      const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
-      // A mark left on an entity the load never touches, so only the global clear can remove it.
-      const stale = testWorld.spawn();
-      markOverride(stale, 'Transform', 'x');
-      expect(getOverrideMarkSet(stale)?.has('Transform.x')).toBe(true);
-
-      await loadSceneFile(
-        { version: SCENE_FORMAT_VERSION, entities: [{ id: 1, traits: { Transform: true } }] },
-        { fetchPrefab: async () => null, loadModels: false },
-      );
-
-      expect(getOverrideMarkSet(stale)).toBeUndefined();
-    });
-
-    it('clearMarks:false preserves marks an EARLIER scene in the same chain seeded', async () => {
-      const { loadSceneFile } = await getLoader();
-      const { markOverride, getOverrideMarkSet, clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
-      clearAllOverrideMarks();
-
-      // Scene 1 of the chain (the BASE) — spawn an instance member and mark a
-      // field on it, standing in for applyOverrides* seeding from the file.
-      const spawned: { entity: any; oldId: number }[] = [];
-      await loadSceneFile(
-        {
-          version: SCENE_FORMAT_VERSION,
-          entities: [{ id: 22, traits: { Transform: true, EntityAttributes: { name: 'Fish' }, PrefabInstance: { source: 'fish.prefab.json', rootInstanceId: 22 } } }],
-        },
-        {
-          world: testWorld, clearMarks: false, fetchPrefab: async () => null, loadModels: false,
-          onEntitySpawned: (entity: any, oldId: number) => { spawned.push({ entity, oldId }); },
-        },
-      );
-      const fish = spawned.find((s) => s.oldId === 22)!.entity;
-      markOverride(fish, 'Transform', 'x');
-      expect(getOverrideMarkSet(fish)?.has('Transform.x')).toBe(true);
-
-      // Scene 2 of the chain (the PRIMARY) — same world, no prefab instances of
-      // its own. Before the fix this call wiped the base's marks. It must not.
-      await loadSceneFile(
-        { version: SCENE_FORMAT_VERSION, entities: [{ id: 7, traits: { Transform: true, EntityAttributes: { name: 'Pad' } } }] },
-        { world: testWorld, clearMarks: false, fetchPrefab: async () => null, loadModels: false },
-      );
-
-      expect(getOverrideMarkSet(fish)?.has('Transform.x')).toBe(true);
-    });
-  });
-
   describe('empty scene', () => {
     it('handles scene with no entities', async () => {
       const { loadSceneFile } = await getLoader();
@@ -1897,20 +1833,16 @@ describe('migrateV12toV13 (UIAnchor.zIndex removal)', () => {
  *  `games/3d-test/runtime/assets/scenes/skinned-test.json` dropped a populated
  *  `Animator.clips` override. The guard here read `field in meta.fields` — the
  *  Inspector-rendering list — as "does this field persist", so `clips`/`clip`
- *  were neither applied NOR marked; the unmarked field then failed
- *  `captureInstanceOverrides`'s mark-gate and the next save deleted it.
+ *  were not applied, and the next save deleted them.
  *  The predicate is now the koota schema (runtime/core/ecs/traitSchema.ts). */
 describe('overrides over persistent fields absent from meta.fields', () => {
   const BANK = JSON.stringify([{ name: 'skin', clip: 'f1cc3b85-2c23-457b-938a-3470ada21b36' }]);
 
   async function applyTo(fields: Record<string, unknown>) {
     const { applyOverridesByLocalToEcs } = await getLoader();
-    const { clearAllOverrideMarks, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
-    clearAllOverrideMarks();
     const entity = testWorld.spawn(Animator({ clips: '[]', clip: '', speed: 1 }));
-    // Stated by the writer's own layer (#1914 R1: only those are recorded).
-    applyOverridesByLocalToEcs(testWorld, new Map([[1, entity.id()]]), { 1: { Animator: fields } }, { 1: { Animator: fields } });
-    return { live: entity.get(Animator) as Record<string, unknown>, marks: getOverrideMarkSet(entity) };
+    applyOverridesByLocalToEcs(testWorld, new Map([[1, entity.id()]]), { 1: { Animator: fields } });
+    return { live: entity.get(Animator) as Record<string, unknown> };
   }
 
   it('APPLIES clips/clip rather than skipping them as unknown fields', async () => {
@@ -1919,15 +1851,8 @@ describe('overrides over persistent fields absent from meta.fields', () => {
     expect(live.clip).toBe('skin');
   });
 
-  it('MARKS them, so a later capture keeps them instead of mark-gating them away', async () => {
-    const { marks } = await applyTo({ clips: BANK, clip: 'skin' });
-    expect(marks?.has('Animator.clips')).toBe(true);
-    expect(marks?.has('Animator.clip')).toBe(true);
-  });
-
   it('still skips a field the schema does not declare (renamed/stale)', async () => {
-    const { live, marks } = await applyTo({ retiredField: 7 });
+    const { live } = await applyTo({ retiredField: 7 });
     expect(live).not.toHaveProperty('retiredField');
-    expect(marks?.has('Animator.retiredField')).not.toBe(true);
   });
 });

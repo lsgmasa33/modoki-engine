@@ -1,17 +1,18 @@
 /** #1880 F5 (owner-approved, the Unity way): an instance's ROTATION is one override. Unity records a rotation edit as one
  *  quaternion (`TransformRotationGUI` writes `m_Rotation.quaternionValue` whole even when one Euler field changed), so an
- *  instance that turned one axis pins its whole rotation against later template edits. Stated in the mark store
- *  (`ROTATION_MARKS`), which every mark writer goes through; the captures save what is marked. */
+ *  instance that turned one axis pins its whole rotation against later template edits. Stated in the override view
+ *  (`recordedKeys`, `ROTATION_MARKS`): a record of one axis reads as the rotation's, and the captures save what it reads. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld, setPlayState, getTraitByName, writeTraitField, findEntity, getAllEntities } from '@modoki/engine/runtime';
 import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { captureInstanceOverrides } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
-import { markOverride, unmarkOverride, getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { recordOverridesByDiff } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { place, setFields } from '../../packages/modoki/src/editor/instance/instanceEdits';
 
 registerAllTraits();
 
@@ -35,37 +36,40 @@ afterEach(() => { game?.dispose(); game = undefined; setPrefabCache(P, null); })
 
 const T = () => getTraitByName('Transform')!;
 const byName = (name: string) => getAllEntities().find((e) => e.name === name)!.id;
-const marksOf = (id: number) => [...(getOverrideMarkSet(findEntity(id)!) ?? [])].filter((k) => k.startsWith('Transform.')).sort();
+const marksOf = (id: number) => [...(overrideKeysOf(findEntity(id)!) ?? [])].filter((k) => k.startsWith('Transform.')).sort();
 function instance(): number {
   const root = instantiatePrefab(pDoc as never, 0);
   setPrefabSource(root, { id: P });
+  place(root); // its record, as a drop mints one
   return root;
 }
 
 describe('rotation is ONE override (#1880 F5)', () => {
-  // Mutation: `markOverride` adds only the one key (drop `groupOf`) — the capture holds rx alone, and ry follows the
-  // template.
+  // Mutation: the view reads one axis as one key (`recordedKeys` drops the `ROTATION_MARKS` group) — the capture holds rx
+  // alone, and ry follows the template.
   it('an rx-only edit saves the WHOLE rotation, the template\'s ry included', () => {
     const root = instance();
     const a = byName('A');
     writeTraitField(a, T(), 'rx', 0.5);
-    markOverride(findEntity(a)!, 'Transform', 'rx');
+    setFields(a, 'Transform', ['rx']);
     expect(marksOf(a)).toEqual(['Transform.rx', 'Transform.ry', 'Transform.rz']);
     expect(captureInstanceOverrides(root, pDoc as never)[2]!.Transform).toEqual({ rx: 0.5, ry: 0.25, rz: 0 });
   });
 
-  it('unmarking one axis unmarks the rotation, and leaves position alone', () => {
+  it('a record of one axis reads as the rotation, and leaves position its own', () => {
     instance();
-    const a = findEntity(byName('A'))!;
-    markOverride(a, 'Transform', 'x');
-    markOverride(a, 'Transform', 'rz');
-    unmarkOverride(a, 'Transform', 'ry');
-    expect(marksOf(byName('A'))).toEqual(['Transform.x']);
+    const a = byName('A');
+    writeTraitField(a, T(), 'x', 3);
+    setFields(a, 'Transform', ['x']);
+    expect(marksOf(a)).toEqual(['Transform.x']);
+    writeTraitField(a, T(), 'rz', 0.7);
+    setFields(a, 'Transform', ['rz']);
+    expect(marksOf(a)).toEqual(['Transform.rx', 'Transform.ry', 'Transform.rz', 'Transform.x']);
   });
 
   // Mutation: decide each rotation axis on its own in `recordOverridesByDiff` AND record one key, not its group
-  // (`groupOf` returning `[key]`) — only rx is recorded, and the save writes rx without ry/rz. Either half alone stays
-  // green: R2's recorder never unmarks, so the group `markOverride` takes for rx is the whole rotation.
+  // (`instanceEdits.ts`' `isRotation`) — only rx is recorded, and the save writes rx without ry/rz. Either half alone
+  // stays green: R2's recorder never takes a record off, so the group the record takes for rx is the whole rotation.
   it('the recorder: rx off its base and ry equal to it records the whole rotation', () => {
     const root = instance();
     const a = byName('A');

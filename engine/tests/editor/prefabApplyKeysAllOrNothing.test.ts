@@ -17,11 +17,12 @@ import {
 import { clearHistory, markSceneSaved } from '@modoki/engine/editor';
 import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
-import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
+import { place, setFields } from '../../packages/modoki/src/editor/instance/instanceEdits';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -52,12 +53,14 @@ function instance(): { guid: string } {
   setPrefabSource(root, { id: P });
   const byName = (n: string) => getAllEntities().find((e) => e.name === n)!.id;
   const ea = getTraitByName('EntityAttributes')!;
+  // The guid the test addresses, then the record under it (the store is keyed by the root's guid).
+  writeTraitField(root, ea, 'guid', 'g-p-root');
+  place(root);
   // A move is read against the new parent's DURABLE guid (`memberRowParents`), so B gets one.
   writeTraitField(byName('B'), ea, 'guid', G(13));
   writeTraitField(byName('A'), ea, 'parentId', byName('B'));
   writeTraitField(byName('B'), getTraitByName('Transform')!, 'x', 5);
-  markOverride(findEntity(byName('B'))!, 'Transform', 'x');
-  writeTraitField(root, ea, 'guid', 'g-p-root');
+  setFields(findEntity(byName('B'))!.id(), 'Transform', ['x']);
   return { guid: 'g-p-root' };
 }
 

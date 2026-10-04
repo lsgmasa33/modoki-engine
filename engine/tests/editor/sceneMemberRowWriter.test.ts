@@ -21,12 +21,12 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, findEntity, type SceneData, type SceneEntityEntry,
+  writeTraitField,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import {
   setActionCallback, pushAction, writeTraitFieldWithUndo, deleteEntitiesWithUndo, removeTraitFromEntitiesWithUndo,
-  createEntityWithUndo, reparentEntity, duplicateEntity, staleInstanceRefusal,
+  createEntityWithUndo, reparentEntity, duplicateEntity, staleInstanceRefusal, ensureGuid,
 } from '@modoki/engine/editor';
 import { Transient } from '../../packages/modoki/src/runtime/core/traits/Transient';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
@@ -40,8 +40,10 @@ import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/p
 import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import { collectInstanceOverrideKeys, canonicalOverrideKey } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { serializeScene, adoptWorldReloadedFromDisk } from '../../packages/modoki/src/editor/scene/serialize';
-import { captureSide, rederiveBaseInstances } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
+import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
+import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { place } from '../../packages/modoki/src/editor/instance/instanceEdits';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -135,7 +137,7 @@ const addChild = (parent: string, name: string) =>
 // The hot reload's adopt persists the scene path (#1698 close-out review: a reload over an edit world must name it).
 // Per test: some describes below unstub every global after they run.
 const localStorageStub = { setItem: () => {}, getItem: () => null, removeItem: () => {} };
-beforeEach(() => { setRunMode('stopped'); prefabs.clear(); clearKeptMemberOrphans(); vi.stubGlobal('localStorage', localStorageStub); });
+beforeEach(() => { setRunMode('stopped'); prefabs.clear(); vi.stubGlobal('localStorage', localStorageStub); });
 afterAll(() => { getCurrentWorld()?.destroy(); });
 
 describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
@@ -245,6 +247,9 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
     await load(scene(O));
     const refRoot = instantiatePrefab(prefabs.get(P) as PrefabFile, one('Slot').id);
     setPrefabSource(refRoot, { id: P });
+    // A durable guid and its record, as a drop gives it (a runtime guid holds no record, #1210).
+    writeTraitField(refRoot, meta('EntityAttributes'), 'guid', 'eeeeeeee-0000-4000-8000-000000000bf0');
+    place(refRoot);
     writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
 
     const entry = await entryOf();
@@ -273,8 +278,10 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
     await load(scene(O));
     const x = instantiatePrefab(q as unknown as PrefabFile, one('Slot').id);
     setPrefabSource(x, { id: Q });
+    ensureGuid(x); place(x); // each drop's door: a durable root guid, and its record linked on the anchor's row
     const y = instantiatePrefab(prefabs.get(P) as PrefabFile, one('QSlot').id);
     setPrefabSource(y, { id: P });
+    ensureGuid(y); place(y);
     // A fresh editor spawn carries RUNTIME guids, which no row may state (#1210); one save and reload
     // gives every member the durable guid a session that has ever saved has.
     await load(await serializeScene());
@@ -465,11 +472,11 @@ describe('a NESTED frame restates each member against the PREFAB baseline (#1468
     // Bytes, not toEqual: toEqual cannot see order. The rows are written in KEY order whatever order the capture found
     // them in (`moveChannelsOntoRows`' sort), so the file does not churn between saves (#1670).
     expect(Object.keys(e1.members!)).toEqual(Object.keys(e1.members!).sort());
-    // Compared from the reload on: this bare loader seeds no instance record, so the save after it captures, and a
-    // capture has no pin for a removed member (the first save's record kept A's from the delete). The editor's load
-    // parses the record from the file, pin and all (`prefabFuzz` holds that round trip).
+    // The load parses the record from the file, pin and all: a removed member keeps its pin (#2001 S6's visible change),
+    // so the save after the reload states A's row as the first save did.
     const e2 = strip(await entryOf());
-    expect({ ...e2.members![`/${gN}/${gK}/${gA}`] }).toEqual({ removed: true });
+    expect(e2.members![`/${gN}/${gK}/${gA}`]).toEqual(e1.members![`/${gN}/${gK}/${gA}`]);
+    expect(e2.members![`/${gN}/${gK}/${gA}`]!.guid).toBeTruthy();
     await load(scene(O, e2 as never));
     expect(JSON.stringify(await entryOf())).toBe(JSON.stringify(e2));
   });
@@ -776,13 +783,15 @@ describe('a P instance dropped inside another P instance, through an Apply fan-o
     const inner = idOfGuid(ROOT2);
     const gE = 'eeeeeeee-0000-4000-8000-000000000b0f';
     createEntityWithUndo('Create', inner, [{ name: 'EntityAttributes', data: { name: 'E', parentId: inner, guid: gE, sourceScene: BASE } }], () => {});
-    const before = prefabs.get(P) as PrefabFile;
-    const side = captureSide(idOfGuid(ROOT2), ROOT2, P);
-    const result = await applyToPrefabSelective(idOfGuid(ROOT2), new Set([`+added.${gE}`]));
+    // Through the Apply's own undo (#2001 S8b): every record stored, so it takes the records route — the applying tree's
+    // seated back, every other tree reprojected from its own. (It drove the snapshot route's base re-derive by hand, every
+    // record dropped; that route now runs only when a record is missing, and a rebuild leaves such a tree as it was.)
+    // The inner instance lies in the outer one's tree, so the tree's own restore re-derives both. Mutation: `restoreRecords`
+    // skips `restoreSide` (`restored = true`) — E stays on both.
+    const result = await applyToPrefabWithUndo(idOfGuid(ROOT2), new Set([`+added.${gE}`]));
+    expect(result.applied).toBe(true);
     expect(getAllEntities().filter((e) => e.name === 'E')).toHaveLength(2);   // the premise: both expanded it
-    stampAll();
-    setPrefabCache(P, before as never);                     // the undo's prefab restore
-    await rederiveBaseInstances([{ source: P, from: result.prefabAfter!, to: before }], side);
+    expect((await undoStep('undo')).did).toBe(true);
     expect(getAllEntities().filter((e) => e.name === 'E')).toHaveLength(1);   // back on the inner one only
     expect(framesBuiltFromOtherRows(idOfGuid(ROOT))).toEqual([]);
     expect(framesBuiltFromOtherRows(idOfGuid(ROOT2))).toEqual([]);

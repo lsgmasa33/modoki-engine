@@ -2,13 +2,12 @@
  *  scopes a template write runs in (the kept-state bake, the statement being rewritten).
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
-import { keptStateOf, restoreKeptState, type KeptState } from '../../runtime/core/ecs/keptOrphanRows';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, templateFrameClimber } from '../../runtime/core/ecs/identityParents';
-import { memberRowKeysIn, memberRowsToWrite } from '../../runtime/core/ecs/memberRows';
+import { memberRowKeysIn } from '../../runtime/core/ecs/memberRows';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
-import { getAllEntities, readTraitData, findEntity, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
-import { durableGuid, mapStringValues, memberPathSteps, entityStep, isStoredRoot, isFrameStep, FRAME_STEP } from '../../runtime/core/assetRefRules';
+import { readTraitData, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { mapStringValues, memberPathSteps, entityStep, isStoredRoot, isFrameStep, FRAME_STEP } from '../../runtime/core/assetRefRules';
 import { templateKeyOf } from '../../runtime/core/templateIdentity';
 import type { AddedEntity, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { memberPathIndex } from '../../runtime/loaders/loadSceneFile';
@@ -368,53 +367,4 @@ export function templateStatementOf(ecsId: number): AddedEntity | null {
     for (const r of Object.values(e.members ?? {})) { walk(r.added); walk(r.own); }
   }
   return hit;
-}
-
-/** After the tag: what R2 kept for every root the new instance swallowed, left as the SCENE half of the bake. Its edits
- *  went into the template (`bakeKeptState`), so a root that became a MEMBER of the new instance keeps only each orphan
- *  row's identity, its pinned `guid` and `name`, moved to the new root under that root's member path (the scene writer
- *  reads kept rows only for a stored root) — a scene statement of the edit as well would pin the old value over any
- *  later template change. Its legacy channels are dropped: the template carries them, and a `moved` there is a scene
- *  guid no template form holds. A root the new instance's member rows do not name is left as it is (the rule and its two
- *  cases are at the test below); so is the selection root, whose own frame is not written as a row (`planPrefabRows`).
- *  Apply's promotion runs it too (#1802), over the instance its reference nodes were promoted into: after the refresh they
- *  are members of it, and the same rule leaves every root that is not — a stored one — alone.
- *  Returns the undo, which restores every entry it changed. */
-export function settleSwallowedKeptState(rootId: number): () => void {
-  const eaMeta = getTraitByName('EntityAttributes');
-  if (!eaMeta) return () => {};
-  const guidOf = (id: number) => durableGuid((readTraitData(id, eaMeta) as { guid?: string } | null)?.guid);
-  const rootGuid = guidOf(rootId);
-  if (!rootGuid) return () => {};
-  // In MEMBER-ROW form (`/<nodeGuid>/…`), the keys the scene writer and the loader address rows by — the one predicate
-  // `captureInstanceMembers` writes through, not `memberPathIndex`, whose keys step by localId.
-  const keyOf = new Map<number, string>(memberRowsToWrite(rootId));
-  const before = new Map<string, KeptState | undefined>();
-  const moved: Record<string, object> = {};
-  for (const id of subtreeIds(getAllEntities(), rootId)) {
-    if (id === rootId) continue;
-    const guid = guidOf(id);
-    const kept = guid ? keptStateOf(guid) : undefined;
-    if (!kept) continue;
-    // ONE rule leaves a root alone: the new instance's member rows do not name it. That is a root still stored (a scene-
-    // added reference node, which the scene save writes whole over the template's node, so stripping it lost this very
-    // instance's edit: close-out review F3), and EVERY root when the tag linked nothing — it refuses a tree that no longer
-    // matches the file written, and a settle then stripped an unlinked instance for a template nothing points at (F6).
-    const prefix = keyOf.get(id);
-    if (prefix === undefined) continue;
-    before.set(guid, kept);
-    const identity: Record<string, object> = {};
-    for (const [k, row] of Object.entries(kept.rows ?? {})) {
-      const { guid: g, name } = row as { guid?: string; name?: string };
-      if (durableGuid(g)) identity[k] = { guid: g, ...(name ? { name } : {}) };
-    }
-    restoreKeptState(guid, {});
-    for (const [k, row] of Object.entries(identity)) moved[`${prefix}${k}`] = row;
-  }
-  if (Object.keys(moved).length) {
-    const own = keptStateOf(rootGuid);
-    before.set(rootGuid, own);
-    restoreKeptState(rootGuid, { ...own, rows: { ...own?.rows, ...moved } });
-  }
-  return () => { for (const [g, st] of before) restoreKeptState(g, st ?? {}); };
 }

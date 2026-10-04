@@ -128,7 +128,6 @@ export async function instantiatePrefabInstance(
   });
   // SYNCHRONOUS from the check to the prime (close-out review): with an await between them, a commit whose cache seat was
   // already queued could land in the gap, and the prime put the older document back over it after all.
-  instanceEdits.beginAddChild(parentId); // #2001 S4: re-seeded before the spawn, so the capture cannot see it
   const rootId = spawnPrefabInstance(prefab, parentId, rootGuid);
   if (!rootId) return rootId;
   // Under a base entity the new instance belongs to that base (#1429). Every caller's redo re-runs this

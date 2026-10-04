@@ -633,10 +633,12 @@ describe('a parked asset under a held outside write (review F1)', () => {
 });
 
 describe('a save records the state it serialized, not the one after its awaits (#1904 close-out review F3)', () => {
-  // `serializeScene` reads the entity list, then awaits a prefab source that missed the cache; an entity created there is
-  // not in the bytes. Captured after the await, the save point included it and the scene read saved with the entity only
-  // in memory. Mutation: move `captureSavePoint()` back below `await serializeScene(...)` in `saveScene`.
-  it('an entity created during the serialize\'s prefab fetch keeps the scene unsaved', async () => {
+  // `serializeScene` reads the entity list, then awaits a prefab source that missed the cache; an entity created there moved
+  // the world's structure under it, so it reads the scene again (#2001 S8b: before, the entity missed the bytes, and the
+  // ids it had read could name other entities by then). The save point is still the one taken before the serialize, so
+  // the scene reads unsaved, which is conservative now that the bytes hold the entity. Mutations: drop the re-read in
+  // `serializeScene` (the save is refused as superseded); move `captureSavePoint()` below the serialize (it reads saved).
+  it('an entity created during the serialize\'s prefab fetch is in the bytes, read again, and the scene stays unsaved', async () => {
     const f = await startRun(be, async () => {}, 'f3-save-point');
     for (const k of ['Q', 'P', 'O', 'H'] as const) { setPrefabCache(f.prefabs[k].guid, null); setPrefabCache(f.prefabs[k].path, null); }
     let created = false;
@@ -650,7 +652,7 @@ describe('a save records the state it serialized, not the one after its awaits (
       expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     } finally { onFetch.fn = null; }
     expect(created, 'precondition: the serialize fetched a prefab source').toBe(true);
-    expect(JSON.stringify(JSON.parse(be.read(f.scenePath)!)).includes('MidSave'), 'precondition: the entity missed the bytes').toBe(false);
+    expect(JSON.stringify(JSON.parse(be.read(f.scenePath)!)).includes('MidSave'), 'the serialize read the scene again').toBe(true);
     expect(hasUnsavedChanges()).toBe(true);
   });
 });

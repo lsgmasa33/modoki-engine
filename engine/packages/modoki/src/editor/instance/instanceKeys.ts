@@ -15,19 +15,21 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { instanceRowKeysIn } from '../../runtime/core/ecs/memberRows';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { templateKeyOf } from '../../runtime/core/templateIdentity';
+import { Transient } from '../../runtime/core/traits/Transient';
 import { isStoredRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import type { RowKey } from '../../runtime/prefab/instanceRecord';
 
 function handles() {
   const world = getCurrentWorld();
   const ea = getTraitByName('EntityAttributes')!.trait;
-  const pi = getTraitByName('PrefabInstance')!.trait;
+  // No PrefabInstance trait registered (a fixture world): no entity is an instance, so none owns a record.
+  const pi = getTraitByName('PrefabInstance')?.trait;
   const byId = new Map<number, Entity>();
   for (const e of world.entities as Iterable<Entity>) byId.set(e.id(), e);
   const parentOf = (id: number): number => ((byId.get(id)?.get(ea) as { parentId?: number } | undefined)?.parentId ?? 0);
   const piOf = (id: number): MemberPi => {
     const e = byId.get(id);
-    return e && e.has(pi) ? (e.get(pi) as MemberPi) : null;
+    return pi && e && e.has(pi) ? (e.get(pi) as MemberPi) : null;
   };
   const guidOf = (id: number): string => ((byId.get(id)?.get(ea) as { guid?: string } | undefined)?.guid ?? '');
   return { world, byId, parentOf, piOf, guidOf };
@@ -36,15 +38,20 @@ function handles() {
 /** A stored root that OWNS a record: a top-level instance or a reference node the scene added — or the Missing Prefab
  *  placeholder of one, which carries no PrefabInstance but keeps its record (rule 9). A stored root that carries a
  *  template key is a template-added REFERENCE node — a supplied node of its enclosing frame (`…/a+<key>`), whose list
- *  is its prefab's template data, never a scene record of its own (§ 2.1, § 2.4 item 4). */
+ *  is its prefab's template data, never a scene record of its own (§ 2.1, § 2.4 item 4). Nor does a `Transient` one (a
+ *  UIEntries pooled row, a preview spawned in a system tick, which tags every entity it spawns): the save skips it, so
+ *  nothing records it, and counted it made the tree it hangs in unsavable (#2001 S8b). */
 function ownsRecord(pi: MemberPi, id: number, e: Entity | undefined): boolean {
-  return (pi ? isStoredRoot(pi, id) : !!unresolvedRefOf(e as never)) && !templateKeyOf(e as never);
+  return (pi ? isStoredRoot(pi, id) : !!unresolvedRefOf(e as never)) && !templateKeyOf(e as never) && !e?.has(Transient);
 }
 
 /** Every keyed node of the instance rooted at record-owning root `rootId` — `instanceRowKeysIn`, in the runtime since the
- *  load asks it too (#2038). */
+ *  load asks it too (#2038). A member of a frame whose document predates v5 (no `nodeGuid`) is keyed by the identity the
+ *  parse gives its row (`preV5NodeGuid`, #2001 S6), as the load's settle keys it: unkeyed, an edit of it reached no
+ *  record (a prefab instance moved under one was dropped by the save, `crossSceneReparent.test.ts`). The save no longer
+ *  re-seeds such a tree from the capture (#2001 S8b): this key is what states it. */
 export function instanceKeyMap(rootId: number): Map<number, RowKey> {
-  return instanceRowKeysIn(rootId, getCurrentWorld());
+  return instanceRowKeysIn(rootId, getCurrentWorld(), true);
 }
 
 /** Where an entity sits relative to the instance records:
@@ -74,8 +81,8 @@ export function instanceTargetOf(entityId: number): InstanceTarget | null {
   return null;
 }
 
-/** The OUTERMOST stored root above (or at) `entityId`: the root the save writes as a top-level entry, and so the one a
- *  re-seed captures (`serialize.ts`: a stored root under an instance is captured by its owner). 0 when none. */
+/** The OUTERMOST stored root above (or at) `entityId`: the root the save writes as a top-level entry (`serialize.ts`: a
+ *  stored root under an instance is written by its owner). 0 when none. */
 export function outermostStoredRoot(entityId: number): number {
   const { byId, parentOf, piOf } = handles();
   let found = 0;

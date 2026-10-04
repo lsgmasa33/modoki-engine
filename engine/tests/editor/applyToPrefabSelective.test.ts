@@ -14,6 +14,9 @@ import {
   type PrefabFile,
 } from '@modoki/engine/editor';
 
+import { ensureGuid } from '../../packages/modoki/src/editor/undo/entityRef';
+import { place } from '../../packages/modoki/src/editor/instance/instanceEdits';
+
 registerAllTraits();
 
 function makePrefab(): PrefabFile {
@@ -84,6 +87,7 @@ describe('applyToPrefabSelective', () => {
     // Instantiate and wire up the source
     const rootId = instantiatePrefab(prefab);
     editorMod.setPrefabSource(rootId, { id: source });
+    ensureGuid(rootId); place(rootId); // the editor drop's door: a durable root guid, and its record
 
     // Edit child fields: Transform.x AND Renderable3D.material
     const childId = findChildEcsId(rootId, 2);
@@ -156,6 +160,8 @@ describe('applyToPrefabSelective', () => {
       await editorMod.getPrefabSource(source);
       const rootId = instantiatePrefab(at(version));
       editorMod.setPrefabSource(rootId, { id: source });
+      ensureGuid(rootId); place(rootId); // the editor drop's door: a durable root guid, and its record
+    ensureGuid(rootId); place(rootId); // the editor drop's door: a durable root guid, and its record
       return rootId;
     };
     let wrote = false;
@@ -209,6 +215,7 @@ describe('applyToPrefabSelective', () => {
     // The authored instance the user edits and applies from.
     const authoredRoot = instantiatePrefab(makePrefab());
     editorMod.setPrefabSource(authoredRoot, { id: source });
+    ensureGuid(authoredRoot); place(authoredRoot); // the editor drop's door: a durable root guid, and its record
 
     // A second instance of the SAME source, tagged the way every runtime spawner tags one.
     const runtimeRoot = instantiatePrefab(makePrefab());
@@ -261,6 +268,7 @@ describe('applyToPrefabSelective', () => {
     await editorMod.getPrefabSource(source);
     const rootId = instantiatePrefab(prefab);
     editorMod.setPrefabSource(rootId, { id: source });
+    ensureGuid(rootId); place(rootId); // the editor drop's door: a durable root guid, and its record
 
     let writeCount = 0;
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation(async (input: RequestInfo, init?: RequestInit) => {
@@ -313,6 +321,7 @@ describe('prefab source GUID resolution', () => {
     await getPrefabSource(guid); // prime cache (keyed by guid)
     const rootId = instantiatePrefab(makePrefab());
     setPrefabSource(rootId, { id: guid });
+    ensureGuid(rootId); place(rootId); // the editor drop's door: a durable root guid, and its record
 
     const childId = findChildEcsId(rootId, 2);
     const tfMeta = getTraitByName('Transform')!;

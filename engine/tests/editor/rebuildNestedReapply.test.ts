@@ -343,8 +343,9 @@ describe('a partial chain addresses nothing (#1383)', () => {
     const root = byName('OuterRoot');
     refresh(root, outerDoc(), outerDoc());
     expect(namePaths()).toContain('Holder/OuterRoot/Panel/InnerRoot/Leaf'); // row 4 untouched
-    expect(namePaths()).toContain('Holder/OuterRoot/Panel/Plain/InnerRoot/Renamed'); // S carried whole
-    expect(count('Renamed')).toBe(1);
+    // The forced stamp makes S a member, never the plain node's content: the record links no S, and the rebuild projects
+    // the record as a save + reload does (#2001 S8b; the old capture carried S whole). The rename lands nowhere.
+    expect(namePaths().some((p) => p.includes('Renamed'))).toBe(false);
   });
 });
 

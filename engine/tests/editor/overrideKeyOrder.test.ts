@@ -4,7 +4,10 @@
  *  `captureInstanceOverrides` built each trait's object in HISTORY order: the value diff in schema order, then the marked
  *  fields whose value equals the base appended in mark-set insertion order. A reload re-seeds the marks in FILE order, and
  *  a rotation mark pulls in its whole group, so a root whose `x` was marked before it was rotated saved `{rx,x,ry,rz}`
- *  and, reloaded, `{rx,ry,rz,x}`. Driven through the real loader and the real `serializeScene`. */
+ *  and, reloaded, `{rx,ry,rz,x}`. Since #2001 S6 a save writes the instance's RECORD, in its own order (load → save is
+ *  verbatim), so the order is set where a gesture lands on the record (`inWrittenOrder`, #2001 S8b): written in gesture
+ *  order, the same edits made in two orders saved two byte orders. Driven through the real loader and the real
+ *  `serializeScene`. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
@@ -17,12 +20,11 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
 }));
 
 import {
-  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, findEntity,
+  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -86,14 +88,16 @@ beforeEach(async () => {
 });
 
 describe('an override field object is written in one key order (#1896)', () => {
-  /** The root's `x` marked while equal to its base, THEN the root rotated: the mark set reads [x, rx, ry, rz]. */
+  /** The root rotated, THEN its `x` moved: the record states [rx, ry, rz, x], in the order the gestures came (#2001 S8b:
+   *  a save writes the record, which the load parsed, not a capture of marks). */
   const markedThenRotated = () => {
     const r = byName('R');
-    markOverride(findEntity(r)!, 'Transform', 'x');
     writeTraitFieldWithUndo(r, getTraitByName('Transform')!, 'rx', 10);
+    writeTraitFieldWithUndo(r, getTraitByName('Transform')!, 'x', 3);
   };
 
-  // Mutation: `result[localId] = diffs` (drop `inCanonicalOrder`) — save 1 writes {rx,x,ry,rz}, save 2 {rx,ry,rz,x}.
+  // The record keeps the order the load read (rule 4), so this holds with or without `inWrittenOrder`: it guards the
+  // reload, not the gesture order (the cases below do).
   it('save → reload → save writes the same bytes', async () => {
     markedThenRotated();
     const first = await saveText();
@@ -102,7 +106,7 @@ describe('an override field object is written in one key order (#1896)', () => {
     expect(second).toBe(first);
   });
 
-  // Mutation: as above — the first save's order is the mark set's, x after rx.
+  // Mutation: drop `inWrittenOrder`'s call in the door's field write — the save's order is the gestures', x after rx.
   it("the root override lists its fields in the trait's schema order", async () => {
     markedThenRotated();
     // Scene v20 (#2001 S6): the root's records are its `"/"` row's.
@@ -110,13 +114,12 @@ describe('an override field object is written in one key order (#1896)', () => {
     expect(Object.keys(rows['/']!.traits.Transform!)).toEqual(['x', 'rx', 'ry', 'rz']);
   });
 
-  // The member-row channel (`moveChannelsOntoRows`) takes the same object. A marked `x` equal to its base and a changed
-  // `y` wrote {y,x}: the value diff first, the fold after it.
+  // A member row's object is ordered the same way: `y` changed, then `x`.
   // Mutation: as above — the row's Transform reads {y,x}.
   it("a member row's override is in schema order too", async () => {
     const a = byName('A');
-    markOverride(findEntity(a)!, 'Transform', 'x');
     writeTraitFieldWithUndo(a, getTraitByName('Transform')!, 'y', 2);
+    writeTraitFieldWithUndo(a, getTraitByName('Transform')!, 'x', 3);
     const text = await saveText();
     const found: string[][] = [];
     JSON.stringify(entry(text), (k, v) => {
@@ -126,13 +129,12 @@ describe('an override field object is written in one key order (#1896)', () => {
     expect(found).toEqual([['x', 'y']]);
   });
 
-  // TRAITS are ordered too, by the registry (Transform before EntityAttributes): the value diff put EntityAttributes (a
-  // rename) first, and the fold appended Transform after it.
-  // Mutation: `const byTrait = diffs` (fields ordered, traits not) — the row reads [EntityAttributes, Transform].
+  // TRAITS are ordered too, by the registry (Transform before EntityAttributes): a rename, then a move.
+  // Mutation: `inWrittenOrder` returns before its trait sort (fields ordered, traits not) — the row reads [EntityAttributes, Transform].
   it('traits are in registry order', async () => {
     const a = byName('A');
-    markOverride(findEntity(a)!, 'Transform', 'x');
     writeTraitFieldWithUndo(a, getTraitByName('EntityAttributes')!, 'name', 'A2');
+    writeTraitFieldWithUndo(a, getTraitByName('Transform')!, 'x', 3);
     const found: string[][] = [];
     JSON.stringify(entry(await saveText()), (_k, v) => {
       if (v && typeof v === 'object' && !Array.isArray(v) && 'Transform' in v && 'EntityAttributes' in v) found.push(Object.keys(v));

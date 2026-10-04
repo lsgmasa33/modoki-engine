@@ -12,7 +12,10 @@
  *    agent holding the runtime one; a despawn does;
  *  - the fill-if-empty sites that now actually receive a runtime guid (guidSeed, prefab roots). */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { setRunMode } from '../../packages/modoki/src/runtime/core/playState';
+import { whyWorldNotAuthored } from '../../packages/modoki/src/editor/scene/authoredWorld';
+import { NO_RECORD_TO_WRITE } from '../../packages/modoki/src/editor/instance/instanceRollback';
 import { createWorld } from 'koota';
 import {
   createTestWorld, type TestWorld, Transform, EntityAttributes, PrefabInstance, BoneAttachment, CameraFrame,
@@ -20,8 +23,9 @@ import {
   spawnEntity, destroyEntity, findEntityByGuid, getCurrentWorld, spawnPrefabInstance, Time, Input, getAllEntities,
 } from '@modoki/engine/runtime';
 import {
-  instantiatePrefabAsync, instantiatePrefab, setPrefabSource, serializeScene, captureInstanceStructure, type PrefabFile,
+  instantiatePrefabAsync, instantiatePrefab, setPrefabSource, serializeScene, captureInstanceStructure, ensureGuid, type PrefabFile,
 } from '@modoki/engine/editor';
+import { place, addChild } from '../../packages/modoki/src/editor/instance/instanceEdits';
 import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import {
@@ -195,22 +199,20 @@ describe('fill-if-empty sites that now receive a runtime guid (#1210)', () => {
     expect(guidOf(part)).toBe(deriveGuid(`${guidOf(root)}|2`));
   });
 
-  it('a serialized prefab-instance root carries a durable guid, never its runtime one', async () => {
+  // Hand-spawned (not spawnPrefabInstance, which tags a play-mode spawn Transient and so is never serialized): an instance
+  // root holding only its runtime guid, and no record (#2001 S8b: every door records what it makes, and mints the root's
+  // durable guid first, `instantiatePrefabInstance`). The save refuses it rather than write a capture under any guid.
+  it('a serialized prefab-instance root never carries its runtime guid: one with no record is refused', async () => {
     tw = createTestWorld({});
-    // Hand-spawned (not spawnPrefabInstance, which tags a play-mode spawn Transient and so is never
-    // serialized): an instance root with no guid, exactly as an editor-time spawn arrives.
     const root = spawnEntity(tw.world, Transform(), EntityAttributes({ name: 'KitRoot' }),
       PrefabInstance({ source: 'c3333333-3333-4333-8333-333333333333', localId: 1, rootInstanceId: 0 }));
     expect(isRuntimeGuid(guidOf(root))).toBe(true);
-    // Cached, so the root is captured as a prefab reference whose identity rides on the top-level
-    // `entry.guid` (not EntityAttributes) — the site this pins.
     setPrefabCache('c3333333-3333-4333-8333-333333333333', prefab() as never);
-    const scene = await serializeScene();
-    const entry = scene.entities.find((e) => (e as { prefab?: string }).prefab === 'c3333333-3333-4333-8333-333333333333');
-    expect(entry).toBeDefined();
-    const written = (entry as { guid?: string }).guid;
-    setPrefabCache('c3333333-3333-4333-8333-333333333333', null);
-    expect(isGuid(written) && !isRuntimeGuid(written)).toBe(true);
+    const err = console.error;
+    console.error = () => {};
+    try {
+      await expect(serializeScene()).rejects.toThrow(/instance "KitRoot" \(entity \d+, no durable guid\) has no instance record to write/);
+    } finally { console.error = err; setPrefabCache('c3333333-3333-4333-8333-333333333333', null); }
   });
 });
 
@@ -244,8 +246,10 @@ describe('copies and string refs under a real mint (#1210)', () => {
     setPrefabCache(KIT, kit() as never);
     const rootId = instantiatePrefab(kit() as never);
     setPrefabSource(rootId, { id: KIT });
+    ensureGuid(rootId); place(rootId); // the editor drop's door: a durable root guid, and its record
     const part = byName('Part');
     const added = spawnEntity(tw.world, Transform({ x: 3 }), EntityAttributes({ name: 'Spark', parentId: part.id() }));
+    addChild(added.id()); // the door for a new node under a member: Part's row links it, by the guid it holds
     expect(isRuntimeGuid(guidOf(added))).toBe(true);
     expect(rootId).toBeGreaterThan(0);
     const scene = await serializeScene(); // the Play snapshot path: throws under vitest on a leak
@@ -333,15 +337,22 @@ describe('copies and string refs under a real mint (#1210)', () => {
     await expect(serializeScene()).rejects.toThrow(/runtime guid/);
   });
 
-  it('a rebuild does not copy the old root\'s runtime guid onto the new root', () => {
+  // A root on a runtime guid holds no record (the drop's door mints a durable guid before it records, #2001 S8b), so a
+  // rebuild never respawns it to carry that guid over (it did, #1210): it is left as it was, said, and the world marked
+  // unsavable (`leftRecordless`). Mutation: drop `leftRecordless` from `rebuildTargetsByEntry` — rebuilt, counted 1.
+  it('a rebuild leaves a root on a runtime guid (no record) as it was, and blocks the save', () => {
     tw = createTestWorld({});
+    setRunMode('stopped'); // authoring: the posed-world check reads the run mode first
     const rootId = instantiatePrefab(kit() as never);
     const oldGuid = guidOf([...tw.world.entities].find((e) => e.id() === rootId)!);
     expect(isRuntimeGuid(oldGuid)).toBe(true);
-    expect(refreshInstances(KIT, [rootId], kit() as never, kit() as never)).toBe(1);
-    const newRoot = [...tw.world.entities].find((e) => e.has(PrefabInstance) && e.get(PrefabInstance)!.rootInstanceId === e.id())!;
-    expect(guidOf(newRoot)).not.toBe(oldGuid);
-    expect(findEntityByGuid(guidOf(newRoot))).toBe(newRoot);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(refreshInstances(KIT, [rootId], kit() as never, kit() as never)).toBe(0);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('no durable guid) has no instance record')), 'the warning names it').toBe(true);
+    } finally { warn.mockRestore(); }
+    expect(findEntityByGuid(oldGuid)?.id()).toBe(rootId);
+    expect(whyWorldNotAuthored()).toBe(NO_RECORD_TO_WRITE);
   });
 
   it('on the Play SNAPSHOT a ref to an added child written unguided trips, rather than naming nothing after Stop', async () => {
@@ -349,7 +360,9 @@ describe('copies and string refs under a real mint (#1210)', () => {
     setPrefabCache(KIT, kit() as never);
     const rootId = instantiatePrefab(kit() as never);
     setPrefabSource(rootId, { id: KIT });
+    ensureGuid(rootId); place(rootId); // the editor drop's door: a durable root guid, and its record
     const added = spawnEntity(tw.world, Transform(), EntityAttributes({ name: 'Grip', parentId: byName('Part').id() }));
+    addChild(added.id());
     spawnEntity(tw.world, Transform(), EntityAttributes({ name: 'Blade' }), BoneAttachment({ target: guidOf(added), bone: 'R' }));
     await expect(serializeScene()).rejects.toThrow(/runtime guid/);
     // The SAVE path writes the mint onto the live child before capture, so the ref follows it.

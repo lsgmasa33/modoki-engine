@@ -215,9 +215,9 @@ describe('prefab edit: exactly one top-level entity, the root (#1836 widening)',
   it('refuses a paste at the top level, and accepts one under the root', () => {
     const w = editWorld();
     const clip = clipEntity(w.grandchild, 'copy')!;
-    expect(refusalOf(() => pasteEntityCopy(clip.snapshot, 0, noSelect))).toBe('outside-root');
+    expect(refusalOf(() => pasteEntityCopy(clip, 0, noSelect))).toBe('outside-root');
     expect(byName('Grandchild')).toHaveLength(1);
-    expect(refusalOf(() => pasteEntityCopy(clip.snapshot, w.root, noSelect))).toBeNull();
+    expect(refusalOf(() => pasteEntityCopy(clip, w.root, noSelect))).toBeNull();
     expect(byName('Grandchild')).toHaveLength(2);
   });
 
@@ -243,7 +243,7 @@ describe('prefab edit: the scaffolding stays out of the root (close-out review)'
   it('refuses a paste of a copied scaffold under the root', () => {
     const w = editWorld();
     const clip = clipEntity(w.light, 'copy')!;
-    expect(refusalOf(() => pasteEntityCopy(clip.snapshot, w.root, noSelect))).toBe('scaffold');
+    expect(refusalOf(() => pasteEntityCopy(clip, w.root, noSelect))).toBe('scaffold');
     expect(byName('__PrefabEditLight')).toHaveLength(1);
   });
 
@@ -297,7 +297,7 @@ describe('prefab edit: nothing nests the edited prefab in itself (#1817)', () =>
     setPrefabSource(src, editedDoc);
     const clip = clipEntity(src, 'copy')!;
     const w = editWorld();
-    expect(refusalOf(() => pasteEntityCopy(clip.snapshot, w.child, noSelect))).toBe('self-nesting');
+    expect(refusalOf(() => pasteEntityCopy(clip, w.child, noSelect))).toBe('self-nesting');
   });
 
   it('accepts a drop of an unrelated prefab under a nested member', async () => {

@@ -13,10 +13,9 @@
  *    Mutation: widen `unkeyedNodes` to every node of the tree — both red on Extra.
  *
  *  - an EXCEPTION after the writing plan's promotion keyed Z (a throw in the commit, before the write) takes the keys off
- *    like a failed write (`dropOnThrow`, the #1884 close-out's candidate (a)); the ACCEPT side, a throw after the rebuild
- *    took the tree (in the commit's rebase), leaves Z the key the written H declares: the rebuild respawned Z under a
- *    derived guid the snapshot does not name, so Apply needs no `keep()`. Mutations: drop `held?.drop()` in
- *    `dropOnThrow` — the first red; strip every key of the tree in `drop()`, ignoring the snapshot — the second red.
+ *    like a failed write (`dropOnThrow`, the #1884 close-out's candidate (a)). Mutation: drop `held?.drop()` in
+ *    `dropOnThrow` — red. A throw after the rebuild took the tree (in the commit's rebase) rolls back to H1's records
+ *    (#2001 S8b, `instanceRollback.ts`); mutation: the rollback's restore dropped — red.
  *
  *  Not driven: the writing plan's own refusal and its conflicts (the same `drop()`), which need the world to change between
  *  the dry plan and the writing one.
@@ -62,6 +61,14 @@ import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/sc
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { getCachedPrefabSync, preloadNestedPrefabsForSubtree } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { saveScene, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
+import { getCurrentWorld } from '../../packages/modoki/src/runtime/core/ecs/world';
+import { storedInstance } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+
+/** `v` in a stable form, its Maps and Sets written out (a record holds both). */
+function canon(v: unknown): string {
+  const sorted = (m: Map<unknown, unknown>) => [...m].sort(([a], [b]) => (String(a) < String(b) ? -1 : 1));
+  return JSON.stringify(v, (_k, x) => (x instanceof Map ? sorted(x) : x instanceof Set ? [...x].sort() : x));
+}
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
@@ -160,11 +167,17 @@ describe("an Apply that lands nothing takes its promotion's keys off (#1884 ride
     expect(keyOf('Z'), 'the reload agrees').toBeUndefined();
   });
 
-  // The claim Apply's door rests on instead of a `keep()`: a throw after the rebuild began leaves the landed keys, because the
-  // rebuild respawned Z under a guid its template derives, which the snapshot does not name.
-  it('an Apply that throws AFTER its rebuild took the tree keeps the keys: they are the written file\'s (accept side)', async () => {
+  // A throw after the rebuild took the tree, with H written: the Apply rolls back (#2001 S8b, hub decision A,
+  // `instanceRollback.ts`) — H1's records as they stood before it, the tree rebuilt from them over the H that stays
+  // written (edge 3), named in the console error. What H now declares (the placed Q and O, Z) shows from the template
+  // AND from H1's own records, which still add them: the honest result of a file left written under records put back.
+  // Before, the throw left the records stale and the re-seed took the half-applied tree, keys and all.
+  it('an Apply that throws AFTER its rebuild took the tree rolls back to its records over the written H (accept side)', async () => {
     const f = await startRun(be, async () => {}, 'applyKeys-throwLanded');
     const h1 = await setup(f);
+    const hr = byName('HR').guid!;
+    const before = canon(storedInstance(getCurrentWorld(), hr)?.record);
+    const errors = vi.spyOn(console, 'error');
     thrown.at = 'rebase';
     try {
       await expect(applyAll(h1, f)).rejects.toThrow(/after the rebuild/);
@@ -172,9 +185,10 @@ describe("an Apply that lands nothing takes its promotion's keys off (#1884 ride
       thrown.at = '';
     }
     await settle();
-    const key = keyOf('Z');
-    expect(key, 'Z keeps the key its landing wrote').toBeTruthy();
-    expect(be.read(f.prefabs.H.path), 'premise: H landed, and declares that key').toContain(key!);
-    expect(placedExtraKey(h1)).toEqual(['k-extra']);
+    expect(be.read(f.prefabs.H.path), 'premise: H landed').toContain('"Z"');
+    expect(canon(storedInstance(getCurrentWorld(), hr)?.record), "H1's record as before the Apply").toBe(before);
+    const said = errors.mock.calls.map((c) => c.join(' ')).filter((m) => m.includes('[instanceRollback]'));
+    expect(said.some((m) => /rolled back/.test(m) && m.includes(f.prefabs.H.path)), said.join(' | ')).toBe(true);
+    errors.mockRestore();
   });
 });

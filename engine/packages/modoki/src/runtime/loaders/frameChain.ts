@@ -71,12 +71,14 @@ export function childFrame(f: Frame, lid: number, read: PrefabReader): FrameRead
   return { frame: frameOf(`${f.prefix}/${componentOf(f, lid)!}`, got.doc, row.prefab) };
 }
 
-/** A `.`-joined localId path (`nestedOverrides` / `nestedStructure` keys, `nestedPathKey`) from frame `f`. */
-export function frameAtPath(f: Frame, path: string, read: PrefabReader): FrameRead {
+/** A `.`-joined localId path (`nestedOverrides` / `nestedStructure` keys, `nestedPathKey`) from frame `f`. `onGone` is
+ *  told the step that names no row of its frame's document. */
+export function frameAtPath(f: Frame, path: string, read: PrefabReader, onGone?: (f: Frame, lid: number) => void): FrameRead {
   let at = f;
   for (const step of parseSteps(path)) {
     if (typeof step !== 'number' || !Number.isInteger(step)) return { gone: true };
     const next = childFrame(at, step, read);
+    if ('gone' in next) onGone?.(at, step);
     if (!('frame' in next)) return next;
     at = next.frame;
   }

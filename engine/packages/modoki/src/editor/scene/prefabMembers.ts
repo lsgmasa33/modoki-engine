@@ -4,15 +4,13 @@
 
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, frameRootDoc } from '../../runtime/core/ecs/identityParents';
-import { instanceRowKeysIn, memberRowsIn, memberRowsToWrite } from '../../runtime/core/ecs/memberRows';
-import { rowPlaceholderOf } from '../../runtime/core/unresolvedPrefabRef';
+import { memberRowsIn, memberRowsToWrite } from '../../runtime/core/ecs/memberRows';
 import { getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { filterAuthoringVisible } from './authoringScope';
 import { durableGuid, isOwnedRoot, isFrameStep, memberPathSteps, appliedMoves, type MemberPi } from '../../runtime/core/assetRefRules';
 import type { SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
-import { findEntityByGuid } from '../../runtime/core/ecs/world';
-import { keptMemberOrphans, memberPathIndex } from '../../runtime/loaders/loadSceneFile';
+import { memberPathIndex } from '../../runtime/loaders/loadSceneFile';
 import { levelDoc } from './prefabBase';
 import { parseMemberToken, memberPathLookup } from '../../runtime/core/templateRefs';
 import { frameRespell } from '../../runtime/loaders/frameRespell';
@@ -52,7 +50,7 @@ import { type PrefabFile } from './prefab';
  *  The domain is every ROW of the document, owned nested roots included (#1481): a member whose template parent is
  *  a nested row resolved no home in a members-only domain, so it read as moved and froze every Transform field
  *  that differed from a re-imported base. And the frame root itself is judged in its OWNER's frame, where its row
- *  is: a moved owned root's compensated pose is unmarked (`markCompensatedTransform`), and the gate dropped it. */
+ *  is: a moved owned root's compensated pose (the reparent's keep-world write) read as unrecorded, and the gate dropped it. */
 export function instanceMovedMembers(rootInstanceId: number, prefab: PrefabFile): (entityId: number, transformDiffers: boolean) => boolean {
   // Built on the FIRST question, not up front: it walks the world's identity, and `recordedOverrides` asks only for a member
   // with an UNMARKED Transform diff — rare, whereas the Inspector recomputes on every dirty frame of a drag (close-out
@@ -292,50 +290,7 @@ export function captureInstanceMembers(rootInstanceId: number, prefab?: PrefabFi
     const parent = parents.get(ecsId);
     out[key] = { guid, ...(ea?.name ? { name: ea.name } : {}), ...(parent ? { parent } : {}) };
   }
-  // R2 — rows the load could not match to any node the template still declares are written back
-  // rather than dropped, so an undone template edit (or a re-import that matches again) restores
-  // the scene's identity for that member. A live member always wins the key, so a row that comes
-  // back stops being an orphan on the next load without anything here noticing.
-  // …less, at a key where a Missing Prefab ROW placeholder is live, every `own` link it states that is not live (#2058,
-  // hunt seed 7399): what the user hung at that row shows under the placeholder (#2018) and is captured there, so a node
-  // there that is not live was deleted, or its placement undone, after the load, and writing the kept copy brought it back.
-  let shown: Set<string> | undefined;
-  for (const [key, row] of keptOrphansWritten(rootInstanceId, out)) {
-    shown ??= rowPlaceholderKeys(rootInstanceId);
-    out[key] = withoutLiveNodes(row, shown.has(key));
-  }
   return out;
-}
-
-/** The row keys of the live Missing Prefab ROW placeholders in the instance at `rootInstanceId` (`instanceRowKeysIn` keys
- *  each at its row, as the fold does). */
-function rowPlaceholderKeys(rootInstanceId: number): Set<string> {
-  const out = new Set<string>();
-  for (const [id, key] of instanceRowKeysIn(rootInstanceId)) if (rowPlaceholderOf(findEntity(id) as never)) out.add(key);
-  return out;
-}
-
-/** The kept orphan rows {@link captureInstanceMembers} writes back for `rootInstanceId`: those at a key no live member
- *  took (`written`). */
-function keptOrphansWritten(rootInstanceId: number, written: Record<string, SceneMemberRow>): [string, SceneMemberRow][] {
-  const eaMeta = getTraitByName('EntityAttributes');
-  const rootGuid = eaMeta ? durableGuid((readTraitData(rootInstanceId, eaMeta) as { guid?: string } | null)?.guid) : '';
-  return Object.entries(rootGuid ? keptMemberOrphans(rootGuid) ?? {} : {}).filter(([key]) => !written[key]);
-}
-
-/** A kept orphan row less each user node it states that is LIVE now (#2028 review F1). The live world's writer states
- *  such a node where it lives: one shown at a missing nested row's placeholder is the node the user hung AT that row
- *  (#2018), captured there with its live content; one moved elsewhere is captured where it went. Written by the row as
- *  well, both copies expanded once the prefab returned — the node twice, one guid. A node not live stays as the file
- *  held it (a member under a missing frame, which shows nothing). AT a live row placeholder the row's `own` links all show
- *  (#2018), so `atPlaceholder` drops every one, the live ones captured where they are; a keyed copy in its `added` waits
- *  unresolved, never shown (`foldInstanceOracle.test.ts` E1), and is kept as before. */
-function withoutLiveNodes(row: SceneMemberRow, atPlaceholder = false): SceneMemberRow {
-  const live = (n: { guid?: unknown } | undefined) => typeof n?.guid === 'string' && !!n.guid && !!findEntityByGuid(n.guid);
-  const added = row.added?.filter((n) => !live(n));
-  if (atPlaceholder) { const { own: _own, ...rest } = row; return { ...rest, ...(added ? { added } : {}) }; }
-  const own = row.own?.filter((n) => !live(n));
-  return { ...row, ...(own ? { own } : {}), ...(added ? { added } : {}) };
 }
 
 /** The world-wide half of {@link instanceRowDomain}, built ONCE per identity resolver: every instance's members,

@@ -26,10 +26,37 @@ export type DetachedMember = {
   guid: string; rootGuid: string; data: Record<string, unknown>;
   /** A promoted owned root's member rename ({@link promoteOwnedRoots}), `[old, new]` — reversed by the undo. */
   renamed?: [string, string][];
-  /** Its override marks as they were, recorded by the editor's owner (`editor/undo/overrideMarkWrites.ts`,
-   *  `recordDetachedMarks`) and put back with its relink (#1794): the mark store is L3, so this module cannot. */
-  marks?: string[];
 };
+
+/** Every surviving member whose frame ends with the entities in `gone` (a member moved out of the frame's subtree, which
+ *  only an older file holds, #2001 S8b): asked, without changing anything, by {@link detachOrphanedMembers} and by the
+ *  gestures that refuse such an unpack before they write (`hasOrphansOf`). */
+function orphansOf(gone: ReadonlySet<number>, world: World): { e: Entity; pi: Pi & { rootInstanceId?: number }; ownedRoot: boolean }[] {
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!piMeta || !gone.size) return [];
+  // The root of the instance whose row an owned nested root expanded from — its owner link when it was moved,
+  // else its live parent's frame (`identityParents.ts`). A nested root carried out inside a moved member was
+  // never moved itself, and its owner still dies (#1451): its live parent is that member, still in the frame.
+  const parents = worldIdentityParents(world);
+  const out: { e: Entity; pi: Pi & { rootInstanceId?: number }; ownedRoot: boolean }[] = [];
+  for (const e of world.query(piMeta.trait) as Iterable<Entity>) {
+    if (gone.has(e.id())) continue;
+    const pi = e.get(piMeta.trait) as (Pi & { rootInstanceId?: number }) | undefined;
+    if (!pi) continue;
+    const root = pi.rootInstanceId ?? 0;
+    const ownedRoot = isOwnedRoot(pi, e.id());
+    // (An owned root also went when its HOME was still dying after the rehome — a home the rehome could not step
+    // past. There is no home any more: its template parent is read from the document, which steps past a gone row.)
+    if (ownedRoot ? !gone.has(parents.ownerOf(e.id())) : !gone.has(root)) continue;
+    out.push({ e, pi, ownedRoot });
+  }
+  return out;
+}
+
+/** Would ending the frames of the entities in `gone` orphan a member ({@link orphansOf})? Changes nothing. */
+export function hasOrphansOf(gone: ReadonlySet<number>, world: World = getCurrentWorld()): boolean {
+  return orphansOf(gone, world).length > 0;
+}
 
 /** Before the entities in `gone` are destroyed (or stripped, #1453), detach every surviving member whose
  *  instance goes with them (#1437): a member MOVED out of its instance's subtree is not under the root being deleted, so it would
@@ -43,23 +70,11 @@ export function detachOrphanedMembers(gone: ReadonlySet<number>, world: World = 
   const byId = new Map<number, Entity>();
   for (const e of world.entities as Iterable<Entity>) byId.set(e.id(), e);
   const guidOf = (e: Entity | undefined) => (e?.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid ?? '' : '');
-  // The root of the instance whose row an owned nested root expanded from — its owner link when it was moved,
-  // else its live parent's frame (`identityParents.ts`). A nested root carried out inside a moved member was
-  // never moved itself, and its owner still dies (#1451): its live parent is that member, still in the frame.
-  const parents = worldIdentityParents(world);
   const out: DetachedMember[] = [];
   const strip: Entity[] = [];
   const promote: Entity[] = [];
-  for (const e of world.query(piMeta.trait) as Iterable<Entity>) {
-    if (gone.has(e.id())) continue;
-    const pi = e.get(piMeta.trait) as (Pi & { rootInstanceId?: number }) | undefined;
-    if (!pi) continue;
-    const root = pi.rootInstanceId ?? 0;
-    const ownedRoot = isOwnedRoot(pi, e.id());
-    // (An owned root also went when its HOME was still dying after the rehome — a home the rehome could not step
-    // past. There is no home any more: its template parent is read from the document, which steps past a gone row.)
-    if (ownedRoot ? !gone.has(parents.ownerOf(e.id())) : !gone.has(root)) continue;
-    out.push({ guid: guidOf(e), rootGuid: ownedRoot ? '' : guidOf(byId.get(root)), data: { ...pi } });
+  for (const { e, pi, ownedRoot } of orphansOf(gone, world)) {
+    out.push({ guid: guidOf(e), rootGuid: ownedRoot ? '' : guidOf(byId.get(pi.rootInstanceId ?? 0)), data: { ...pi } });
     (ownedRoot ? promote : strip).push(e);
   }
   for (const e of strip) e.remove(piMeta.trait);

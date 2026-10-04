@@ -73,10 +73,9 @@ export function makePrefabInstantiateAction(opts: {
     // By guid only (#1827, I19): the raw id it used to fall back to names, after a world swap, whatever entity holds
     // that id now, and the undo deleted it. A root that is gone, or has become a placeholder, refuses.
     // #2001 S8: both directions keep the instance records exact. The redo re-runs the placement, which goes through the
-    // door (`instantiatePrefabInstance`: `beginAddChild` + `place`); the undo is the door's delete of the root it placed
+    // door (`instantiatePrefabInstance`: `place`); the undo is the door's delete of the root it placed
     // (its record goes, with every record under it, and the `own` link of the member it was dropped on), so the records
     // are what they were before the placement.
-    maintainsRecords: true,
     undo: () => {
       const id = currentRef.require();
       const commit = instanceEdits.beginDelete([id]);

@@ -487,6 +487,12 @@ describe('the placeholder gate: an edit the save would drop is refused where it 
     const node = spawnEntity(getCurrentWorld(), meta('EntityAttributes').trait({ name: 'Node', parentId: inst, sortOrder: 0, guid: 'ffffffff-0000-4000-8000-000000001833' }));
     const { markUnresolved } = await import('../../packages/modoki/src/runtime/core/unresolvedPrefabRef');
     markUnresolved(node as never, 'cccccccc-0000-4000-8000-00000000dead', 'node', { prefab: 'cccccccc-0000-4000-8000-00000000dead' });
+    // Held as a load holds one (#2001 S8b): its own record, read from what it carries, and its link on INST's row.
+    const { capturedRecordsOf } = await import('../../packages/modoki/src/editor/instance/instanceSync');
+    const { setInstanceRecord } = await import('../../packages/modoki/src/runtime/prefab/instanceStore');
+    const { addChild } = await import('../../packages/modoki/src/editor/instance/instanceEdits');
+    for (const r of capturedRecordsOf(node.id()) ?? []) setInstanceRecord(getCurrentWorld(), r);
+    addChild(node.id());
     const copy = duplicateEntity(node.id(), () => {})!;
     expect(getAllEntities().find((e) => e.id === copy)!.sortOrder).toBeGreaterThan(0);
     const plainCopy = duplicateEntity(idOf(HOLDER), () => {})!; // accept: a plain copy is placed last

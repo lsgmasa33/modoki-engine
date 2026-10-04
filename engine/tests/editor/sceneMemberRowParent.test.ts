@@ -22,7 +22,6 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData, type SceneEntityEntry,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
@@ -111,7 +110,7 @@ async function placedInstance(): Promise<{ template: PrefabFile; scene: { entiti
   return { template, scene };
 }
 
-beforeEach(() => { setRunMode('stopped'); prefabs.clear(); clearKeptMemberOrphans(); });
+beforeEach(() => { setRunMode('stopped'); prefabs.clear(); });
 afterAll(() => { getCurrentWorld()?.destroy(); });
 
 const rowNamed = (entry: SceneEntityEntry, name: string) =>

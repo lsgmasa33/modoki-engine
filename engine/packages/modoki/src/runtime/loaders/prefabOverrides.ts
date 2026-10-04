@@ -543,9 +543,9 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
   }
   if (own) noteUntargeted(doc, rows, under ?? lower.removed, removed, byGuid);
   // Node rows LAST, over whatever the member rows left: a member's `added: []` (v16) or removal takes its
-  // template nodes with it. A row naming no node applies nowhere; R2 reports and keeps it
-  // (`applyStoredMemberRows`), since only the whole template can say the node is gone — for a stored
-  // root by its guid, for a template reference node by the guid its root derives (`keepTemplateNodeOrphans`, #1542).
+  // template nodes with it. A row naming no node applies nowhere; R2 reports it
+  // (`applyStoredMemberRows`) and the record keeps it, since only the whole template can say the node is gone (#1542:
+  // for a template reference node too).
   if (nodeRows.size || deep.size) added = applyNodeRows(added as unknown as KeyedNode<never>[] | undefined, nodeRows as never, undefined, own, deep as never).nodes as unknown as A[] | undefined;
   return {
     overrides, added, removedTraits,
@@ -596,10 +596,10 @@ export function isUntargetedRow(row: object): boolean {
  *  the frame, since a removal cascades — a lower layer removed (`lowerRemoved`) and the writer's did not put back (it is
  *  still in `removed`, the fold's set after the writer's rows); a row reaching into a nested frame whose root is so
  *  removed too, since that frame is never expanded. A removal the WRITER states marks none: the instance's own delete
- *  takes the records on and under the member with it (`withKeptUnused`). Only ever SETS a mark: the descent into
+ *  takes the records on and under the member with it. Only ever SETS a mark: the descent into
  *  a removed member's frame folds the same row objects again and finds nothing removed there, so a clear here undid
  *  the outer fold's (hunt seeds 3064, 1264). A load parses fresh rows; a mark left on a row a rebuild re-folds after its
- *  member came back only adds it to the orphan store, where every writer lets the live member's row win. */
+ *  member came back only lists it among the settle's orphans (`settleEntryRows`), which no writer reads. */
 function noteUntargeted(
   doc: { entities?: readonly { localId?: number }[] }, rows: Record<string, unknown> | undefined,
   lowerRemoved: readonly number[] | undefined, removed: ReadonlySet<number>, byGuid: ReadonlyMap<string, { localId: number }>,

@@ -24,7 +24,7 @@ import { unbindDeletedAssetEditors } from '../../packages/modoki/src/editor/pane
 import { saveScene, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
 import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
-import { freshInstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { storedRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { detachPrefabInstance } from '../../packages/modoki/src/editor/scene/prefabLink';
 
 const be = makeFuzzBackend();
@@ -61,7 +61,7 @@ describe('#2058 review: a re-seed at a Missing Prefab row placeholder keeps ever
     detachPrefabInstance(getAllEntities().find((x) => x.name === 'HR')!.id); await settle();
     writeTraitFieldWithUndo(named(f, 'A'), getTraitByName('EntityAttributes')!, 'name', 'A2'); await settle();
     const rootGuid = getAllEntities().find((e) => e.id === p1(f))!.guid!;
-    const rows = [...freshInstanceRecord(getCurrentWorld(), rootGuid)!.list.rows.values()];
+    const rows = [...storedRecord(getCurrentWorld(), rootGuid)!.list.rows.values()];
     expect(rows.map((r) => r.traits?.Transform).find((t) => t && typeof t === 'object' && 'rx' in t)).toEqual({ rx: 0.5, ry: 0, rz: 0 });
     // Q comes back with its root turned about y: the override (all three axes) still wins.
     const doc = JSON.parse(q); doc.entities[0].traits.Transform.ry = 1;

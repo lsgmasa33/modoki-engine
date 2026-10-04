@@ -17,11 +17,12 @@ import {
 import { clearHistory, markSceneSaved } from '@modoki/engine/editor';
 import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
-import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
+import { place, setFields } from '../../packages/modoki/src/editor/instance/instanceEdits';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -59,6 +60,9 @@ afterEach(() => { game?.dispose(); game = undefined; setPrefabCache(P, null); se
 function instance(x1: number, x2: number): string {
   const root = instantiatePrefab(oDoc as never, 0);
   setPrefabSource(root, { id: O });
+  // The guid the test addresses, then the record under it (the store is keyed by the root's guid).
+  writeTraitField(root, getTraitByName('EntityAttributes')!, 'guid', 'g-o-root');
+  place(root);
   const all = getAllEntities();
   const byId = new Map(all.map((e) => [e.id, e]));
   const aUnder = (slot: string) => all.find((e) => {
@@ -69,9 +73,8 @@ function instance(x1: number, x2: number): string {
   const tf = getTraitByName('Transform')!;
   for (const [slot, x] of [['Slot', x1], ['Slot2', x2]] as const) {
     writeTraitField(aUnder(slot), tf, 'x', x);
-    markOverride(findEntity(aUnder(slot))!, 'Transform', 'x');
+    setFields(findEntity(aUnder(slot))!.id(), 'Transform', ['x']);
   }
-  writeTraitField(root, getTraitByName('EntityAttributes')!, 'guid', 'g-o-root');
   return 'g-o-root';
 }
 

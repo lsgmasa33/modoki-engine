@@ -42,31 +42,6 @@ vi.mock('three/examples/jsm/loaders/GLTFLoader.js', () => ({
   },
 }));
 
-// Override marks are keyed by raw ecs id, so the global clear is a WORLD-scoped
-// concern — but it used to run on every `loadSceneFile` CALL, which meant a chain
-// (N scene files into ONE world, bases first / primary last) had the primary wipe
-// the marks the base had just seeded (A9 defect 1). Count the clears so the
-// "exactly once per staging world" contract is pinned, not just assumed.
-// See docs/reviews/a9-carried-instance-overrides-investigation.md.
-const markCounters = vi.hoisted(() => ({ clearAllCalls: 0 }));
-vi.mock('../../src/runtime/loaders/overrideMarks', () => {
-  // Keyed by the packed entity, like the real module (#868).
-  const marks = new Map<number, Set<string>>();
-  const setFor = (e: { valueOf(): number }) => {
-    let s = marks.get(e.valueOf());
-    if (!s) { s = new Set(); marks.set(e.valueOf(), s); }
-    return s;
-  };
-  return {
-    markOverride: (e: { valueOf(): number }, t: string, f: string) => { setFor(e).add(`${t}.${f}`); },
-    restoreOverrideMarks: (e: { valueOf(): number }, keys: Iterable<string>) => { const s = setFor(e); for (const k of keys) s.add(k); },
-    getOverrideMarkSet: (e: { valueOf(): number }) => marks.get(e.valueOf()),
-    getCarriedOverrideMarks: (e: { valueOf(): number }) => marks.get(e.valueOf()),
-    clearOverrideMarks: (e: { valueOf(): number }) => { marks.delete(e.valueOf()); },
-    clearAllOverrideMarks: () => { markCounters.clearAllCalls++; marks.clear(); },
-  };
-});
-
 vi.mock('../../src/runtime/core/traits/Time', () => ({ Time: TimeLike }));
 vi.mock('../../src/runtime/traits/Input', () => ({ Input: InputLike }));
 // `runtime/core/ecs/world.ts` (registerEntity/findEntityByGuid/guidOf) imports the REAL

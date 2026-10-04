@@ -282,11 +282,13 @@ describe('registerSelectionRestore', () => {
 
     const { registerSelectionRestore } = await import('../../src/editor/store/selectionRestore');
 
+    // Modules the import pulls in subscribe at load (a world-local registry clears itself on a swap); count only ours.
+    const atLoad = registered.length;
     registerSelectionRestore();
     registerSelectionRestore();
     registerSelectionRestore();
 
-    expect(registered).toHaveLength(1);
+    expect(registered.length - atLoad).toBe(1);
     vi.doUnmock('../../src/runtime/core/ecs/world');
   });
 

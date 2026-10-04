@@ -8,8 +8,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   setRunMode, getCurrentWorld, spawnEntity, Transform, EntityAttributes, readTraitData, getTraitByName,
-  worldTransforms, getOverrideMarkSet, PrefabInstance, Canvas2D, Frame2D, transformPropagationSystem, forgetCanvasView2D,
+  worldTransforms, PrefabInstance, Canvas2D, Frame2D, transformPropagationSystem, forgetCanvasView2D,
 } from '@modoki/engine/runtime';
+import { place } from '../../packages/modoki/src/editor/instance/instanceEdits';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { reparentEntity, planReparent, setActionCallback, pushAction, clearHistory, undo, redo } from '@modoki/engine/editor';
 import { moveEntityToScene } from '../../packages/modoki/src/editor/undo/entityActions';
@@ -208,8 +210,9 @@ describe('a stored instance root is marked only on what the move changed (the ru
     const parent = spawn('P', { x: 5, y: 2 });
     const root = spawn('Root', { x: 1, sy: -1 });
     live(root).add(PrefabInstance({ source: 'x', localId: 1, rootInstanceId: root, parentLocalId: 0 }));
+    place(root); // its record, as a drop mints one
     reparentEntity(root, parent);
-    const marks = [...(getOverrideMarkSet(live(root)) ?? [])].filter((m) => m.startsWith('Transform.')).sort();
+    const marks = [...(overrideKeysOf(live(root)) ?? [])].filter((m) => m.startsWith('Transform.')).sort();
     expect(marks).toEqual(['Transform.x', 'Transform.y']);
   });
 });

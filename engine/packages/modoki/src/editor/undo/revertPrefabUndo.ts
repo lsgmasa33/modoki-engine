@@ -69,7 +69,6 @@ export async function revertOverridesWithUndo(rootInstanceId: number, selectedKe
   pushAction({
     label: 'Revert prefab overrides',
     affectedScenes,
-    maintainsRecords: true,
     undo: () => restore(before),
     redo: () => restore(after),
   });

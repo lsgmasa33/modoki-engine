@@ -13,26 +13,24 @@ import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid } from '../../runtime/loaders/assetManifest';
 import { remapGuidValues } from '../../runtime/core/assetRefRules';
 import { planCopyGuids } from '../../runtime/core/copyIdentity';
-import { markOverride, getCarriedOverrideMarks, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
-import { markOverrideIfInstance, recordOverridesByDiff, writeTraitFieldMarked, markStateOf, putMarkState, putMarksOnly, putFieldRows, captureMarks, restoreMarks, restoreMarksOnly, recordDetachedMarks, relinkDetachedMembersMarked, takeUnmarkedFromBase, type MarkCapture, type MarkState } from './overrideMarkWrites';
+import { markOverrideIfInstance, recordOverridesByDiff, writeTraitFieldMarked, writeTraitFieldMarkedBeforeSeat, putFieldRows, requireRowRecords, takeUnmarkedFromBase } from './overrideMarkWrites';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { traitRemoveRefusal, traitWriteRefusal } from '../../runtime/core/ecs/traitEditPolicy';
-import { endFrames, captureRootLinks, restoreRootLinks, promoteOwnedRoots, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
+import { captureRootLinks, relinkDetachedMembers, restoreRootLinks, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { worldIdentityParents, linkOwnerBeforeMove, frameDocReader, frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../../runtime/core/ecs/identityParents';
 import { isStoredRoot, isOwnedRoot, durableGuid, type MemberPi } from '../../runtime/core/assetRefRules';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runtime/core/carriedMarkers';
 import { copyUnresolvedRef, recordGuidMints, keptGuidMints } from './unresolvedRefCopy';
-import { keptOrphanRowsOf, keptStateOf, keptUnusedRowsOf, restoreKeptState, type KeptState } from '../../runtime/core/ecs/keptOrphanRows';
+import { keptStateFromRecord, type KeptState } from '../instance/instanceKeptState';
 import { reparentSuffixes, reparentWrite, mergeTrs, IDENTITY_TRS, type PoseHierarchy } from '../../runtime/scene/transformSpace';
 import { pushAction, peekUndo, type EditDetail } from './undoManager';
-import { markStale, storedInstance, setInstanceRecord } from '../../runtime/prefab/instanceStore';
 import { packedOf, type PackedEntity } from '../../runtime/core/ecs/entityTable';
 import { frame2DFitNow } from '../../runtime/rendering/frame2D';
 import { currentFieldGesture } from './fieldGesture';
 import { UndoRefusedError } from './undoFailure';
 import type { EditorJournalType } from '../editorJournal';
 import { arrive, checkRef, refsCheck, type StepCheck, type CheckPass } from './stepCheck';
-import { entityRef, ensureGuid, buildGuidIndex, resolveWith, requireWith, requireAll, renamesOf, requireDetachedMembers, journalRefOf, type EntityRef } from './entityRef';
+import { entityRef, ensureGuid, buildGuidIndex, requireWith, requireAll, renamesOf, requireDetachedMembers, journalRefOf, type EntityRef } from './entityRef';
 import { placeholderWriteRefusal, placeholderWriteRefusalAny, entityNameOf, rowPlaceholderCopyRefusal } from './placeholderGate';
 import { useEditorStore } from '../store/editorStore';
 import { notifyFieldEdited } from '../animation/recording';
@@ -41,16 +39,15 @@ import { nestedDeclaredKeys, type TemplateKeyDoc } from '../../runtime/loaders/t
 import { resolveAffectedScenes, rawSourceScene, adoptParentScene } from '../scene/sceneDirty';
 import { assertPrefabEditAllows, prefabEditRefusal, type PrefabEditRefusalReason } from '../scene/prefabEditRefusal';
 import { SCAFFOLD_PREFIX } from '../scene/prefabEditGuids';
-import { restructureRefusal, reorderWriteRefusal, isSuppliedByPrefab, suppliedByPrefabChecker, RESTRUCTURE_REFUSAL_TEXT } from '../scene/restructureRefusal';
+import { restructureRefusal, reorderWriteRefusal, isSuppliedByPrefab, suppliedByPrefabChecker, RESTRUCTURE_REFUSAL_TEXT, MOVED_MEMBER_REFUSAL_TEXT } from '../scene/restructureRefusal';
 import { prefabNestingReader, getCachedPrefabSync } from '../scene/prefabCache';
 import { rebaseStaleInstancesSoon } from '../scene/prefabRebuild';
-import { leftBehindReader } from '../scene/prefabBase';
 import { translateLocalIds } from '../../runtime/loaders/memberTranslation';
 import * as instanceEdits from '../instance/instanceEdits';
-import { restoreSide, seatSide, sideReprojects, takeTreeRecords, type RecordsSide, type TreeRecords } from '../instance/instanceHistory';
-import { instanceTargetOf, outermostStoredRoot, projectionRootOf } from '../instance/instanceKeys';
+import { changedSince, copyRecords, seatAround, recordsSide, restoreSide, seatSide, sideReprojects, takeRecordsAround, takeTreeRecords, type RecordsSide, type TreeRecords } from '../instance/instanceHistory';
+import { guidOfEntity, instanceTargetOf, outermostStoredRoot, projectionRootOf, storedRootsAbove, storedRootsUnder } from '../instance/instanceKeys';
 import { reprojectFromStore } from '../instance/instanceReproject';
-import { ROOT_ROW_KEY, type InstanceRecord } from '../../runtime/prefab/instanceRecord';
+import { type InstanceRecord } from '../../runtime/prefab/instanceRecord';
 import { removeMissingComponent, restoreMissingComponent, missingComponentsFor, setMissingComponents } from '../../runtime/core/ecs/missingComponents';
 import { liveMissingSource, missingRemoveRefusal } from '../panels/missingComponentRows';
 
@@ -72,7 +69,9 @@ export function assignFreshSortOrder(newId: number, parentId: number): void {
   if (!attrMeta) return;
   const siblings = getAllEntities().filter((e) => e.parentId === parentId && e.id !== newId);
   const nextSort = siblings.length > 0 ? Math.max(...siblings.map((e) => e.sortOrder)) + 1 : 0;
-  writeTraitFieldMarked(newId, attrMeta, 'sortOrder', nextSort);
+  // Not through the door (#2001 S8b): the copy's records are seated after the spawn, from the live copy (`seatCopy`),
+  // and the door asked for them before that.
+  writeTraitFieldMarkedBeforeSeat(newId, attrMeta, 'sortOrder', nextSort);
 }
 
 /** Why the Hierarchy's sibling drop of `moverId` under `targetParent` must not run, decided BEFORE its renumber writes
@@ -127,7 +126,7 @@ export function placeholderGestureRefusal(ids: readonly number[], trait: string)
 /** The open field GESTURE: the record each entity's field held when it began, its coalesce key, the Inspector field
  *  session it belongs to (`fieldGesture.ts`), and the undo entry its last write left on top. Keyed by the PACKED entity:
  *  a gesture outlives the frame, and a recycled index must not inherit another entity's record (#868). */
-let gesture: { key: string; session: string; marks: Map<PackedEntity, MarkState>; records: Map<PackedEntity, instanceEdits.FieldRecordState | null>; top: unknown } | null = null;
+let gesture: { key: string; session: string; records: Map<PackedEntity, instanceEdits.FieldRecordState | null>; top: unknown } | null = null;
 
 /** Put back the record `field` held on each of `ids` when the gesture this write CONTINUES began (#1914, the hub's
  *  #1922 finding), so the write then records over it (`markFieldOverrideIfInstance`). An Inspector number field commits
@@ -143,7 +142,7 @@ let gesture: { key: string; session: string; marks: Map<PackedEntity, MarkState>
  *  chain: two discrete writes inside its window would be one gesture, and the second, landing on the base, would drop
  *  the first's record. Call it AFTER reading the undo's mark state: the undo restores what the entity held before THIS
  *  write (a merged chain keeps its first entry's anyway). `endGestureWrite` closes the write. */
-function resumeGesture(key: string | undefined, ids: readonly number[], trait: string, field: string): void {
+function resumeGesture(key: string | undefined, ids: readonly number[], trait: string): void {
   const session = currentFieldGesture();
   if (key === undefined || session === null) { gesture = null; return; } // a write no gesture continues
   const continues = !!gesture && gesture.key === key && gesture.session === session && gesture.top === peekUndo();
@@ -151,22 +150,18 @@ function resumeGesture(key: string | undefined, ids: readonly number[], trait: s
   if (continues) {
     for (const id of ids) {
       const p = packed(id);
-      const m = p === undefined ? undefined : gesture!.marks.get(p);
-      if (m) putMarkState(id, trait, m);
       const r = p === undefined ? undefined : gesture!.records.get(p);
-      if (r) instanceEdits.putFieldRecord(r); // #2001 S4: the door's record of the gesture's start, as the marks
+      if (r) instanceEdits.putFieldRecord(r); // #2001 S4: the door's record of the gesture's start
     }
     return;
   }
-  const marks = new Map<PackedEntity, MarkState>();
   const records = new Map<PackedEntity, instanceEdits.FieldRecordState | null>();
   for (const id of ids) {
     const p = packed(id);
     if (p === undefined) continue;
-    marks.set(p, markStateOf(id, trait, [field]));
     records.set(p, instanceEdits.fieldRecordOf(id, trait));
   }
-  gesture = { key, session, marks, records, top: undefined };
+  gesture = { key, session, records, top: undefined };
 }
 
 /** After a gesture's write is pushed: the entry it left on top, which only a continuing write may find there. */
@@ -188,14 +183,11 @@ function writeFieldRecorded(id: number, meta: TraitMeta, field: string, value: u
   markFieldOverrideIfInstance(id, meta, field);
 }
 
-/** {@link putFieldRows} for a step that put a whole component on or took it off: each entity's marks of `meta` become
- *  its capture's exactly, the rows go back, and every field the row does not record shows the fold. The fallback is
- *  `restoreMarks`' own: the base the marks name, a field the base lacks recorded (#1914 R1). */
-function putComponentRows(ids: readonly number[], rows: readonly (instanceEdits.RowSnap | null)[] | null, meta: TraitMeta, marks: readonly MarkCapture[]): void {
-  ids.forEach((id, i) => restoreMarksOnly(id, marks[i]!));
+/** {@link putFieldRows} for a step that put a whole component on or took it off: the rows go back, and every field the
+ *  row does not record shows the fold. */
+function putComponentRows(ids: readonly number[], rows: readonly (instanceEdits.RowSnap | null)[] | null, meta: TraitMeta): void {
   if (rows && instanceEdits.putRows(ids, rows, meta.name, 'all')) return;
-  markStale(getCurrentWorld(), 'undo');
-  for (const id of ids) takeUnmarkedFromBase(id, [meta], undefined, true);
+  for (const id of ids) takeUnmarkedFromBase(id, [meta]);
 }
 
 /** Write a field with undo tracking. Returns the refusal's words when the placeholder gate refuses it (#1818), else
@@ -218,26 +210,23 @@ export function writeTraitFieldWithUndo(entityId: number, meta: TraitMeta, field
   // the uniform "resolve before mutation" convention (Phase 12, M2) every affected-
   // scene call in this file follows.
   const affectedScenes = resolveAffectedScenes([entityId]);
-  // The undo puts the mark back as it was, or an undone edit is saved as an override at the old value (#1709): as it was
+  // The undo puts the record back as it was, or an undone edit is saved as an override at the old value (#1709): as it was
   // before the GESTURE, which is also the state the write records over.
   const coalesceKey = fieldCoalesceKey(meta, field, [entityId]);
-  const oldMarks = markStateOf(entityId, meta.name, [field]);
   const oldRows = instanceEdits.rowsOf([entityId]);
-  resumeGesture(coalesceKey, [entityId], meta.name, field);
+  resumeGesture(coalesceKey, [entityId], meta.name);
   writeFieldRecorded(entityId, meta, field, value);
   // The redo puts back the record THIS write left, not a fresh diff (#1914, work-qa's finding A): inside a field session the
   // write records over the gesture's start (`resumeGesture`), so a redo that re-recorded by diff gave 2 and 20 their
   // records back and left 200 — the base — recorded after undo×3, redo×3.
-  const newMarks = markStateOf(entityId, meta.name, [field]);
   const newRows = instanceEdits.rowsOf([entityId]);
   // Capture a guid-based ref so undo/redo survive a world rebuild (Play→Stop).
   const ref = entityRef(entityId);
   _pushAction({
     label: `Edit ${meta.name}.${field || 'toggle'}`,
     // `require` (I19): a target a world swap removed, or turned into a placeholder, refuses rather than reading as done.
-    undo: () => { const id = ref.require(); writeTraitField(id, meta, field, oldValue); putMarksOnly(id, meta.name, oldMarks); putFieldRows([id], oldRows, meta.name, [field]); },
-    redo: () => { const id = ref.require(); writeTraitField(id, meta, field, value); putMarksOnly(id, meta.name, newMarks); putFieldRows([id], newRows, meta.name, [field]); },
-    maintainsRecords: true,
+    undo: () => { const id = ref.require(); requireRowRecords(oldRows); writeTraitField(id, meta, field, oldValue); putFieldRows([id], oldRows, meta.name, [field]); },
+    redo: () => { const id = ref.require(); requireRowRecords(newRows); writeTraitField(id, meta, field, value); putFieldRows([id], newRows, meta.name, [field]); },
     check: refsCheck(() => [ref]), // #2010: the same `require`, askable before a batch runs
     coalesceKey,
     detail: editDetail([ref], meta, field, [oldValue], [value]),
@@ -271,11 +260,9 @@ export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMet
   });
   const affectedScenes = resolveAffectedScenes(entityIds);
   const coalesceKey = fieldCoalesceKey(meta, field, entityIds);
-  const oldMarks = entityIds.map((id) => markStateOf(id, meta.name, [field])); // put back by the undo (#1709)
   const oldRows = instanceEdits.rowsOf(entityIds);
-  resumeGesture(coalesceKey, entityIds, meta.name, field);
+  resumeGesture(coalesceKey, entityIds, meta.name);
   entityIds.forEach((id) => writeFieldRecorded(id, meta, field, value));
-  const newMarks = entityIds.map((id) => markStateOf(id, meta.name, [field])); // put back by the redo (finding A, above)
   const newRows = instanceEdits.rowsOf(entityIds);
   // Guid refs (positionally aligned with oldValues) so undo/redo survive a rebuild.
   const refs = entityIds.map((id) => entityRef(id));
@@ -283,9 +270,8 @@ export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMet
   _pushAction({
     label: `Edit ${meta.name}.${field || 'toggle'}${suffix}`,
     // Every ref required before the first write (I19): one missing entity refuses the whole entry, never half of it.
-    undo: () => { const ids = requireAll(refs); ids.forEach((id, i) => { writeTraitField(id, meta, field, oldValues[i]); putMarksOnly(id, meta.name, oldMarks[i]!); }); putFieldRows(ids, oldRows, meta.name, [field]); },
-    redo: () => { const ids = requireAll(refs); ids.forEach((id, i) => { writeTraitField(id, meta, field, value); putMarksOnly(id, meta.name, newMarks[i]!); }); putFieldRows(ids, newRows, meta.name, [field]); },
-    maintainsRecords: true,
+    undo: () => { const ids = requireAll(refs); requireRowRecords(oldRows); ids.forEach((id, i) => writeTraitField(id, meta, field, oldValues[i])); putFieldRows(ids, oldRows, meta.name, [field]); },
+    redo: () => { const ids = requireAll(refs); requireRowRecords(newRows); ids.forEach((id) => writeTraitField(id, meta, field, value)); putFieldRows(ids, newRows, meta.name, [field]); },
     check: refsCheck(() => refs), // #2010
     coalesceKey,
     detail: editDetail(refs, meta, field, oldValues, refs.map(() => value)),
@@ -318,7 +304,7 @@ export function writeTraitFieldPerEntityWithUndo(
     // rename wiped the whole clips list).
     const data = readTraitDataFull(id, meta);
     const oldValue = data ? data[field] : undefined;
-    return { id, ref: entityRef(id), oldValue, newValue: compute(oldValue, id), oldMarks: markStateOf(id, meta.name, [field]) };
+    return { id, ref: entityRef(id), oldValue, newValue: compute(oldValue, id) };
   }).filter((e) => !Object.is(e.oldValue, e.newValue));
   if (entries.length === 0) return null;
   const reordered = entries.map((e) => reorderWriteRefusal([e.id], meta.name, field, e.newValue)).find((r) => r); // #1869
@@ -326,21 +312,19 @@ export function writeTraitFieldPerEntityWithUndo(
   const affectedScenes = resolveAffectedScenes(entries.map((e) => e.id));
   // One gesture with the writers above (#1932, R4-L1 finding 2): a composite sub-field typed in a `BufferedNumberInput`
   // (a binding's value, a material override's constant, an anim bank's numbers) commits on every keystroke, so retyping
-  // the base value recorded its "2" and "20", and F3 kept the record. After the old marks are read (`entries`).
+  // the base value recorded its "2" and "20", and F3 kept the record. After the old rows are read.
   const coalesceKey = fieldCoalesceKey(meta, field, entityIds);
   const oldRows = instanceEdits.rowsOf(entries.map((e) => e.id));
-  resumeGesture(coalesceKey, entries.map((e) => e.id), meta.name, field);
+  resumeGesture(coalesceKey, entries.map((e) => e.id), meta.name);
   entries.forEach(({ id, newValue }) => { writeTraitField(id, meta, field, newValue); markFieldOverrideIfInstance(id, meta, field); });
   // The redo puts back the record THIS write left, not a fresh diff (finding A, as above).
-  const newMarks = entries.map((e) => markStateOf(e.id, meta.name, [field]));
   const newRows = instanceEdits.rowsOf(entries.map((e) => e.id));
   const suffix = entries.length > 1 ? ` (${entries.length})` : '';
   _pushAction({
     label: `${label}${suffix}`,
     // Resolved by guid each invocation, so undo/redo survive a rebuild; every ref before the first write (I19).
-    undo: () => { const ids = requireAll(entries.map((e) => e.ref)); entries.forEach(({ oldValue, oldMarks }, i) => { writeTraitField(ids[i], meta, field, oldValue); putMarksOnly(ids[i], meta.name, oldMarks); }); putFieldRows(ids, oldRows, meta.name, [field]); },
-    redo: () => { const ids = requireAll(entries.map((e) => e.ref)); entries.forEach(({ newValue }, i) => { writeTraitField(ids[i], meta, field, newValue); putMarksOnly(ids[i], meta.name, newMarks[i]!); }); putFieldRows(ids, newRows, meta.name, [field]); },
-    maintainsRecords: true,
+    undo: () => { const ids = requireAll(entries.map((e) => e.ref)); requireRowRecords(oldRows); entries.forEach(({ oldValue }, i) => writeTraitField(ids[i], meta, field, oldValue)); putFieldRows(ids, oldRows, meta.name, [field]); },
+    redo: () => { const ids = requireAll(entries.map((e) => e.ref)); requireRowRecords(newRows); entries.forEach(({ newValue }, i) => writeTraitField(ids[i], meta, field, newValue)); putFieldRows(ids, newRows, meta.name, [field]); },
     check: refsCheck(() => entries.map((e) => e.ref)), // #2010
     coalesceKey,
     detail: editDetail(entries.map((e) => e.ref), meta, field, entries.map((e) => e.oldValue), entries.map((e) => e.newValue)),
@@ -372,7 +356,7 @@ export function writeTraitFieldsPerEntityWithUndo(
     const patch = compute(full, id);
     const oldValues: Record<string, unknown> = {};
     for (const k of Object.keys(patch)) oldValues[k] = full ? full[k] : undefined;
-    return { id, ref: entityRef(id), oldValues, patch, oldMarks: markStateOf(id, meta.name, Object.keys(patch)) };
+    return { id, ref: entityRef(id), oldValues, patch };
   }).filter((e) => Object.keys(e.patch).length > 0);
   if (entries.length === 0) return null;
   // #1818, as above — per field, since the patch decides which fields this write touches.
@@ -391,30 +375,28 @@ export function writeTraitFieldsPerEntityWithUndo(
     const ids = requireAll(entries.map((e) => e.ref)); // I19
     entries.forEach(({ patch }, i) => writeMany(ids[i], patch));
   }
-  // The redo puts back the marks and rows THIS write left, never a fresh diff (D-8a: `writeMany` again re-derived them).
-  const newMarks = entries.map((e) => markStateOf(e.id, meta.name, Object.keys(e.patch)));
+  // The redo puts back the rows THIS write left, never a fresh diff (D-8a: `writeMany` again re-derived them).
   const newRows = instanceEdits.rowsOf(entries.map((e) => e.id));
   const suffix = entries.length > 1 ? ` (${entries.length})` : '';
   _pushAction({
     label: `${label}${suffix}`,
-    // Raw writes plus the old marks: `writeMany` would MARK the old values, saving an undone edit as an override (#1709).
+    // Raw writes plus the old rows: `writeMany` would RECORD the old values, saving an undone edit as an override (#1709).
     undo: () => {
       const ids = requireAll(entries.map((e) => e.ref)); // I19
-      entries.forEach(({ oldValues, oldMarks }, i) => {
+      requireRowRecords(oldRows);
+      entries.forEach(({ oldValues }, i) => {
         for (const [field, value] of Object.entries(oldValues)) writeTraitField(ids[i], meta, field, value);
-        putMarksOnly(ids[i], meta.name, oldMarks);
         putFieldRows([ids[i]], oldRows && [oldRows[i]], meta.name, Object.keys(oldValues));
       });
     },
     redo: () => {
       const ids = requireAll(entries.map((e) => e.ref)); // I19
+      requireRowRecords(newRows);
       entries.forEach(({ patch }, i) => {
         for (const [field, value] of Object.entries(patch)) writeTraitField(ids[i], meta, field, value);
-        putMarksOnly(ids[i], meta.name, newMarks[i]!);
         putFieldRows([ids[i]], newRows && [newRows[i]], meta.name, Object.keys(patch));
       });
     },
-    maintainsRecords: true,
     check: refsCheck(() => entries.map((e) => e.ref)), // #2010
     affectedScenes,
   });
@@ -460,9 +442,6 @@ export function addTraitToEntitiesWithUndo(
   const affectedScenes = resolveAffectedScenes(targets);
   const initial = values ? filterToTraitSchema(meta, values) : undefined;
   const refs = targets.map((id) => entityRef(id));
-  // Only this trait's: the add changes no other mark, and its undo's restore must not touch another trait's fields.
-  const oldMarks = targets.map((id) => captureMarks(id, meta.name));
-  instanceEdits.prepare(targets); // #2014: the door's record, re-seeded before the capture could see the add
   const oldRows = instanceEdits.rowsOf(targets);
   // Clone per entity AND per apply: without it, redo would re-seat the same object on every target and they'd share one
   // array.
@@ -476,24 +455,24 @@ export function addTraitToEntitiesWithUndo(
     recordOverridesByDiff(id, meta);
   });
   markUIDirty(); markStructureDirty();
-  // The redo puts back the marks and rows the add left, never a second pass through the door (#2046 S7.2, D-8a).
-  const newMarks = targets.map((id) => captureMarks(id, meta.name));
+  // The redo puts back the rows the add left, never a second pass through the door (#2046 S7.2, D-8a).
   const newRows = instanceEdits.rowsOf(targets);
   _pushAction({
     label: `${label}${targets.length > 1 ? ` (${targets.length})` : ''}`,
     undo: () => {
       const ids = requireAll(refs);
+      requireRowRecords(oldRows);
       ids.forEach((id) => findEntity(id)?.remove(meta.trait));
-      putComponentRows(ids, oldRows, meta, oldMarks);
+      putComponentRows(ids, oldRows, meta);
       markUIDirty(); markStructureDirty();
     },
     redo: () => {
       const ids = requireAll(refs);
+      requireRowRecords(newRows);
       ids.forEach(addLive);
-      putComponentRows(ids, newRows, meta, newMarks);
+      putComponentRows(ids, newRows, meta);
       markUIDirty(); markStructureDirty();
     },
-    maintainsRecords: true,
     check: refsCheck(() => refs), // #2010
     affectedScenes,
   });
@@ -514,7 +493,7 @@ export function addTraitToEntitiesWithUndo(
 export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: TraitMeta): string | null {
   const refused = traitRemoveRefusal(meta.name); // #1454, as above
   if (refused) { console.error(`[entityActions] ${refused}`); return refused; }
-  const targets: { ref: EntityRef; data: Record<string, unknown> | null; marks: MarkCapture }[] = [];
+  const targets: { ref: EntityRef; data: Record<string, unknown> | null }[] = [];
   for (const id of entityIds) {
     const e = findEntity(id);
     // readTraitDataFull + clone, for the SAME reason snapshotEntity uses them: readTraitData
@@ -523,9 +502,7 @@ export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: Trait
     // captured. Sibling of QA-CTX-0003, found by its close-out sweep.
     if (e && e.has(meta.trait)) {
       const full = readTraitDataFull(id, meta);
-      // Its marks go with its data (#1800): a rebuild before the undo re-seeds them from the file, which records the
-      // component as removed, and the save keeps only marked fields.
-      targets.push({ ref: entityRef(id), data: full ? cloneTraitValues(full) : null, marks: captureMarks(id, meta.name) });
+      targets.push({ ref: entityRef(id), data: full ? cloneTraitValues(full) : null });
     }
   }
   if (targets.length === 0) return null;
@@ -540,23 +517,23 @@ export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: Trait
   const commitRecord = instanceEdits.beginRemoveComponent(ids0, meta.name);
   removeLive(ids0);
   commitRecord();
-  // Undo and redo put back the rows and marks each side had (#2046 S7.2): the redo never re-derives.
-  const newMarks = ids0.map((id) => captureMarks(id, meta.name));
+  // Undo and redo put back the rows each side had (#2046 S7.2): the redo never re-derives.
   const newRows = instanceEdits.rowsOf(ids0);
   _pushAction({
     label: `Remove ${meta.name}${targets.length > 1 ? ` (${targets.length})` : ''}`,
     undo: () => {
       const ids = requireAll(refs);
+      requireRowRecords(oldRows);
       ids.forEach((id, i) => findEntity(id)?.add(meta.trait((targets[i].data ?? {}) as Record<string, unknown>)));
-      putComponentRows(ids, oldRows, meta, targets.map((t) => t.marks));
+      putComponentRows(ids, oldRows, meta);
       markUIDirty(); markStructureDirty();
     },
     redo: () => {
       const ids = requireAll(refs);
+      requireRowRecords(newRows);
       removeLive(ids);
-      putComponentRows(ids, newRows, meta, newMarks);
+      putComponentRows(ids, newRows, meta);
     },
-    maintainsRecords: true,
     check: refsCheck(() => targets.map((t) => t.ref)), // #2010
     affectedScenes,
   });
@@ -587,11 +564,16 @@ export function removeMissingComponentWithUndo(entityIds: number[], name: string
     requireAll(targets.map((t) => t.ref)).forEach((id, i) => restoreMissingComponent(targets[i].guid, name, targets[i].data, id));
     markUIDirty();
   };
+  // The records it changes (an instance root's or member's row holds the component too), seated around its undo and
+  // redo (#2001 S8b).
+  const recordsBefore = copyRecords();
   apply();
+  for (const id of carrying) instanceEdits.dropMissingComponent(id, name);
+  const changed = changedSince(recordsBefore);
   _pushAction({
     label: `Remove Missing ${name}${targets.length > 1 ? ` (${targets.length})` : ''}`,
-    undo: revert,
-    redo: apply,
+    undo: () => seatAround(changed, 'before', revert),
+    redo: () => seatAround(changed, 'after', apply),
     check: refsCheck(() => targets.map((t) => t.ref)),
     affectedScenes,
   });
@@ -634,7 +616,7 @@ export function pasteTraitAsNewWithUndo(entityIds: number[], meta: TraitMeta, va
 
 // ── Action callback (for backward compat during migration) ──
 
-type ActionCallback = (action: { label: string; undo: () => void; redo: () => void; coalesceKey?: string; detail?: EditDetail; kind?: EditorJournalType; journalPayload?: Record<string, unknown>; affectedScenes?: string[]; maintainsRecords?: true; check?: StepCheck }) => void;
+type ActionCallback = (action: { label: string; undo: () => void; redo: () => void; coalesceKey?: string; detail?: EditDetail; kind?: EditorJournalType; journalPayload?: Record<string, unknown>; affectedScenes?: string[]; check?: StepCheck }) => void;
 
 /** GUID for a parent id in a structural journal payload: 'root' for 0, else the
  *  entity's stable guid (`id:<n>` only for an un-guidable entity — see `journalRefOf`). */
@@ -673,9 +655,6 @@ export interface EntitySnapshot {
   id: number;
   traits: { meta: TraitMeta; data: Record<string, unknown> | true }[];
   children: EntitySnapshot[];
-  /** The entity's prefab override marks ("Trait.field"), when it has any. Marks are keyed by the
-   *  packed entity (#868), so a respawn gets them only from here — see overrideMarks.ts. */
-  marks?: string[];
   /** Its unregistered markers (`Transient`, `TemplateAddedKey`), which the registry walk above never
    *  sees (#1427). Restored by an undo's respawn; a copy drops them (`copySnapshot`), all
    *  but the template key of a node inside a copied whole instance (#1430). */
@@ -689,15 +668,6 @@ export interface EntitySnapshot {
    *  by the root's guid beside the tree, so a respawn or a copy got none of it: a duplicated instance saved without
    *  either, and only the original took the scene's edit once the template brought the member or frame back. */
   kept?: KeptState;
-  /** A member nested root's share of what R2 keeps for its OWNER (the snapshot's top only): the owner's orphan and unused
-   *  rows under the member's key, re-keyed to it. A copy that makes the member a stored root of its own takes them as its
-   *  `kept` (`copySnapshot`), as #1788 carries an instance's own: else a Missing Prefab row placeholder under it lost its
-   *  pin on the copy's save, and came back under the template's name and a derived guid (hunt seed 7191). */
-  ownerKept?: KeptState;
-  /** The fields ("Trait.field") the layers enclosing its frame give it from OUTSIDE the snapshotted subtree
-   *  (`layerFieldsLeftBehind`, #1914): a copy that makes its frame a stored root shows them with no layer to give them,
-   *  so it records them (`copySnapshot`). An undo's respawn, which puts the entity back where it was, ignores them. */
-  layerMarks?: string[];
   /** Its MISSING components — the ones this build registers no trait for, kept by guid (`missingComponents.ts`, #1944).
    *  The record is keyed by the guid, so an undo's respawn under the same guid already has it; a COPY has a new guid and
    *  got none, so the original kept the data and the duplicate silently lacked it (Unity's duplicate carries a Missing
@@ -727,11 +697,9 @@ function snapshotPrefabs(snapshot: EntitySnapshot): string[] {
   return out;
 }
 
-export function snapshotEntity(entityId: number, scope?: SnapshotScope): EntitySnapshot | null {
+export function snapshotEntity(entityId: number): EntitySnapshot | null {
   const entity = findEntity(entityId);
   if (!entity) return null;
-  const ownerKept = scope ? undefined : ownerKeptOf(entityId);
-  scope ??= snapshotScope(entityId);
   const traits: EntitySnapshot['traits'] = [];
   for (const meta of getAllTraits()) {
     if (!entity.has(meta.trait)) continue;
@@ -746,60 +714,19 @@ export function snapshotEntity(entityId: number, scope?: SnapshotScope): EntityS
     else { const data = readTraitDataFull(entityId, meta); if (data) traits.push({ meta, data: cloneTraitValues(data) }); }
   }
   const childEntities = getAllEntities().filter(e => e.parentId === entityId);
-  const children = childEntities.map(c => snapshotEntity(c.id, scope)).filter((s): s is EntitySnapshot => s !== null);
-  const marks = getCarriedOverrideMarks(entity);
-  const layerMarks = scope.layerMarksOf(traits);
+  const children = childEntities.map(c => snapshotEntity(c.id)).filter((s): s is EntitySnapshot => s !== null);
   const markers = captureMarkers(entity);
   const frameDoc = frameRootDoc(getCurrentWorld(), entity);
-  const kept = keptStateOf(durableGuidOf(traits));
+  // What the root's record keeps beyond its live tree (#2001 S8b step 2); a tree with no record keeps nothing.
+  const kept = keptStateFromRecord(entityId);
   const missing = missingComponentsFor(rawGuidOf(traits), entityId);
   return {
     id: entityId, traits, children,
     // Not cloned: no bag is edited in place (Remove and its undo replace the record's bag), so the snapshot can share it.
     ...(missing ? { missing: missing as Record<string, unknown> } : {}),
-    ...(marks && marks.size > 0 ? { marks: [...marks] } : {}),
-    ...(layerMarks.length ? { layerMarks } : {}),
     ...(markers ? { markers } : {}),
     ...(frameDoc ? { frameDoc } : {}),
     ...(kept ? { kept } : {}),
-    ...(ownerKept ? { ownerKept } : {}),
-  };
-}
-
-/** {@link EntitySnapshot.ownerKept} for `entityId`: when it is a member nested root, the rows R2 keeps for its owner
- *  under its key, re-keyed to it; else undefined. */
-function ownerKeptOf(entityId: number): KeptState | undefined {
-  const pi = getTraitByName('PrefabInstance');
-  if (!pi || !findEntity(entityId)?.has(pi.trait)) return undefined;
-  const t = instanceTargetOf(entityId);
-  if (t?.kind !== 'member' || t.key === ROOT_ROW_KEY) return undefined;
-  const prefix = `${t.key}/`;
-  const slice = (rows: Record<string, object> | undefined) => {
-    const out: Record<string, object> = {};
-    for (const [k, v] of Object.entries(rows ?? {})) {
-      if (!k.startsWith(prefix)) continue;
-      // Pins and statements only: a user node the row HOLDS (an R2 orphan's `own`/`added`) is the original's, and a copy
-      // restating it is a second claimant of its record (hunt seed 178).
-      const { own: _own, added: _added, ...row } = structuredClone(v) as Record<string, unknown>;
-      if (Object.keys(row).length) out[k.slice(t.key.length)] = row;
-    }
-    return Object.keys(out).length ? out : undefined;
-  };
-  const rows = slice(keptOrphanRowsOf(t.rootGuid));
-  const unused = slice(keptUnusedRowsOf(t.rootGuid));
-  return rows || unused ? { ...(rows ? { rows } : {}), ...(unused ? { unused } : {}) } : undefined;
-}
-
-/** One snapshot's view of the subtree it captures: what the layers outside it give each member (`leftBehindReader`). */
-interface SnapshotScope { layerMarksOf: (traits: EntitySnapshot['traits']) => string[] }
-
-function snapshotScope(rootId: number): SnapshotScope {
-  const read = leftBehindReader(rootId);
-  return {
-    layerMarksOf: (traits) => {
-      const pi = traits.find((t) => t.meta.name === 'PrefabInstance')?.data;
-      return pi && pi !== true ? read(pi as MemberPi) : [];
-    },
   };
 }
 
@@ -821,6 +748,11 @@ function snapshotScope(rootId: number): SnapshotScope {
  *  - **A kept member's new guid is the one a reload will derive**, so a carried ref survives save + reload.
  *  The rules and their reasoning live in `runtime/core/copyIdentity.ts` (`planCopyGuids`). The clone is computed ONCE
  *  per duplicate/paste, so undo→redo re-spawns the same identity. */
+/** Each copy's whole remap ({@link copySnapshot}'s `fullRemap`): its entities' new guids AND the identities it re-minted
+ *  for what no live entity holds — a Missing Prefab placeholder's record (#1699), a kept orphan row — for a copy's
+ *  records to follow (`copyGuidMap`, #2001 S8b). */
+const copyRemaps = new WeakMap<EntitySnapshot, ReadonlyMap<string, string>>();
+
 export function copySnapshot(snapshot: EntitySnapshot): EntitySnapshot {
   const dataOf = (s: EntitySnapshot, name: string): Record<string, unknown> | null => {
     const t = s.traits.find((x) => x.meta.name === name);
@@ -872,15 +804,7 @@ export function copySnapshot(snapshot: EntitySnapshot): EntitySnapshot {
   };
   // …and every identity a stored root's KEPT state names (#1788): an orphan row pins a member guid no live entity holds,
   // so `planCopyGuids` never saw it. A guid the plan already moved keeps the plan's.
-  // A promoted member takes its owner's share as its own (`EntitySnapshot.ownerKept`), its own kept state over it.
-  const keptOf = (s: EntitySnapshot): KeptState | undefined => {
-    if (links.get(s) === 'strip') return undefined;
-    if (links.get(s) !== 'promote' || !s.ownerKept) return s.kept;
-    const o = s.ownerKept, k = s.kept;
-    const merge = (a?: Record<string, object>, b?: Record<string, object>) => (a || b ? { ...a, ...b } : undefined);
-    const rows = merge(o.rows, k?.rows), unused = merge(o.unused, k?.unused);
-    return { ...(rows ? { rows } : {}), ...(unused ? { unused } : {}), ...(k?.legacy ? { legacy: k.legacy } : {}) };
-  };
+  const keptOf = (s: EntitySnapshot): KeptState | undefined => (links.get(s) === 'strip' ? undefined : s.kept);
   const collectKeptMints = (s: EntitySnapshot): void => {
     const kept = keptOf(s);
     if (kept) for (const [g, m] of keptGuidMints(kept, newGuid)) if (!fullRemap.has(g)) fullRemap.set(g, m);
@@ -907,10 +831,8 @@ export function copySnapshot(snapshot: EntitySnapshot): EntitySnapshot {
       else if (t.meta.name === 'PrefabInstance' && link === 'promote') traits.push({ meta: t.meta, data: { ...data, parentLocalId: 0, parentNodeGuid: '', ownerGuid: '' } });
       else traits.push({ meta: t.meta, data });
     }
-    const { marks, layerMarks, kept: _kept, ownerKept: _ownerKept, ...rest } = s;
+    const { kept: _kept, ...rest } = s;
     const kept = keptOf(s);
-    // What the layers the copy leaves behind gave a member becomes its own record (#1914, `EntitySnapshot.layerMarks`).
-    const recorded = [...new Set([...(marks ?? []), ...(layerMarks ?? [])])];
     return {
       ...rest,
       // A stripped node is no instance any more, so it has no rows to keep.
@@ -918,14 +840,14 @@ export function copySnapshot(snapshot: EntitySnapshot): EntitySnapshot {
       // Its missing components, under the copy's guid (recorded by the respawn), with refs into the copy carried like any
       // trait's (#1338's rule): the data is opaque, but a guid it names that the copy re-minted is the copy's now.
       ...(s.missing ? { missing: remapGuidValues(s.missing, fullRemap) as Record<string, unknown> } : {}),
-      // An override mark means something only on a member of an instance: a stripped node is an added node.
-      ...(recorded.length && link !== 'strip' ? { marks: recorded } : {}),
       markers: markersOf(s),
       traits,
       children: s.children.map(copy),
     };
   };
-  return copy(snapshot);
+  const out = copy(snapshot);
+  copyRemaps.set(out, fullRemap);
+  return out;
 }
 
 /** Rebuild a snapshot's subtree under `newParentId`; returns the new root id. Every entity gets a
@@ -947,12 +869,8 @@ export function respawnFromSnapshot(snapshot: EntitySnapshot, newParentId: numbe
       }
     }
     const entity = spawnEntity(getCurrentWorld(), ...traitArgs);
-    // Clear first: the 8-bit generation wraps, so a dead member's marks can match this packed value.
-    clearOverrideMarks(entity);
-    if (snap.marks) restoreOverrideMarks(entity, snap.marks);
     restoreMarkers(entity, snap.markers);
     if (snap.frameDoc) noteFrameRootDoc(getCurrentWorld(), entity, snap.frameDoc);
-    if (snap.kept) restoreKeptState(durableGuidOf(snap.traits), snap.kept);
     const id = entity.id();
     // Set, never cleared when absent: a record outlives a snapshot that predates it (keyed by guid, see `missing`).
     if (snap.missing) setMissingComponents(rawGuidOf(snap.traits), snap.missing, id);
@@ -1066,7 +984,6 @@ export function createEntityWithUndo(
       : spec.data;
     traitInits.push(data !== undefined ? meta.trait(data) : meta.trait());
   }
-  instanceEdits.beginAddChild(parentId); // #2001 S4: re-seeded before the spawn, so the capture cannot see it
   const entity = spawnEntity(getCurrentWorld(), ...traitInits);
   let currentId = entity.id();
   // Under a base entity it belongs to that base (#1429) — before the snapshot, so redo keeps the stamp.
@@ -1085,10 +1002,24 @@ export function createEntityWithUndo(
   selectEntity(currentId);
   _pushAction({
     label,
+    // #2001 S8b: both directions keep the instance records exact, as an Instantiate's do: the undo is the door's delete of
+    // the node it made (the `own` link of the member it hangs under goes), and the redo links it again where it lands.
     // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
-    undo: () => { deleteEntity(selfRef.require()); selectEntity(null); },
+    undo: () => {
+      const id = selfRef.require();
+      const commit = instanceEdits.beginDelete([id]);
+      deleteEntity(id);
+      commit();
+      selectEntity(null);
+    },
     // The parent is required, never the scene root (#1793's fork, owner ruling R): a parent that is gone refuses.
-    redo: () => { if (snap) { currentId = respawnFromSnapshot(snap, parentRef ? parentRef.require() : 0); selectEntity(currentId); } },
+    redo: () => {
+      if (!snap) return;
+      const p = parentRef ? parentRef.require() : 0;
+      currentId = respawnFromSnapshot(snap, p);
+      instanceEdits.addChild(currentId);
+      selectEntity(currentId);
+    },
     check: spawnCheck(selfRef, parentRef, snap),
     kind: '!create',
     journalPayload: { entity: journalRefOf(guid, currentId), parent: parentGuid(parentId) },
@@ -1141,11 +1072,14 @@ export function createEntitySubtreeWithUndo(
   root: SubtreeSpec,
   selectEntity: (id: number | null) => void,
 ): number | null {
-  instanceEdits.beginAddChild(parentId); // #2001 S4, before the spawn
+  const recordsBefore = copyRecords();
   const rootId = spawnEntitySubtree(parentId, root);
   if (rootId == null) return null;
   adoptParentScene(rootId); // #1429 — see createEntityWithUndo
   instanceEdits.addChild(rootId); // #2001 S4: the door's `addChild`
+  // #2001 S8b: the records the add changed (a node added under a member links into its tree's record), seated around the
+  // undo's delete and the redo's respawn.
+  const changed = changedSince(recordsBefore);
   let currentId = rootId;
   const snap = snapshotEntity(currentId);
   const guid = rootGuidOf(snap!);
@@ -1156,8 +1090,13 @@ export function createEntitySubtreeWithUndo(
   _pushAction({
     label,
     // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
-    undo: () => { deleteEntity(selfRef.require()); selectEntity(null); },
-    redo: () => { if (snap) { currentId = respawnFromSnapshot(snap, parentRef ? parentRef.require() : 0); selectEntity(currentId); } },
+    undo: () => { const id = selfRef.require(); seatAround(changed, 'before', () => deleteEntity(id)); selectEntity(null); },
+    redo: () => {
+      if (!snap) return;
+      const parent = parentRef ? parentRef.require() : 0;
+      seatAround(changed, 'after', () => { currentId = respawnFromSnapshot(snap, parent); });
+      selectEntity(currentId);
+    },
     check: spawnCheck(selfRef, parentRef, snap),
     kind: '!create',
     journalPayload: { entity: journalRefOf(guid, currentId), parent: parentGuid(parentId) },
@@ -1204,16 +1143,18 @@ export function duplicateEntity(
     assignFreshSortOrder(id, p);
     return id;
   };
-  instanceEdits.beginAddChild(parentId); // #2001 S4, before the spawn
-  // #2046 S7.4 (D-8c): the records the copy carries, read off the source before anything spawns.
-  const records = holdsPlaceholder(captured) ? null : instanceEdits.copyRecordsOf(entityId);
-  const remap = copyGuidMap(captured, snapshot);
+  // #2046 S7.4 (D-8c): the records the copy carries, read off the source before anything spawns; none, and the copy is
+  // refused (#2001 S8b).
+  const records = instanceEdits.copyRecordsOf(entityId);
+  if (!records) { reportWriteRefusal(copyRefusal(snapshotNameOf(captured))); return null; }
+  const remap = copyGuidMap(captured, snapshot, records);
   // Reprojected even from a live source: the copy then shows exactly what its records state, as its reload will (a live
-  // mark the record does not state is not copied; hunt seed 8065).
-  const first = spawnOnRecords(() => spawnCopy(parentId), records, remap, snapshot, true);
-  let currentId = first.id;
-  const onRecords = first.onRecords;
-  if (!records) instanceEdits.afterCopy(currentId);
+  // mark the record does not state is not copied; hunt seed 8065). One the store cannot seat or rebuild is refused.
+  let currentId: number;
+  try { currentId = spawnOnRecords(() => spawnCopy(parentId), records, remap, snapshot, true); } catch (err) {
+    if (err instanceof UndoRefusedError) { reportWriteRefusal(err.message); return null; }
+    throw err;
+  }
   const selfRef = entityRef(currentId); // the copy's fresh guid, minted by copySnapshot
   // Resolved from the COPY, after spawn — its sourceScene mirrors the source's
   // (respawnFromSnapshot copies EntityAttributes verbatim, sourceScene included).
@@ -1222,15 +1163,13 @@ export function duplicateEntity(
   _pushAction({
     label: 'Duplicate Entity',
     // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
-    undo: () => { deleteCopy(selfRef.require(), onRecords); selectEntity(null); },
+    undo: () => { deleteCopy(selfRef.require(), true); selectEntity(null); },
     redo: () => {
       const p = parentRef ? parentRef.require() : 0;
       // The redo respawns the copy after a template change the stack does not hold (a saved prefab edit).
-      currentId = spawnOnRecords(() => spawnCopy(p), onRecords ? records : null, remap, snapshot, true).id;
-      currentId = liveIdOf(guid, currentId);
+      currentId = liveIdOf(guid, spawnOnRecords(() => spawnCopy(p), records, remap, snapshot, true));
       selectEntity(currentId);
     },
-    ...(onRecords ? { maintainsRecords: true as const } : {}),
     check: spawnCheck(selfRef, parentRef, snapshot),
     kind: '!duplicate',
     // Source guid from the attrData already read above — do NOT entityRef(entityId) here:
@@ -1250,8 +1189,9 @@ export interface EntityClipboard {
   source: EntityRef;
   /** A cut's world only: a copy never re-finds its source, and holding a replaced world keeps it alive. */
   world?: ReturnType<typeof getCurrentWorld>;
-  /** A copy's: the records its paste carries (`instanceEdits.copyRecordsOf`, #2046 S7.4), or null for the stale path. */
-  records?: ReadonlyMap<string, InstanceRecord> | null;
+  /** A copy's: the records its paste carries (`instanceEdits.copyRecordsOf`, #2046 S7.4), or null for the stale path. A
+   *  cut's: null (its paste is a reparent). Never left out: a paste reads it off the clipboard ({@link pasteEntityCopy}). */
+  records: ReadonlyMap<string, InstanceRecord> | null;
 }
 
 /** Take `entityId` onto the clipboard, or null when it has no snapshot. */
@@ -1263,7 +1203,7 @@ export function clipEntity(entityId: number, op: 'copy' | 'cut'): EntityClipboar
   if (!snapshot) return null;
   return {
     snapshot, op, source: entityRef(entityId, false),
-    ...(op === 'cut' ? { world: getCurrentWorld() } : { records: holdsPlaceholder(snapshot) ? null : instanceEdits.copyRecordsOf(entityId) }),
+    ...(op === 'cut' ? { world: getCurrentWorld(), records: null } : { records: instanceEdits.copyRecordsOf(entityId) }),
   };
 }
 
@@ -1399,8 +1339,9 @@ function survivingFrameRows(snapshots: readonly EntitySnapshot[]) {
 
 /** The live id of the entity `guid` names, else `fallback` (an un-guidable entity keeps its respawned id). */
 /** Each node's guid in `source` → its copy's in `copy` (`copySnapshot` keeps the tree's shape). */
-function copyGuidMap(source: EntitySnapshot, copy: EntitySnapshot): Map<string, string> {
-  const out = new Map<string, string>();
+function copyGuidMap(source: EntitySnapshot, copy: EntitySnapshot, records?: ReadonlyMap<string, InstanceRecord> | null): Map<string, string> {
+  // The identities the copy re-minted for nodes it holds no entity of (a placeholder's members), then every entity's.
+  const out = new Map<string, string>(copyRemaps.get(copy));
   const guidIn = (s: EntitySnapshot): string => {
     const d = s.traits.find((t) => t.meta.name === 'EntityAttributes')?.data;
     return d && d !== true && typeof d.guid === 'string' ? d.guid : '';
@@ -1411,29 +1352,41 @@ function copyGuidMap(source: EntitySnapshot, copy: EntitySnapshot): Map<string, 
     a.children.forEach((c, i) => { if (b.children[i]) walk(c, b.children[i]!); });
   };
   walk(source, copy);
+  // …and every identity a carried record states that no copied entity holds: the nodes it HOLDS (`held.heldOwn`: a
+  // user's node whose anchor is not projected), the pin of a member the template no longer has (#1788), and a pin in a
+  // statement it holds verbatim (`held.pendingLegacy`). The plan
+  // never saw them; the copy holds its own, under fresh guids, minted once here so an undo/redo of this copy keeps them.
+  for (const rec of records?.values() ?? []) {
+    const pins = [...rec.list.rows.values()].flatMap((r) => (r.guid !== undefined && !r.removed ? [{ guid: r.guid }] : []));
+    for (const [g, m] of keptGuidMints([...(rec.held.heldOwn?.values() ?? []), pins, rec.held.pendingLegacy ?? {}], newGuid)) if (!out.has(g)) out.set(g, m);
+  }
   return out;
 }
 
-/** Does the snapshot hold a Missing Prefab placeholder? Its record is the placeholder's to carry (#1699): off records. */
-function holdsPlaceholder(s: EntitySnapshot): boolean {
-  return !!s.markers?.UnresolvedPrefabRef || s.children.some(holdsPlaceholder);
+/** Why a copy of `entityId` is refused (#2001 S8b): its records cannot be restated for the copy
+ *  (`instanceEdits.copyRecordsOf` null), or could not be seated or rebuilt once it was spawned. Before S8b such a copy
+ *  went on with every record around it marked stale, to be re-seeded from the capture. */
+function copyRefusal(name: string | undefined): string {
+  return `"${name || 'The entity'}" was not copied: a prefab instance in it holds a part a copy cannot carry over exactly`;
 }
 
 /**
  * Spawn a copy (`spawn`) and put it on `records` (#2046 S7.4, D-8c; `instanceEdits.copyRecordsOf`'s): seated under the
  * copy's guids, then, with `reproject`, every tree they lie in rebuilt from its records onto the CURRENT documents — the
- * clipboard and a redo outlive a template change the stack does not hold. Off records (`records` null, or a copy the
- * store cannot seat or rebuild): `rebaseRespawned` with `reproject`, as before, the records left stale.
+ * clipboard and a redo outlive a template change the stack does not hold. A copy the store cannot seat or rebuild is
+ * taken back out and refused (`UndoRefusedError`, #2001 S8b): nothing of it stays.
  */
-function spawnOnRecords(spawn: () => number, records: ReadonlyMap<string, InstanceRecord> | null, remap: ReadonlyMap<string, string>,
-  snapshot: EntitySnapshot, reproject: boolean): { id: number; onRecords: boolean } {
+function spawnOnRecords(spawn: () => number, records: ReadonlyMap<string, InstanceRecord>, remap: ReadonlyMap<string, string>,
+  snapshot: EntitySnapshot, reproject: boolean): number {
   const id = spawn();
   const guid = rootGuidOf(snapshot);
-  if (!records || !instanceEdits.seatCopy(records, remap, id)) {
-    if (reproject) rebaseRespawned([snapshot]);
-    return { id: liveIdOf(guid, id), onRecords: false };
-  }
-  if (!reproject) return { id, onRecords: true };
+  const refuse = (seated: boolean): never => {
+    deleteCopy(liveIdOf(guid, id), seated);
+    const why = copyRefusal(snapshotNameOf(snapshot));
+    throw new UndoRefusedError(why, why);
+  };
+  if (!instanceEdits.seatCopy(records, remap, id)) refuse(false);
+  if (!reproject) return id;
   const tops = new Set<number>();
   for (const g of records.keys()) {
     const live = findEntityByGuid(remap.get(g) ?? '')?.id();
@@ -1443,12 +1396,9 @@ function spawnOnRecords(spawn: () => number, records: ReadonlyMap<string, Instan
   const topGuids = [...tops].map((t) => (getAllEntities().find((e) => e.id === t)?.guid ?? ''));
   for (const g of topGuids) {
     const top = g ? findEntityByGuid(g)?.id() : undefined;
-    if (top && reprojectFromStore(top)) continue;
-    markStale(getCurrentWorld(), 'duplicateInstance', topGuids.filter(Boolean));
-    rebaseRespawned([snapshot]);
-    return { id: liveIdOf(guid, id), onRecords: false };
+    if (!top || !reprojectFromStore(top)) refuse(true);
   }
-  return { id: liveIdOf(guid, id), onRecords: true };
+  return liveIdOf(guid, id);
 }
 
 /** Delete a copy: through the door's delete when the copy is on records (its records go, its link is dropped). */
@@ -1466,21 +1416,23 @@ function liveIdOf(guid: string, fallback: number): number {
  *  Fresh guids ONCE and each node's prefab link by its frame (`copySnapshot`, #1756, shared with duplicate), a
  *  unique sortOrder at the end of the parent's children, and the TARGET's scene (#1760): the parent's, or the
  *  primary at the root, never the source's stamp — the clipboard outlives a scene load, so that stamp can name a
- *  scene that is not loaded, and the copy was then saved into no file (`adoptParentScene`). One undo entry. */
+ *  scene that is not loaded, and the copy was then saved into no file (`adoptParentScene`). One undo entry. Null, with
+ *  the reason reported, when the copy is refused: its records cannot be restated for it (#2001 S8b), as a duplicate's. */
 export function pasteEntityCopy(
-  snapshot: EntitySnapshot,
+  /** A copy's clipboard ({@link clipEntity}): its snapshot, and the records the copy carries, named by every caller so no
+   *  paste can leave them behind (#2001 S8b: seven fixtures pasted the snapshot alone, off the records production keeps). */
+  clip: Pick<EntityClipboard, 'snapshot' | 'records'>,
   parentId: number,
   selectEntity: (id: number | null) => void,
-  /** The records the copy carries ({@link EntityClipboard.records}): none keeps the stale path. */
-  records?: ReadonlyMap<string, InstanceRecord> | null,
-): number {
+): number | null {
+  const { snapshot, records } = clip;
   // Prefab edit (#1817, #1836): a paste outside the root is lost on save, and one holding an instance of the edited
   // prefab nests it in itself — the clipboard outlives the world, so it can carry one copied from a scene.
   assertPrefabEditAllows({ kind: 'add', parentId, prefabs: snapshotPrefabs(snapshot), read: prefabNestingReader(), scaffold: isScaffoldSnapshot(snapshot) });
   const copy = copySnapshot(snapshot);
   const parentRef = parentId ? entityRef(parentId) : null;
-  const remap = copyGuidMap(snapshot, copy);
-  const carried = records && !holdsPlaceholder(snapshot) ? records : null;
+  if (!records) { reportWriteRefusal(copyRefusal(snapshotNameOf(snapshot))); return null; }
+  const remap = copyGuidMap(snapshot, copy, records);
   let selfRef: EntityRef | null = null;
   const place = (p: number): number => {
     const id = respawnFromSnapshot(copy, p);
@@ -1490,65 +1442,109 @@ export function pasteEntityCopy(
     return id;
   };
   // The clipboard outlives a template change (an Apply, a Replace, a prefab-edit save, an outside edit): the copy is
-  // reprojected from its records onto the current documents (#2046 S7.4), or, off records, `rebaseRespawned`.
-  const spawn = (p: number, on: ReadonlyMap<string, InstanceRecord> | null) => {
-    const r = spawnOnRecords(() => place(p), on, remap, copy, true);
-    return { ...r, id: selfRef?.resolve() ?? r.id };
+  // reprojected from its records onto the current documents (#2046 S7.4); one the store cannot seat or rebuild is refused.
+  const spawn = (p: number): number => {
+    const id = spawnOnRecords(() => place(p), records, remap, copy, true);
+    return selfRef?.resolve() ?? id;
   };
-  instanceEdits.beginAddChild(parentId); // #2001 S4, before the spawn
-  const first = spawn(parentId, carried);
-  let currentId = first.id;
-  const onRecords = first.onRecords;
-  if (!carried) instanceEdits.afterCopy(currentId);
+  let currentId: number;
+  try { currentId = spawn(parentId); } catch (err) {
+    if (err instanceof UndoRefusedError) { reportWriteRefusal(err.message); return null; }
+    throw err;
+  }
   const affectedScenes = resolveAffectedScenes([currentId]);
   selectEntity(currentId);
   _pushAction({
     label: 'Paste Entity',
     // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
-    undo: () => { deleteCopy(selfRef!.require(), onRecords); selectEntity(null); },
-    redo: () => { currentId = spawn(parentRef ? parentRef.require() : 0, onRecords ? carried : null).id; selectEntity(currentId); },
-    ...(onRecords ? { maintainsRecords: true as const } : {}),
+    undo: () => { deleteCopy(selfRef!.require(), true); selectEntity(null); },
+    redo: () => { currentId = spawn(parentRef ? parentRef.require() : 0); selectEntity(currentId); },
     check: spawnCheck(selfRef!, parentRef, copy),
     affectedScenes,
   });
   return currentId;
 }
 
+/** One tree a delete reaches ({@link deleteTrees}): its records before the delete, whether its root goes with it, and
+ *  `seat` for one holding a Missing Prefab placeholder the delete takes, which nothing projects (rule 9): the undo brings
+ *  the tree's deleted nodes back from their snapshots and seats its records, rather than reprojecting it. */
+interface DeletedTree { records: TreeRecords; gone: boolean; seat?: true }
+
 /** The instance trees a delete of `rootIds` reaches, with their records as they stand before it (#2046 S7.4, D-8c;
  *  § 3.2's delete rows): each tree a deleted node lies in, by its outermost projectable root, and whether that root goes
- *  with the delete. Null when the store cannot state one of them — a node under a Missing Prefab placeholder, a member
- *  that hangs in another tree's node or outside its own — and the undo stays on the snapshot. */
-function deleteTrees(rootIds: readonly number[]): { records: TreeRecords; gone: boolean }[] | null {
+ *  with the delete — or a Missing Prefab placeholder the delete takes whole, by its own records (#2001 S8b), with each tree
+ *  that projects under it by its own. Null when the store cannot state one of them — a node under a placeholder that
+ *  stays, a member that hangs in another tree's node or outside its own — and the undo stays on the snapshot. */
+function deleteTrees(rootIds: readonly number[]): DeletedTree[] | null {
   // No instance type registered (a bare world): no tree to state, and today's undo is the whole of it.
   if (!getTraitByName('PrefabInstance')) return null;
   const deleted = new Set(collectSubtreeIds(getAllEntities().map((e) => [e.id, e.parentId] as const), rootIds));
   const identity = worldIdentityParents(getCurrentWorld());
   const tops = new Set<number>();
+  const placeholders = new Set<number>();
+  const seatTops = new Set<number>();
+  const ea = getTraitByName('EntityAttributes')!;
+  const parentOf = (id: number) => ((findEntity(id)?.get(ea.trait) as { parentId?: number } | undefined)?.parentId ?? 0);
   for (const id of deleted) {
     const top = projectionRootOf(id);
-    if (top !== outermostStoredRoot(id)) return null;
+    const outer = outermostStoredRoot(id);
+    if (!top && outer) {
+      // Under a Missing Prefab placeholder (`projectionRootOf` stops at the nearest one): only one the delete takes whole.
+      // Its records are seated — at the top level its own, inside a live tree that tree's, around it respawned from its
+      // snapshot — not reprojected: nothing projects a placeholder (rule 9), and the tree it hangs in is as it was.
+      const near = storedRootsAbove(id)[0]!;
+      if (!deleted.has(near)) return null;
+      const above = parentOf(near) ? projectionRootOf(parentOf(near)) : 0;
+      if (above) seatTops.add(above);
+      else if (outermostStoredRoot(near) === near) placeholders.add(near);
+      else return null;
+      continue;
+    }
+    // A tree that projects under a Missing Prefab placeholder (an instance placed under one whose prefab was trashed since,
+    // hunt seed 9454; a reference node the scene added there, #2018): a tree of its own when the delete takes the
+    // placeholder whole, restored from its records beside the placeholder's seat. Under one that stays, not stated.
+    if (top !== outer && !(top && deleted.has(outer))) return null;
     const frame = identity.frameOf(id);
     if (frame && projectionRootOf(frame) !== top) return null;
     if (top) tops.add(top);
   }
-  // A target inside a tree that stays must be a MEMBER of it: the records bring a member back. A scene-owned node deleted
-  // as its own target (a node a Detach left in the tree, hunt seed 8034) comes back from its snapshot, as before.
+  // A target inside a tree that stays must be a node of it: a MEMBER or a scene-owned node an anchor's `own` links itself
+  // (#2001 S8b), which its records bring back (the node's content from the tree's side, `ownContentOf`), or a scene-owned
+  // node BELOW a linked one (a node a Detach left in the tree, hunt seed 8034), which comes back from its snapshot
+  // (`belowLink`) with the tree around it from its records: the reprojection keeps the linked node live and does not re-add
+  // what it lost. Before, that last sent the whole delete off records, and its undo to the re-seed (hunt seeds 8052, 8059).
   for (const id of rootIds) {
     const top = projectionRootOf(id);
-    if (top && !deleted.has(top) && instanceTargetOf(id)?.kind !== 'member') return null;
+    if (!top || deleted.has(top) || seatTops.has(top)) continue;
+    if (!instanceTargetOf(id)) return null;
   }
-  const out: { records: TreeRecords; gone: boolean }[] = [];
-  for (const top of tops) {
+  const out: DeletedTree[] = [];
+  // A seated tree's deleted nodes come back from their snapshots, its own with the placeholder's (`inTree` false): a
+  // reprojection cannot rebuild the placeholder, whose prefab nothing reads.
+  for (const top of new Set([...tops, ...seatTops])) {
     const records = takeTreeRecords(top);
     if (!records) return null;
-    out.push({ records, gone: deleted.has(top) });
+    out.push({ records, gone: deleted.has(top), ...(seatTops.has(top) ? { seat: true as const } : {}) });
+  }
+  for (const p of placeholders) {
+    // A tree that projects under it is one of `tops` (above), restored from its own records; the seat states its roots too.
+    const roots = storedRootsUnder(p);
+    const side = recordsSide(roots.map(guidOfEntity).filter(Boolean));
+    if ([...side.records.values()].some((r) => !r)) return null;
+    out.push({ records: { side, at: guidOfEntity(p) }, gone: true, seat: true });
   }
   return out;
 }
 
+/** Is `id` a scene-owned node below the one an anchor's `own` links (not that node itself)? */
+function belowLink(id: number): boolean {
+  const target = instanceTargetOf(id);
+  return target?.kind === 'owned' && target.linkId !== id;
+}
+
 /** Each tree of {@link deleteTrees}' as the delete left it: the live records of a tree that stays, none for a deleted
  *  tree's roots. Null when a tree that stays cannot be stated. */
-function afterDelete(trees: readonly { records: TreeRecords; gone: boolean }[]): RecordsSide[] | null {
+function afterDelete(trees: readonly DeletedTree[]): RecordsSide[] | null {
   const out: RecordsSide[] = [];
   for (const t of trees) {
     const before = [...t.records.side.records.keys()];
@@ -1564,8 +1560,9 @@ function afterDelete(trees: readonly { records: TreeRecords; gone: boolean }[]):
 /** Can each of `sides` (one per tree of `trees`) be restored exactly now: its records reproject onto the current
  *  documents ({@link sideReprojects}), and a tree that stays is still its own outermost projectable root (not under a
  *  Missing Prefab placeholder since)? */
-function restorable(sides: readonly RecordsSide[], trees: readonly { records: TreeRecords; gone: boolean }[]): boolean {
+function restorable(sides: readonly RecordsSide[], trees: readonly DeletedTree[]): boolean {
   return trees.every((t, i) => {
+    if (t.seat) return true;
     if (!sideReprojects(sides[i]!)) return false;
     if (t.gone) return true;
     const id = findEntityByGuid(t.records.at)?.id();
@@ -1634,12 +1631,16 @@ export function deleteEntitiesWithUndo(
   const survivors = survivingFrameRows(snaps.map((s) => s.snapshot));
   // #2046 S7.4: the trees the delete reaches, before it — what the undo restores (rule 8).
   const trees = deleteTrees(snaps.map((s) => s.snapshot.id));
-  // Which roots lie inside a tree that stays: its records bring them back, not the snapshot.
-  const inTree = snaps.map((s) => { const top = trees ? projectionRootOf(s.snapshot.id) : 0; return !!top && top !== s.snapshot.id; });
+  // Which roots lie inside a tree that stays: its records bring them back, not the snapshot. Not a scene-owned node below a
+  // linked one (`deleteTrees`).
+  const seated = new Set((trees ?? []).filter((t) => t.seat).map((t) => t.records.at));
+  const inTree = snaps.map((s) => { const top = trees ? projectionRootOf(s.snapshot.id) : 0; return !!top && top !== s.snapshot.id && !seated.has(guidOfEntity(top)) && !belowLink(s.snapshot.id); });
   // #2001 S4: the door's delete (`removeMember`, and the unlink of an added node or instance) — targets read before the
   // delete, committed after it (rule 3: a deleted member's records stay).
   const commitRecord = instanceEdits.beginDelete(snaps.map((s) => s.snapshot.id));
-  let detached: DetachedMember[] = recordDetachedMarks(snaps.flatMap(s => deleteEntity(s.snapshot.id)));
+  // Every record before the delete: what a delete off the record path seats back on its undo (`changedSince` below).
+  const recordsBefore = copyRecords();
+  let detached: DetachedMember[] = snaps.flatMap(s => deleteEntity(s.snapshot.id));
   commitRecord();
   setSelection?.([]);
 
@@ -1654,18 +1655,24 @@ export function deleteEntitiesWithUndo(
     // delete (I19): a target that is gone refuses the redo rather than deleting the rest and reading as done.
     const idx = buildGuidIndex();
     const ids = requireTargets((g) => idx.get(g));
-    detached = recordDetachedMarks(ids.flatMap(id => deleteEntity(id)));
+    detached = ids.flatMap(id => deleteEntity(id));
     setSelection?.([]);
   };
   // The record path (#2046 S7.4): every tree it reaches stated by the store, and no member moved out of a deleted one.
   // `after`: each tree's records as the forward step left them (a deleted tree's as none), which the redo seats.
   const after = trees && !detached.length ? afterDelete(trees) : null;
   const viaRecords = after ? trees : null;
+  // Off that path (a member moved out of a deleted instance, a tree the store cannot state as one: #2001 S8b): the
+  // records the delete changed, as it found and left them. The undo seats the first and the snapshot puts the live world
+  // back; the redo seats the second and repeats the delete. Seated BEFORE the live work, which reads them (the snapshot's
+  // frame rebase reprojects from the store, and a record still stating the delete removes what it respawned), and again
+  // after it, over whatever that work wrote. Nothing is re-derived and nothing is marked stale.
+  const changed = viaRecords ? null : changedSince(recordsBefore);
   /** Today's undo: respawn the snapshot, rebase it onto the current documents. The fallback, and the whole undo for a
    *  delete the store could not state. */
   const undoViaSnapshot = () => {
     // Every ref first (I19): a parent or an instance root that is gone refuses before anything respawns. Through the
-    // rename the delete's frame-ending made (a promoted member keeps a new guid until `relinkDetachedMembersMarked` below
+    // rename the delete's frame-ending made (a promoted member keeps a new guid until `relinkDetachedMembers` below
     // takes it back), since the refs were taken before it.
     const idx = buildGuidIndex();
     const renames = renamesOf(detached);
@@ -1677,7 +1684,7 @@ export function deleteEntitiesWithUndo(
     // The relink FIRST: it reverses the frame-ending's guid rename, and `restoreRootLinks` finds each root by the guid
     // it had before that rename. The other way round a renamed root was skipped, and its respawned member kept the
     // snapshot's raw `rootInstanceId`, stale after a world swap (#1819 close-out re-review). The relink reads no link.
-    relinkDetachedMembersMarked(detached);
+    relinkDetachedMembers(detached);
     restoreRootLinks(rootLinks);
     // After the links are back: a prefab-edit save or an outside edit since the delete changed a template (#1820).
     // and the rows of a frame that survived the delete, whose own record that edit already moved on (`survivingFrameRows`).
@@ -1692,22 +1699,18 @@ export function deleteEntitiesWithUndo(
   _pushAction({
     label: snaps.length > 1 ? `Delete ${snaps.length} Entities` : 'Delete Entity',
     undo: () => {
-      if (!viaRecords) return undoViaSnapshot();
-      // A step since that the store does not follow left a tree it cannot restore exactly (a prefab trashed, a template
-      // that drops a node a record holds): the snapshot, with the records marked stale around it as for any such step.
+      if (!viaRecords) return seatAround(changed!, 'before', undoViaSnapshot);
+      // A step since that the store does not follow left a tree it cannot reproject (a prefab trashed, a template that
+      // drops a node a record holds): the snapshot rebuilds the live trees, and each tree's records are then seated exactly
+      // as they stood before the delete (rule 8). That keeps what only a record holds — the pin of a member removed inside
+      // it, which is not live for a capture to read (#2001 S6, hunt seed 178) — and needs no re-seed (#2001 S8b). A
+      // snapshot that throws part-way rolls the step back (`undoStep`, `instanceRollback.ts`). Seated BEFORE the snapshot
+      // too, as the redo below and `seatAround` do: its frame rebase reprojects from the store, and a record still stating
+      // the delete removed the member it had just respawned (#2001 S8b review G1).
       if (!restorable(viaRecords.map((t) => t.records.side), viaRecords)) {
-        markStale(getCurrentWorld(), 'undo');
-        try { undoViaSnapshot(); } finally {
-          // The delete dropped the records of the instances it took. Each one that is back is seated as it stood before
-          // the delete, STALE: its re-seed from the capture then carries what only a record holds — the pin of a member
-          // removed inside it, which is not live for the capture to read (#2001 S6, hunt seed 178: the undo's save
-          // wrote that row without its guid).
-          const world = getCurrentWorld();
-          for (const t of viaRecords) for (const [g, r] of t.records.side.records) {
-            if (r && !storedInstance(world, g) && findEntityByGuid(g)) setInstanceRecord(world, structuredClone(r));
-          }
-          markStale(world, 'undo');
-        }
+        for (const t of viaRecords) seatSide(t.records.side);
+        undoViaSnapshot();
+        for (const t of viaRecords) seatSide(t.records.side);
         return;
       }
       // The refusals first, as on the snapshot path (I19).
@@ -1720,23 +1723,25 @@ export function deleteEntitiesWithUndo(
       const liveIds = snaps.map((s, i) => (inTree[i] ? 0 : respawnFromSnapshot(s.snapshot, parents[i])));
       restoreRootLinks(rootLinks);
       for (const t of viaRecords) {
+        if (t.seat) { seatSide(t.records.side); continue; }
         if (restoreSide(t.records.side, t.records.at)) continue;
-        markStale(getCurrentWorld(), 'undo');
         throw new Error(`the delete's undo could not rebuild "${t.records.at}" from its records`);
       }
       setSelection?.(snaps.map((x, i) => liveIdOf(x.guid, liveIds[i]!)));
     },
     redo: () => {
-      if (!viaRecords || !after) { redoDelete(); return; }
+      if (!viaRecords || !after) return seatAround(changed!, 'after', redoDelete);
       // The forward step's after-records, restored over the live delete repeated (#1941's rule: a redo restores, it does
       // not re-derive), and each tree that stays reprojected from them as the undo was from the before-records: the
       // reprojection is what tells the frame which of its rows are REMOVED. Only seated, the frame kept the undo's word
       // for a row its prefab could not expand then (trashed since) — a row it never had, not a removal — and the next
       // capture lost the delete (hunt seed 1130). Not through the door either, which re-derives. A tree the store cannot
-      // restore exactly any more takes today's redo, with the records marked stale around it.
+      // restore exactly any more (a prefab trashed since) repeats the live delete and seats each tree's after-records, as
+      // the undo seats its before-records there (#2001 S8b: before, it marked every record stale for the re-seed).
       if (!restorable(after, viaRecords)) {
-        markStale(getCurrentWorld(), 'redo');
-        try { redoDelete(); } finally { markStale(getCurrentWorld(), 'redo'); }
+        for (const side of after) seatSide(side);
+        redoDelete();
+        for (const side of after) seatSide(side);
         return;
       }
       redoDelete();
@@ -1744,11 +1749,9 @@ export function deleteEntitiesWithUndo(
         const t = viaRecords[i]!;
         if (t.gone) return seatSide(side);
         if (restoreSide(side, t.records.at)) return;
-        markStale(getCurrentWorld(), 'redo');
         throw new Error(`the delete's redo could not rebuild "${t.records.at}" from its records`);
       });
     },
-    ...(viaRecords ? { maintainsRecords: true as const } : {}),
     // #2010: the undo's checks above, in its order, against a batch's pass; then what the undo brings back (the deleted
     // subtrees, and each promoted member's pre-delete guid in place of the one the frame-ending gave it).
     check: {
@@ -1979,26 +1982,6 @@ function planMoveUnlinks(entityId: number, newParentId: number): { strip: number
   return strip.length || promote.length ? { strip, promote } : null;
 }
 
-/** A reparent keeps the world pose by rewriting the local Transform. On an entity still linked to a prefab
- *  instance those local values are overrides, and the save keeps an instance field only when it is MARKED
- *  (`captureInstanceOverrides`), so an unmarked compensated field reloaded at the prefab's value and the
- *  entity jumped (#1436 review: a root dropped under a moved parent reloaded at that parent's origin).
- *  Marks each field the compensation changed — on a STORED instance root only (top-level or user-added).
- *  A member moved inside its own instance needs no mark: while it sits away from its template parent the
- *  save writes every Transform field that differs from the base (`captureInstanceOverrides`, #1437), and
- *  once it is moved back nothing is left pinned. A mark would outlive the move and pin the pose. The same
- *  holds for an OWNED nested root, whose "away from its template parent" is asked of its owner's frame
- *  (`ownedRootMoved`, #1481). */
-function markCompensatedTransform(id: number, oldLocal: Record<string, unknown>, newLocal: Record<string, number>): void {
-  const piMeta = getTraitByName('PrefabInstance');
-  const entity = findEntity(id);
-  if (!piMeta || !entity?.has(piMeta.trait)) return;
-  if (!isStoredRoot(entity.get(piMeta.trait) as MemberPi, id)) return;
-  for (const f of Object.keys(newLocal)) {
-    if (Math.abs(newLocal[f]! - Number(oldLocal[f] ?? 0)) > 1e-6) markOverride(entity, 'Transform', f);
-  }
-}
-
 export function reparentEntity(entityId: number, newParentId: number, newSortOrder?: number): boolean {
   // Self-parent + cycle now live in runtime/core/ecs/hierarchy.ts, shared with the device's
   // set-traits guard — the same rule in two places is what #166 P7 found diverging (§9).
@@ -2051,6 +2034,15 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // tag — folded into this action's undo/redo so Cmd+Z restores the tag too.
   const clearFolder = parentChanged && newParentId !== 0 && oldFolder !== '';
 
+  // A move that would unlink members (a member an older version moved out of its instance, carried out of it, #1447, or
+  // left above its frame, #1450) is refused before anything is written (#2001 S8b, owner ruling 2026-10-04): the records
+  // cannot follow that unpack. Taken BEFORE the parent write (#1445): afterwards the mover's own ancestry runs through
+  // its new parent, so a drop into ANOTHER instance read as staying inside the one it had left.
+  if (parentChanged && planMoveUnlinks(entityId, newParentId)) {
+    reportWriteRefusal(`"${entityNameOf(entityId)}" was not moved: ${MOVED_MEMBER_REFUSAL_TEXT}`);
+    return false;
+  }
+
   // Keep the world pose (only if the entity has a Transform), writing only what the move changes (#1848).
   let oldLocal: Record<string, any> | null = null;
   let newLocal: Record<string, number> | null = null;
@@ -2065,16 +2057,14 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
     }
   }
 
-  // Taken BEFORE the parent write (#1445): afterwards the mover's own ancestry runs through its new parent, so a
-  // drop into ANOTHER instance read as staying inside the one it had left.
-  const detachPlan = parentChanged ? planMoveUnlinks(entityId, newParentId) : null;
-
   // An OWNED nested root records which instance's row it is BEFORE it leaves: after the write its live parent
   // no longer says (`identityParents.ts`). Kept across the undo — back at its row, the link and the live parent
   // agree. (A plain member records nothing: its template parent is read from the document.)
-  // The marks an undo puts back: taken before ANY write here, since the sortOrder write below marks (#1709), and a
-  // snapshot after it made the undo restore that mark, pinning the old order as an override.
-  const oldMarks = captureMarks(entityId);
+  // #2001 S8b: the records of every tree the move touches, as they stand before it — the mover's and the new parent's —
+  // so its undo seats them back exactly (its live writes put back the tree they state) and its redo the ones it left.
+  const recordsBefore = recordsAroundMove(entityId, parentChanged ? newParentId : 0);
+  // And every record, for a move those trees do not state alone (`changedSince` below).
+  const everyBefore = copyRecords();
   // #2001 S4: the door's reparent (`setPlacement` + `own` relinks) — targets read before the parent write, committed
   // after the compensation below.
   const commitRecord = parentChanged ? instanceEdits.beginReparent(entityId) : null;
@@ -2083,83 +2073,20 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   if (newSortOrder !== undefined) writeTraitFieldMarked(entityId, attrMeta, 'sortOrder', newSortOrder);
   if (clearFolder) writeTraitField(entityId, attrMeta, 'editorFolder', '');
 
-  // Leaving the OUTERMOST instance cuts exactly the links the move splits (#1447): a member carried away from its
-  // instance root, or left behind by it, is unpacked into a plain entity that keeps its guid; an OWNED nested
-  // instance separated from the instance whose row expanded it becomes a standalone instance of its own prefab
-  // (owner ruling 2026-09-19 — it used to unpack too). Everything that moves together stays linked: a stored
-  // root dropped anywhere stays an instance, and inside another instance becomes its user-added nested one
-  // (#1436). A move that stays inside the outermost instance is saved as a `moved` entry (#1437) and cuts only a
-  // member it leaves above its frame — a root dropped under its own member unpacks that member (#1450, owner
-  // ruling 2026-09-19: unpack, not refuse). All of it is part of this action's undo/redo.
-  const piMeta = getTraitByName('PrefabInstance');
-  // `ownerRef` addresses the instance root by guid (null: the target IS the root): `data.rootInstanceId`
-  // is a bare ecs id, which a world rebuild (Play→Stop) reassigns, and an undo restoring the stale id
-  // left the instance naming a dead root — the next save wrote neither root nor members.
-  // An unpacked member keeps its marks (#1794 close-out review): the undo re-links it, and a rebuild in between re-seeds the
-  // marks from a file that holds it plain, so the next save dropped its overrides. A PROMOTED root needs none: it is saved
-  // as the standalone instance it became, whose overrides mark it again on the reload (the second review, measured).
-  const detachTargets: { ref: EntityRef; ownerRef: EntityRef | null; data: Record<string, unknown>; marks: MarkCapture }[] = [];
-  const promoteTargets: { ref: EntityRef; data: Record<string, unknown> }[] = [];
-  if (piMeta && detachPlan) {
-    for (const id of detachPlan.strip) {
-      const pd = findEntity(id)!.get(piMeta.trait) as Record<string, unknown>;
-      const owner = pd.rootInstanceId as number;
-      detachTargets.push({ ref: entityRef(id), ownerRef: owner === id ? null : entityRef(owner), data: { ...pd }, marks: captureMarks(id) });
-    }
-    for (const id of detachPlan.promote) promoteTargets.push({ ref: entityRef(id), data: { ...(findEntity(id)!.get(piMeta.trait) as Record<string, unknown>) } });
-  }
-  // What the last apply renamed, for its undo. (The values the outer row set on a promoted instance need no
-  // re-marking: every expansion marks the row overrides it applies, so the save already keeps them.)
-  let renamed = new Map<string, string>();
-  // …and what its frame-ending promoted or unlinked OUTSIDE the plan (#1453).
-  let orphans: DetachedMember[] = [];
-  const applyDetach = () => {
-    if (!piMeta) return;
-    const idx = buildGuidIndex();
-    const ids = detachTargets.map((t) => resolveWith(t.ref, idx)).filter((id): id is number => id != null);
-    // A member moved away from an unpacked one keeps its path (#1437), and one still linked to an unpacked
-    // owned root's frame is promoted or unlinked with it (#1453).
-    orphans = recordDetachedMarks(endFrames(new Set(ids)));
-    for (const id of ids) findEntity(id)?.remove(piMeta.trait);
-    const roots = promoteTargets.map((t) => resolveWith(t.ref, idx)).filter((id): id is number => id != null);
-    renamed = promoteOwnedRoots(roots);
-  };
-  const undoDetach = () => {
-    if (!piMeta) return;
-    // Renames reversed last-applied first: the plan's promotions, then the orphans' (inside the relink).
-    applyGuidRemap(new Map([...renamed].map(([a, b]) => [b, a])));
-    relinkDetachedMembersMarked(orphans);
-    const idx = buildGuidIndex();
-    for (const t of promoteTargets) {
-      const id = resolveWith(t.ref, idx);
-      // Its own root: the id, not the stored one, which a world rebuild (Play→Stop) reassigns.
-      if (id != null) findEntity(id)?.set(piMeta.trait, { ...t.data, rootInstanceId: id });
-    }
-    for (const t of detachTargets) {
-      const id = resolveWith(t.ref, idx);
-      if (id == null) continue;
-      const owner = t.ownerRef ? resolveWith(t.ownerRef, idx) : id;
-      // An owner that no longer resolves (a derived guid the rebuild re-derived differently) is left
-      // unlinked: its stale id may now name an unrelated entity, and a member naming one is dropped
-      // by the save, whereas a plain entity is written.
-      if (owner == null) continue;
-      findEntity(id)?.add(piMeta.trait({ ...t.data, rootInstanceId: owner }));
-      restoreMarks(id, t.marks);
-    }
-  };
-  const detaching = detachTargets.length > 0 || promoteTargets.length > 0;
-  // Guid refs so undo/redo survive a world rebuild. Root (0) stays literal 0. Taken BEFORE the detach: a
-  // promotion renames members (#1447), and the old parent can be one of them — undo reverses the rename first,
-  // so a ref taken after it named nothing and the mover went to the scene root (close-out review).
+  // Guid refs so undo/redo survive a world rebuild. Root (0) stays literal 0.
   const ref = entityRef(entityId);
   const oldParentRef = oldParentId ? entityRef(oldParentId) : null;
   const newParentRef = newParentId ? entityRef(newParentId) : null;
-  if (detaching) applyDetach();
   // A member that STAYS linked keeps deriving from the row parent it left (#1437) with nothing recorded on it:
   // every identity walk reads its template parent from the document (`identityParents.ts`, #1468 Phase 6).
-  if (oldLocal && newLocal) markCompensatedTransform(entityId, oldLocal, newLocal);
-  commitRecord?.({ compensated: oldLocal && newLocal ? { old: oldLocal, next: newLocal } : undefined, detaching });
+  commitRecord?.({ compensated: oldLocal && newLocal ? { old: oldLocal, next: newLocal } : undefined });
   markStructureDirty();
+  // Those trees' records as the move left them, when it left every one fresh and created or dropped none. A move that
+  // reaches a tree they do not state seats what it changed in the whole store instead (#2001 S8b: before, it marked every
+  // record stale for the re-seed), before its live undo or redo (which may read them) and again after it.
+  const recordsAfter = recordsBefore ? recordsSide(recordsBefore.records.keys()) : null;
+  const movedOnRecords = !!recordsAfter && [...recordsBefore!.records].every(([g, r]) => !r === !recordsAfter.records.get(g));
+  const changed = movedOnRecords ? null : changedSince(everyBefore);
 
   const savedOldLocal = oldLocal ? { ...oldLocal } : null;
   const savedNewParentId = newParentId;
@@ -2174,50 +2101,53 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // after — one scene, resolved once, post-mutation is fine.
   const affectedScenes = resolveAffectedScenes([entityId]);
 
+  const redoLive = (id: number, parent: number) => {
+    writeTraitField(id, attrMeta!, 'parentId', parent);
+    // As the original action: only a move that SET a sortOrder writes it. (Before #1914 R2 re-writing the unchanged
+    // value un-recorded a stored override equal to the base; no write removes a record now.)
+    if (newSortOrder !== undefined) writeTraitFieldMarked(id, attrMeta!, 'sortOrder', newSortOrder);
+    if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', '');
+    if (savedNewLocal && transformMeta) { for (const [f, v] of Object.entries(savedNewLocal)) writeTraitField(id, transformMeta, f, v); }
+    markStructureDirty();
+  };
+
   _pushAction({
     label,
     undo: () => {
       // The mover and its old parent, both required before the first write (I19): a parent that is gone refuses
-      // rather than putting the mover at the scene root. Through the promotion's rename, which `undoDetach` reverses
-      // only after this: both refs were taken before it, and either one can be a member it renamed (#1447).
+      // rather than putting the mover at the scene root.
       const idx = buildGuidIndex();
-      const renames = detaching ? renamesOf(orphans, new Map(renamed)) : undefined;
-      const id = requireWith(ref, idx, undefined, renames);
-      const parent = oldParentRef ? requireWith(oldParentRef, idx, undefined, renames) : 0;
-      if (detaching) undoDetach(); // re-tag the detached members first, and take back a promotion's rename
-      writeTraitField(id, attrMeta!, 'parentId', parent);
-      writeTraitField(id, attrMeta!, 'sortOrder', oldSortOrder);
-      if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', oldFolder);
-      // Only the keys the move wrote: an edit since to any other field is not the move's to undo.
-      if (savedOldLocal && savedNewLocal && transformMeta) { for (const f of Object.keys(savedNewLocal)) writeTraitField(id, transformMeta, f, savedOldLocal[f]); }
-      restoreMarks(id, oldMarks);
+      const id = requireWith(ref, idx);
+      const parent = oldParentRef ? requireWith(oldParentRef, idx) : 0;
+      const live = () => {
+        writeTraitField(id, attrMeta!, 'parentId', parent);
+        writeTraitField(id, attrMeta!, 'sortOrder', oldSortOrder);
+        if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', oldFolder);
+        // Only the keys the move wrote: an edit since to any other field is not the move's to undo.
+        if (savedOldLocal && savedNewLocal && transformMeta) { for (const f of Object.keys(savedNewLocal)) writeTraitField(id, transformMeta, f, savedOldLocal[f]); }
+      };
+      if (changed) seatAround(changed, 'before', live);
+      else { live(); seatSide(recordsBefore!); }
+      // A field the records put back do not list shows the base (#1709: the undone order is no override).
+      takeUnmarkedFromBase(id);
       markStructureDirty();
     },
     redo: () => {
       const id = ref.require();
-      writeTraitField(id, attrMeta!, 'parentId', newParentRef ? newParentRef.require() : 0);
-      // As the original action: only a move that SET a sortOrder writes it. (Before #1914 R2 re-writing the unchanged
-      // value un-recorded a stored override equal to the base; no write removes a record now.)
-      if (newSortOrder !== undefined) writeTraitFieldMarked(id, attrMeta!, 'sortOrder', newSortOrder);
-      if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', '');
-      if (savedNewLocal && transformMeta) { for (const [f, v] of Object.entries(savedNewLocal)) writeTraitField(id, transformMeta, f, v); }
-      if (detaching) applyDetach(); // re-strip after the move
-      if (savedOldLocal && savedNewLocal) markCompensatedTransform(id, savedOldLocal, savedNewLocal);
-      markStructureDirty();
+      const parent = newParentRef ? newParentRef.require() : 0;
+      if (changed) return seatAround(changed, 'after', () => redoLive(id, parent));
+      redoLive(id, parent);
+      seatSide(recordsAfter!);
     },
-    // #2010: each half's refs, as above. A move that detaches changes which entities are instance members, and a
-    // promotion renames them, which no later check can read off the pass: it ends the pre-pass.
+    // #2010: each half's refs, as above.
     check: {
       undo: (pass) => {
-        const renames = detaching ? renamesOf(orphans, new Map(renamed)) : undefined;
-        checkRef(pass, ref, undefined, renames);
-        if (oldParentRef) checkRef(pass, oldParentRef, undefined, renames);
-        if (detaching) pass.blind = true;
+        checkRef(pass, ref);
+        if (oldParentRef) checkRef(pass, oldParentRef);
       },
       redo: (pass) => {
         checkRef(pass, ref);
         if (newParentRef) checkRef(pass, newParentRef);
-        if (detaching) pass.blind = true;
       },
     },
     kind: '!reparent',
@@ -2228,6 +2158,17 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   });
 
   return true;
+}
+
+/** The records of every tree a move of `entityId` under `newParentId` touches (#2001 S8b): the one that holds the mover,
+ *  or each one under it, and the new parent's. Null when one of them cannot be had. */
+function recordsAroundMove(entityId: number, newParentId: number): RecordsSide | null {
+  const around = takeRecordsAround(entityId);
+  if (!around) return null;
+  if (!newParentId || !projectionRootOf(newParentId)) return around;
+  const into = takeTreeRecords(newParentId);
+  if (!into) return null;
+  return { records: new Map([...around.records, ...into.side.records]) };
 }
 
 // ── Move between scenes (scene-loading.md Phase 14) ──
@@ -2308,7 +2249,7 @@ function rewriteEntityRefsForGuid(oldGuid: string, newGuid: string): RefRewrite[
 
 export interface SceneMoveResult {
   ok: boolean;
-  reason?: 'no-entity' | 'no-attrs' | 'same-scene' | 'trait-missing' | 'collapsed-parent' | SceneMoveRefusal | RestructureRefusal;
+  reason?: 'no-entity' | 'no-attrs' | 'same-scene' | 'trait-missing' | 'collapsed-parent' | 'rekey-instance' | SceneMoveRefusal | RestructureRefusal;
   /** Live ids of every entity re-stamped (the subtree, root first). */
   movedIds: number[];
   /** True when the root's parentId was cleared (landed at the target scene's
@@ -2371,6 +2312,11 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
   // serialize.ts) — a half-moved subtree is exactly the cross-scene-parented
   // state the Phase 6 guard exists to prevent.
   const ids = subtreeIds(flat, entityId);
+  // A rekey renames guids the instance records name (a root, a member, a node an anchor links): refused before anything
+  // changes, as no record follows the rename (#2001 S8b: before, the step marked every record stale for the re-seed).
+  if (opts?.rekeyGuids?.size && ids.some((id) => opts.rekeyGuids!.has(byId.get(id)?.guid || '') && (instanceTargetOf(id) || outermostStoredRoot(id)))) {
+    return { ...NULL_MOVE_RESULT, reason: 'rekey-instance' };
+  }
 
   const allTraitsList = getAllTraits();
   const transformMeta = allTraitsList.find((m) => m.name === 'Transform');
@@ -2450,7 +2396,6 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     writeTraitFieldMarked(rid, attrMeta, 'sortOrder', newSortOrder);
     if (clearFolder) writeTraitField(rid, attrMeta, 'editorFolder', '');
     if (newLocal && transformMeta) for (const [f, v] of Object.entries(newLocal)) writeTraitField(rid, transformMeta, f, v);
-    if (oldLocal && newLocal) markCompensatedTransform(rid, oldLocal, newLocal);
   };
   const undoStamps = ({ ids, parent }: { ids: number[]; parent: number }) => {
     perEntity.forEach(({ prevSourceScene }, i) => writeTraitField(ids[i], attrMeta, 'sourceScene', prevSourceScene));
@@ -2460,13 +2405,15 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     if (clearFolder) writeTraitField(rid, attrMeta, 'editorFolder', oldFolder);
     // Only the keys the move wrote: an edit since to any other field is not the move's to undo.
     if (oldLocal && newLocal && transformMeta) for (const f of Object.keys(newLocal)) writeTraitField(rid, transformMeta, f, oldLocal[f]);
-    restoreMarks(rid, rootMarks);
   };
-  const rootMarks = captureMarks(entityId);
+  const recordsBefore = copyRecords();
   // #2001 S4: the door's reparent, as `reparentEntity` (a scene move refuses an instance-member split, so no detach).
   const commitRecord = parentChanged ? instanceEdits.beginReparent(entityId) : null;
   applyStamps();
   commitRecord?.({ compensated: oldLocal && newLocal ? { old: oldLocal, next: newLocal } : undefined });
+  // #2001 S8b: the records the move changed (a moved root's placement, an `own` link it gained or lost), as it found and
+  // left them: the undo seats the first around its raw writes, the redo the second. Before, both marked every record stale.
+  const changed = changedSince(recordsBefore);
 
   // Rekey (owner decision D: machinery built, not wired to the Hierarchy confirm
   // dialog yet). `rewriteEntityRefsForGuid` is symmetric under argument order, so
@@ -2511,13 +2458,12 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     label: opts?.label ?? (targetScene ? `Promote "${rootInfo.name}" → ${targetLabel}` : `Demote "${rootInfo.name}" → ${targetLabel}`),
     undo: () => {
       const target = requireMove(oldParentRef, new Map(rekeyPairs.map((p) => [p.oldGuid, p.newGuid])));
-      undoRekeys();
-      undoStamps(target);
+      seatAround(changed, 'before', () => { undoRekeys(); undoStamps(target); });
+      takeUnmarkedFromBase(target.ids[0]!); // as the reparent's undo
       markStructureDirty(); markUIDirty();
     },
     redo: () => {
-      applyStamps();
-      applyRekeys();
+      seatAround(changed, 'after', () => { applyStamps(); applyRekeys(); });
       markStructureDirty(); markUIDirty();
     },
     // #2010: each half's `requireMove`, against the pass; then the guids the half's rekey puts on.
@@ -2575,7 +2521,7 @@ export function demoteEntityToScene(entityId: number, opts?: Omit<SceneMoveOptio
  *  A stored instance root dropped inside a base's instance is NOT refused: it becomes that instance's
  *  user-added nested instance, as it does in a same-scene reparent (#1436). */
 export type ReparentPlan =
-  | { kind: 'refused'; reason: ReparentRefusal | SceneMoveRefusal | PrefabEditRefusalReason | RestructureRefusal | CollapsedParentRefusal }
+  | { kind: 'refused'; reason: ReparentRefusal | SceneMoveRefusal | PrefabEditRefusalReason | RestructureRefusal | CollapsedParentRefusal | MovedMemberRefusal }
   | { kind: 'same-scene' }
   | { kind: 'scene-move'; from: string; to: string };
 
@@ -2591,17 +2537,23 @@ export function planReparent(entityId: number, newParentId: number, newSortOrder
   // `newSortOrder`, when the caller gives the mover a place: a new one is a reorder, refused the same way under its own
   // parent.
   const ea = getTraitByName('EntityAttributes');
-  const oldSort = ea ? Number((readTraitData(entityId, ea) as { sortOrder?: number } | null)?.sortOrder ?? 0) : 0;
+  const attrs = ea ? readTraitData(entityId, ea) as { sortOrder?: number; parentId?: number } | null : null;
+  const oldSort = Number(attrs?.sortOrder ?? 0);
   const reorder = newSortOrder !== undefined && newSortOrder !== oldSort;
   if (restructureRefusal({ id: entityId, parentId: newParentId, reorder })) return { kind: 'refused', reason: 'restructure' };
   // No local transform keeps the world pose under a zero-scale parent (#1848). Asked here, in the plan, so a multi-target
   // field write refuses before its first target moves, and the op names the reason instead of reading a no-op.
   if (collapsesUnder(entityId, newParentId)) return { kind: 'refused', reason: 'collapsed-parent' };
+  // A same-scene move that would unlink members: only a member an older version moved out of its instance gets there
+  // (#2001 S8b, owner ruling 2026-10-04), and the records cannot follow that unpack. (A scene move asks its own question,
+  // `sceneMoveRefusal`, below.)
+  const sameScene = (): ReparentPlan => ((attrs?.parentId ?? 0) !== newParentId && planMoveUnlinks(entityId, newParentId)
+    ? { kind: 'refused', reason: 'moved-member' } : { kind: 'same-scene' });
   // Un-parenting keeps the entity's own scene: a root belongs to whichever file stamps it.
-  if (newParentId === 0) return { kind: 'same-scene' };
+  if (newParentId === 0) return sameScene();
   const from = rawSourceScene(entityId);
   const to = rawSourceScene(newParentId);
-  if (from === to) return { kind: 'same-scene' };
+  if (from === to) return sameScene();
   // The same question `moveEntityToScene` asks, asked here too so a caller can refuse BEFORE its prompt.
   const moveRefusal = sceneMoveRefusal(entityId);
   if (moveRefusal) return { kind: 'refused', reason: moveRefusal };
@@ -2613,7 +2565,9 @@ export type SceneMoveRefusal = 'instance-member';
 
 /** A move or reorder of an object a prefab supplies (#1869, `restructureRefusal`). */
 export type RestructureRefusal = 'restructure';
-export { RESTRUCTURE_REFUSAL_TEXT };
+/** A move that would unlink a member an older version moved out of its instance (`MOVED_MEMBER_REFUSAL_TEXT`). */
+export type MovedMemberRefusal = 'moved-member';
+export { RESTRUCTURE_REFUSAL_TEXT, MOVED_MEMBER_REFUSAL_TEXT };
 
 /** The editor's words for a refused scene move: the Hierarchy toasts this for every drop that asks. */
 export const SCENE_MOVE_REFUSAL_TEXT: Record<SceneMoveRefusal | RestructureRefusal, string> = {

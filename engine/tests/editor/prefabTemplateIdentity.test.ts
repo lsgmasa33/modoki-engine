@@ -33,7 +33,7 @@ import {
 } from '@modoki/engine/runtime';
 import { clearHistory, setActionCallback, pushAction, serializeScene, deleteEntitiesWithUndo, undo, duplicateEntity } from '@modoki/engine/editor';
 import {
-  snapshotEntity, respawnFromSnapshot, copySnapshot, planReparent, applyReparent, reparentEntity, moveEntityToScene, planSceneDrop, siblingDropRefusal,
+  clipEntity, pasteEntityCopy, planReparent, applyReparent, reparentEntity, moveEntityToScene, planSceneDrop, siblingDropRefusal,
   siblingKeepsItsPlace, siblingsKeepingTheirPlace, stuckDropText, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo,
 } from '../../packages/modoki/src/editor/undo/entityActions';
 import { getEditVersion } from '../../packages/modoki/src/editor/undo/undoManager';
@@ -54,6 +54,8 @@ import type { AddedEntity } from '../../packages/modoki/src/runtime/loaders/load
 import { setTemplateKey, templateKeyOf, TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { isRuntimeGuid, deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { instanceKeyMap } from '../../packages/modoki/src/editor/instance/instanceKeys';
+import { storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -728,8 +730,19 @@ describe('a member token naming a template-added node survives a scene save + re
       const e = [...getCurrentWorld().entities].find((x) => x.id() === id)!;
       e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), parentId });
     };
-    setParent(extraOf().id, slot);
-    await load(await serializeScene() as unknown as SceneData);
+    // The file the old capture wrote for Extra moved out of its frame under Slot (a raw parent write; no gesture makes such
+    // a move, and since #2001 S8b a raw write reaches no record): the template's node removed, and Extra stated as the
+    // scene's own node under Slot, under its guid and with no key.
+    const keys = instanceKeyMap(getAllEntities().find((e) => e.guid === G1)!.id);
+    const key = keys.get(extraOf().id)!, slotKey = keys.get(slot)!;
+    expect(key, 'premise: Extra is keyed in its frame').toMatch(new RegExp(`/a\\+${KEY}$`));
+    const extraGuid = extraOf().guid!;
+    const file = await serializeScene() as unknown as { entities: Array<{ guid?: string; members?: Record<string, Record<string, unknown>> }> };
+    const rows = (file.entities.find((e) => e.guid === G1)!.members ??= {});
+    rows[key] = { removed: true };
+    rows[slotKey] = { ...rows[slotKey], own: [{ parentLocalId: 0, guid: extraGuid, name: 'Extra', traits: { EntityAttributes: { name: 'Extra' }, Transform: {} }, children: [] }] };
+    void setParent; void inner;
+    await load(file as unknown as SceneData);
     const live = () => [...getCurrentWorld().entities].find((x) => x.id() === extraOf().id)!;
     expect(live().has(TemplateAddedKey)).toBe(false); // out of its frame, nothing derives its guid
     const innerNow = getAllEntities().find((e) => e.name === 'InnerRoot' && rootGuidOf(e.id) === G1
@@ -805,16 +818,17 @@ describe('a duplicated or pasted instance keeps its template-added nodes keyed a
     await expectCopyKeyed(file);
   });
 
-  // Paste respawns from a snapshot taken earlier — the source may be gone by then.
+  // Paste respawns from the clipboard taken earlier — the source may be gone by then. Through the gesture (Copy, then
+  // Paste): the clipboard carries the records the copy is placed on, which a bare snapshot respawn does not.
   it('a paste after the source was deleted', async () => {
     const file = outerWithRef() as unknown as PrefabFile;
     install(file);
     await load(twoInstances(OUTER, 'OuterRoot'));
     const src = getAllEntities().find((e) => e.guid === G1)!.id;
-    const snap = snapshotEntity(src)!;
+    const clip = clipEntity(src, 'copy')!;
     deleteEntitiesWithUndo([src]);
-    respawnFromSnapshot(copySnapshot(snap), 0);
-    const root = getAllEntities().find((e) => e.name === 'OuterRoot' && e.guid !== G2)!.id;
+    const root = pasteEntityCopy(clip, 0, () => {})!;
+    expect(getAllEntities().find((e) => e.id === root)?.name).toBe('OuterRoot');
     const rootGuid = getAllEntities().find((e) => e.id === root)!.guid!;
     expect(keyOn(extraUnder(root).id)).toBe(KEY);
     expect(extraUnder(root).guid).toBe(deriveMemberGuid(rootGuid, [2, 3, 2, 3, `+${KEY}`]));
@@ -911,11 +925,13 @@ describe('a duplicated or pasted instance keeps its template-added nodes keyed a
     install(droppedDoc());
     await load({ ...twoInstances(OUTER, 'OuterRoot'), entities: [twoInstances(OUTER, 'OuterRoot').entities[0]] } as unknown as SceneData);
     const mid = getAllEntities().find((e) => e.name === 'MidRoot')!.id;
-    const dropped = getAllEntities().find((e) => e.name === 'InnerRoot' && keyOn(e.id) === REF_KEY)!.id;
-    const droppedBefore = guidsUnder(dropped);
+    const droppedGuid = getAllEntities().find((e) => e.name === 'InnerRoot' && keyOn(e.id) === REF_KEY)!.guid!;
+    const dropped = () => getAllEntities().find((e) => e.guid === droppedGuid)!.id;
+    const droppedBefore = guidsUnder(dropped());
     const root = duplicateEntity(mid, () => {})!;
-    // The copy moves no identity of the source's: a ref to one of them from another file must keep resolving.
-    expect(guidsUnder(dropped)).toEqual(droppedBefore);
+    // The copy moves no identity of the source's: a ref to one of them from another file must keep resolving. (By guid:
+    // a copy on records rebuilds every tree it lies in from its records, the source's too, under new ids, #2046 S7.4.)
+    expect(guidsUnder(dropped())).toEqual(droppedBefore);
     const rootGuid = getAllEntities().find((e) => e.id === root)!.guid;
     const before = guidsUnder(root);
     expect(before.filter((g) => g.startsWith('InnerRoot:'))).toHaveLength(2); // the row's expansion and the dropped node
@@ -1245,7 +1261,15 @@ describe('#1869: restructuring a prefab instance is refused, with no side effect
     const extra = getAllEntities().find((e) => e.name === 'Extra')!.id;
     expect(templateKeyOf(live(extra))).toBe(KEY); // precondition: keyed here too
     expect(planReparent(extra, editRoot)).toEqual({ kind: 'same-scene' });
+    // The move is a template edit the prefab-edit save writes: the nested row's record links Extra as the row's own node
+    // (the document states it on the row; its keyed link is derived from the row's frame, #2001 S8b step 5), and moved out
+    // of the row, it leaves the row's list. Mutation: drop `isSuppliedByPrefab` from `beginReparent`'s member test — the
+    // move throws and is rolled back, and the link stays.
+    const store = () => JSON.stringify([...storedInstances(getCurrentWorld())], (_k, v: unknown) => (v instanceof Map ? [...v] : v));
+    const extraGuid = getAllEntities().find((e) => e.id === extra)!.guid!;
+    expect(store()).toContain(extraGuid); // precondition: linked
     expect(reparentEntity(extra, editRoot)).toBe(true);
+    expect(store()).not.toContain(extraGuid);
     const slot = getAllEntities().find((e) => e.name === 'Slot')!.id;
     expect(planReparent(slot, editRoot)).toEqual({ kind: 'refused', reason: 'restructure' });
   });

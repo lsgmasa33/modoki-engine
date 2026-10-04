@@ -5,7 +5,11 @@
  *  - refused: an unresolved link to a prefab whose file is gone, named by the path it lived at;
  *  - accepted: an unresolved link to a prefab that still exists — #1272's case, a held nested frame whose guid a reload
  *    re-derived, which keeps its own link;
- *  - accepted without a read: every link resolves. */
+ *  - accepted without a read: every link resolves.
+ *  And `everyLink` (#2001 S8b, hunt seed 8032 — the fuzz regression drives Detach's real undo): a RESOLVED link is asked
+ *  too, since a Detach leaves its entities live and plain through a trash of their prefab:
+ *  - refused: a resolved link to a prefab whose file is gone;
+ *  - accepted: a resolved link to a prefab that still exists. */
 
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { registerAsset } from '@modoki/engine/runtime';
@@ -59,5 +63,19 @@ describe('requireLinks (#1880 W5)', () => {
   it('links that all resolve read nothing and refuse nothing', async () => {
     await expect(requireLinks(snapshot(link(true), link(true)), 'the step')).resolves.toBeUndefined();
     expect(reads).toEqual([]);
+  });
+
+  // Mutation: ignore `everyLink` (resolve the link as before) — every link resolves, nothing refuses, and Detach's undo
+  // relinks its entities to a prefab that does not load.
+  it('everyLink: a link that resolves still refuses when its prefab was deleted since', async () => {
+    const e = await refusal(requireLinks(snapshot(link(true), link(true)), '"Detach prefab"', { everyLink: true }));
+    expect(e).toBeInstanceOf(UndoRefusedError);
+    expect(String((e as Error).message)).toBe(`"Detach prefab" was not undone: 2 of the prefab links it puts back name ${QP}, which was deleted since, so nothing was changed.`);
+  });
+
+  // Accept side. Mutation: refuse every link `everyLink` asks of (drop the `prefabFileGone` test) — this goes red.
+  it('everyLink: a link to a prefab that still exists is not refused', async () => {
+    disk.add(QP);
+    await expect(requireLinks(snapshot(link(true)), '"Detach prefab"', { everyLink: true })).resolves.toBeUndefined();
   });
 });

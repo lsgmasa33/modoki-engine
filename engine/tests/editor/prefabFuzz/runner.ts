@@ -23,7 +23,7 @@ import { isStoredRoot } from '../../../packages/modoki/src/runtime/core/assetRef
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { findEntityByGuid } from '../../../packages/modoki/src/runtime/core/ecs/world';
 import { unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
-import { shadowSeams, listDiff, p5Diff, assertNotSelf, liveStoredRoots, type ShadowSeams } from './shadow';
+import { shadowSeams, p5Diff, liveStoredRoots, type ShadowSeams } from './shadow';
 import type { OverrideList } from '../../../packages/modoki/src/runtime/prefab/instanceRecord';
 import { checkRecord, type StoredOwner } from '../foldOracle';
 import { foldInstance } from '../../../packages/modoki/src/runtime/prefab/foldInstance';
@@ -31,7 +31,6 @@ import { parseInstanceRecord, parseReferenceNode } from '../../../packages/modok
 import { getCachedPrefab } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
 import type { SceneEntityEntry, AddedEntity } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import type { PrefabDoc, PrefabReader, ParsedInstance } from '../../../packages/modoki/src/runtime/prefab/instanceRecord';
-import type { OpKind } from './ops';
 
 /** `MODOKI_PREFAB_FUZZ_DUMP=<dir>`: write every compared state there, for reading a finding by hand. */
 function dump(name: string, value: unknown): void {
@@ -302,47 +301,18 @@ function setAsideLeaf(before: unknown, after: Record<string, unknown>, d: string
 }
 
 /** #2009: the new model's checks (`shadow.ts`), each only once the build has installed its seam, and each run counted.
- *  ⚠️ I25 compares `rec.list` only, as the design words it: the root's `Placement` (parent, order, name) is not compared
- *  between S4 and S5, and P1's reprojection is the first check that would see a wrong one (review).
- *  - I25 (the shadow, S4–S7): after an op whose door exists, every record equals what today's capture reads off the live
- *    tree, modulo identity pins. After any other op it is NOT compared (§ 10.5), and that is counted per op kind, so the
- *    tally shows which doors are still missing.
  *  - P1 (S5 on, permanently): reprojecting every record from the store leaves the world as it was — traits, marks,
  *    parents, order, guids. A difference is a writer that changed live state without the door, or a fold that is not a
- *    function of the record. */
-async function shadowChecks(seams: ShadowSeams, kind: string): Promise<Failure[]> {
+ *    function of the record.
+ *  (I25, the record against the old capture, ran from S4 to #2001 S8b: `shadow.ts` says why it went.) */
+async function shadowChecks(seams: ShadowSeams, _kind: string): Promise<Failure[]> {
   const out: Failure[] = [];
   // Both checks walk the STORE, so a live instance it lacks is one neither compares: a store that holds nothing would
   // pass both while counting them as run (review). Every live stored root must have a record.
   const stored = new Set(seams.records().map((r) => r.rootGuid));
-  const missing = liveStoredRoots().filter((g) => {
-    if (stored.has(g)) return false;
-    const why = seams.unrecorded?.(g);
-    if (why) ran(`shadow: a live stored root unrecorded by ${why}`);
-    return !why;
-  });
+  const missing = liveStoredRoots().filter((g) => !stored.has(g));
   ran('shadow: the store covers every live stored root');
   if (missing.length) return [{ check: 'a live stored instance has no record', detail: `${missing[0]}${missing.length > 1 ? ` (+${missing.length - 1} more)` : ''}` }];
-  if (seams.captureList) {
-    if (!seams.doors.has(kind as OpKind)) ran(`I25 after ${kind}: not compared (no door yet)`);
-    else {
-      ran(`I25 after ${kind}`);
-      // Per op kind, whether a record was COMPARED after it, not only that I25 ran: a door whose records were all skipped
-      // (stale, uncapturable) after it would otherwise count as judged (review).
-      let comparedHere = false;
-      for (const rec of seams.records()) {
-        const judged = seams.judge ? seams.judge(rec) : rec.list;
-        if ('skip' in judged) { ran(`I25 not compared: ${judged.skip}`); continue; }
-        const captured = seams.captureList(rec.rootGuid);
-        if (!captured) { out.push({ check: 'I25 a stored record has no live instance', detail: rec.rootGuid }); break; }
-        assertNotSelf(rec.list, captured);
-        ran('I25 compared a record');
-        if (!comparedHere) { comparedHere = true; ran(`I25 compared after ${kind}`); }
-        const d = listDiff(judged, captured);
-        if (d) { out.push({ check: 'I25 the record is not the capture', detail: `${rec.rootGuid} ${d}` }); break; }
-      }
-    }
-  }
   if (seams.project) {
     for (const rec of [...seams.records()]) {
       const p = await seams.project(rec);
@@ -354,17 +324,17 @@ async function shadowChecks(seams: ShadowSeams, kind: string): Promise<Failure[]
       if (d) { out.push({ check: 'P1 the projection of a record is not its live instance', detail: `${rec.rootGuid} ${d}`, moved: nodeMoved(d, p.live, p.projected) }); break; }
     }
   }
+  if (out.length) return out;
   return out;
 }
 
-/** The lists P5 compares: every record the shadow judges now, by root guid, cloned. Undefined with no seams installed. */
+/** The lists P5 compares: every record the seams do not skip now, by root guid, cloned. Undefined with no seams installed. */
 function p5Lists(): Map<string, OverrideList> | undefined {
   const seams = shadowSeams();
   if (!seams) return undefined;
   const out = new Map<string, OverrideList>();
   for (const rec of seams.records()) {
-    const judged = seams.judge ? seams.judge(rec) : rec.list;
-    if (!('skip' in judged)) out.set(rec.rootGuid, structuredClone(rec.list));
+    if (seams.skip?.(rec) === undefined) out.set(rec.rootGuid, structuredClone(rec.list));
   }
   return out;
 }
@@ -377,8 +347,8 @@ function p5Check(before: ReadonlyMap<string, OverrideList>, kind: string): Failu
   for (const [guid, list] of before) {
     const rec = now.get(guid);
     if (!rec) { ran(`P5 not compared after ${kind}: no record`); continue; }
-    const judged = seams.judge ? seams.judge(rec) : rec.list;
-    if ('skip' in judged) { ran(`P5 not compared after ${kind}: ${judged.skip}`); continue; }
+    const skip = seams.skip?.(rec);
+    if (skip !== undefined) { ran(`P5 not compared after ${kind}: ${skip}`); continue; }
     ran('P5 compared a record');
     ran(`P5 compared after ${kind}`);
     const d = p5Diff(list, rec.list);
@@ -650,9 +620,9 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     // a member taken out of its template, a trashed or renamed prefab). None is an explicit act on an instance, so the
     // scene must state every record afterwards too (Unity's unused overrides; docs/prefabs.md § I18, I23).
     const recordsBefore = RECORD_NEUTRAL.has(op.kind) && !editing() ? recordKeys(JSON.stringify(await serializeScene())) : undefined;
-    // P5 (design § 3.5, #2046 S7): the same audit asked of the DATA. Every record the shadow judges before a record-neutral
-    // op must hold the same list after it. Only once seams are installed; a record the op leaves stale is not compared
-    // (its op has not moved onto records yet), counted per reason.
+    // P5 (design § 3.5, #2046 S7): the same audit asked of the DATA. Every record the seams do not skip before a
+    // record-neutral op must hold the same list after it. Only once seams are installed; a skipped record is counted per
+    // reason.
     const p5Before = RECORD_NEUTRAL.has(op.kind) && !editing() ? p5Lists() : undefined;
     // Taken before the op, for the rebuild ≡ reload check the generator wrote into it (#1880 T2).
     const sBefore = op.check === 'rebuild-reload' && !editing() ? await serializeScene() : undefined;

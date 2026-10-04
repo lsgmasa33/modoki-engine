@@ -1,7 +1,7 @@
 /** Serialize the ECS world to scene + materials JSON files.
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
-import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, readTraitData, findEntity, subtreeIds, getStructureVersion } from '../../runtime/core/ecs/entityUtils';
 import { openIdentityScope, closeIdentityScope, worldIdentityParents } from '../../runtime/core/ecs/identityParents';
 import { collectTransientSubtreeIds } from './authoringScope';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
@@ -26,12 +26,12 @@ import { isPrefabEditWorld } from './prefabEditWorld';
 import { useEditorStore } from '../store/editorStore';
 import { setPlayState } from '../../runtime/core/playState';
 import { whyWorldNotAuthored } from './authoredWorld';
+import { isUnsavableMark } from '../instance/instanceRollback';
 import { beginWorldReplacement } from './authoringSettle';
 import { UNREACHABLE_STATE } from '../undo/stateToken';
 import { forgetHistory, rekeyUntitledHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled, worldStateToken, beginFreshWorldState, captureSavePoint, captureSceneSavePoint, settleSavePoint, settleSceneSavePoint, restoreWorldStateToken, type SavePoint } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { getPrefabSource, preloadNestedPrefabs } from './prefabCache';
-import { captureInstanceEntry } from './instanceEntry';
 import { savedEntryOf, placedAsLive, livePlacement, type SavedInstance } from '../instance/instanceSave';
 import { rebaseStaleInstances, savedFrameDoc } from './prefabRebuild';
 import { levelDoc } from './prefabBase';
@@ -50,7 +50,7 @@ import { clearSceneDirty, dirtySceneGuidsSnapshot, hasDirtyScenes, isSceneDirty,
 import { beginFreshFileRead } from './freshFileRead';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
-import { SCENE_FORMAT_VERSION, CAPTURE_FORM_SCENE_VERSION } from '../../runtime/core/version';
+import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { hasDirtyAssets, getDirtyAssetPaths, flushDirtyAssets, type FlushResult } from './dirtyAssets';
 import { hasPendingBaseScenes, getPendingBaseScenePaths, flushPendingBaseScenes, reconcileBaseScenePark } from './pendingBaseScene';
 import { hasPendingMeta, getPendingMetaPaths, flushPendingMeta, type MetaFlushResult } from './pendingMeta';
@@ -199,8 +199,30 @@ export async function serializeScene(opts?: {
 }): Promise<SceneFile> {
   // One identity resolver for the whole save, rebuilt only if the world's structure moves under an await
   // (`identityParents.ts`).
+  // A structure that moved under an await (an in-place rebuild, an undo's restore) is read again, from the top: the bytes
+  // are of one state of the world, never two. A replaced world, or one still moving after three reads, stops the save.
   openIdentityScope();
-  try { return await serializeSceneScoped(opts); } finally { closeIdentityScope(); }
+  try {
+    for (let attempt = 1; ; attempt++) {
+      try { return await serializeSceneScoped(opts); } catch (err) {
+        if (!(err instanceof SerializeSupersededError) || err.swapped || attempt >= 3) throw err;
+      }
+    }
+  } finally { closeIdentityScope(); }
+}
+
+/** A serialize whose world moved under one of its awaits: swapped out (a New Scene or a scene load landing while it awaited
+ *  a prefab source, the old world destroyed), or re-minted in place (another Apply's fan-out, a refresh: a spawn, delete
+ *  or reparent bumps the structure version). The entity list it read before the await then names entities that are gone
+ *  or are others, so it stops rather than write one tree's list with another's data. */
+export class SerializeSupersededError extends Error {
+  /** The world itself was replaced (else its structure moved, and `serializeScene` reads it again). */
+  readonly swapped: boolean;
+  constructor(swapped: boolean) {
+    super(swapped ? 'the scene was replaced while it was being serialized; nothing was written' : 'the scene kept changing while it was being serialized; nothing was written');
+    this.name = 'SerializeSupersededError';
+    this.swapped = swapped;
+  }
 }
 
 async function serializeSceneScoped(opts?: {
@@ -208,6 +230,14 @@ async function serializeSceneScoped(opts?: {
   scene?: { path: string; guid: string };
 }): Promise<SceneFile> {
   const targetScene = opts?.scene;
+  // Every read below is of the CURRENT world, and the awaits below are where another one can be installed (the old one is
+  // destroyed): checked after each, so no instance entry, and no refusal mark, is taken of a world these bytes are not.
+  const serializing = getCurrentWorld();
+  const structure = getStructureVersion();
+  const sameWorld = (): void => {
+    if (getCurrentWorld() !== serializing) throw new SerializeSupersededError(true);
+    if (getStructureVersion() !== structure) throw new SerializeSupersededError(false);
+  };
   // TRANSIENCE (preview-mode-refactor, Phase 2): drop every entity SPAWNED during a
   // scrub/preview/play (a `Transient` root) AND its whole subtree from serialization — a
   // preview/scrub mutation must never reach disk. Exclude the subtree up front so ALL passes
@@ -350,6 +380,7 @@ async function serializeSceneScoped(opts?: {
   // Preload every referenced prefab so captureInstanceOverrides can read from
   // the cache without async I/O during the serialize loop.
   await Promise.all(Array.from(prefabSources).map((src) => getPrefabSource(src)));
+  sameWorld();
 
   // Structural-override pre-pass: for each prefab root, capture added/removed
   // entities + removed traits, and fold the added entities' live ECS ids into the
@@ -362,7 +393,8 @@ async function serializeSceneScoped(opts?: {
   /** The entry for stored root `rootId` (a live instance's, or a Missing Prefab placeholder's), computed once. */
   const savedFor = (rootId: number): SavedInstance | null => {
     if (entries.has(rootId)) return entries.get(rootId)!;
-    const saved = savedEntryOf(rootId, () => legacyEntries.get(rootId)?.() ?? null, rootDocs.get(rootId));
+    const legacy = legacyEntries.get(rootId);
+    const saved = savedEntryOf(rootId, legacy && (() => legacy()), rootDocs.get(rootId));
     entries.set(rootId, saved);
     if (saved) {
       for (const ecsId of saved.consumed) prefabChildIds.add(ecsId);
@@ -374,7 +406,7 @@ async function serializeSceneScoped(opts?: {
     }
     return saved;
   };
-  /** What the old save wrote for a root, for one with no record to write (`savedEntryOf` converts it). */
+  /** A Missing Prefab placeholder's verbatim entry, for one with no record to write (`savedEntryOf` converts it). */
   const legacyEntries = new Map<number, () => { entry: SceneEntityEntry; version: number } | null>();
   /** Each live root's own document as this save resolved it (the sync cache may no longer hold it, #1738). */
   const rootDocs = new Map<number, { source: string; doc: unknown }>();
@@ -385,22 +417,13 @@ async function serializeSceneScoped(opts?: {
     const current = resolved ?? levelDoc(rootId, source).doc;
     if (current) {
       rootDocs.set(rootId, { source, doc: current });
-      // Measured against the document the instance was EXPANDED from (#1685), translated onto `current` when written.
+      // The document the instance was EXPANDED from (#1685): the nested documents its record names are warmed from it.
       const prefab = savedFrameDoc(rootId, source, current);
       // A nested row whose instance is gone is recorded as removed only when its prefab is cached
       // (#1355), and a deleted instance's source is not among the live ones preloaded above.
       await preloadNestedPrefabs(prefab);
-      legacyEntries.set(rootId, () => {
-        const guid = guidForId(rootId);
-        const parentGuid = guidForId(byId.get(rootId)?.parentId ?? 0);
-        const placement: Record<string, unknown> = {};
-        if (parentGuid) placement.parentId = parentGuid;
-        if (byId.get(rootId)?.editorFolder) placement.editorFolder = byId.get(rootId)!.editorFolder;
-        const { entry, consumedEcsIds } = captureInstanceEntry(rootId, source, prefab, guid);
-        const traits = withMissingComponents(Object.keys(placement).length ? { EntityAttributes: placement } : {}, guid, rootId);
-        return { entry: { id: 0, name: byId.get(rootId)?.name ?? '', prefab: source, guid, ...entry, traits } as unknown as SceneEntityEntry, version: CAPTURE_FORM_SCENE_VERSION, consumed: consumedEcsIds };
-      });
     }
+    sameWorld();
   };
   for (const [rootId, { source }] of prefabRootInfo) {
     await registerRoot(rootId, source);
@@ -1307,11 +1330,14 @@ export interface SaveResult {
   path: string | null;
   /** `'switching'`: a scene switch is still landing, so the editor's path does not describe the world on screen yet
    *  (#1750) — refused, never waited for; saving again once the scene is open works. */
-  /** `'unreadable-file'`: the target is a scene file this build refused to read (#2128), so nothing was written. */
+  /** `'unsavable'`: the world is marked unsavable (a rollback that could not finish, a tree with no record to write,
+   *  `instanceRollback.ts`) — only a reload clears it; `error` says which (#2001 S8b review L2).
+   *  `'unreadable-file'`: the target is a scene file this build refused to read (#2128), so nothing was written. */
   reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'switching' | 'prefab-edit' | 'target-loaded' | 'superseded'
-    | 'unreadable-file';
-  /** Why the write was refused, in the route's words (#1811), when `reason` is `'write-failed'` for the primary — or
-   *  the refusal the file got when this build tried to read it, for `'unreadable-file'`. */
+    | 'unsavable' | 'unreadable-file';
+  /** Why the write was refused, in the route's words (#1811), when `reason` is `'write-failed'` for the primary — the
+   *  mark's words when it is `'unsavable'`, or the refusal the file got when this build tried to read it, for
+   *  `'unreadable-file'`. */
   error?: string;
   /** Set when an explicit `path` wrote the open scene to ANOTHER file (#1414): the copy got a fresh
    *  scene id and reminted entity guids, and the editor then reopened it from disk so the live world
@@ -1550,6 +1576,10 @@ export async function saveScene(opts: {
     console.warn(`[Editor] Save refused — ${SCENE_SWITCH_LANDING}; save again once it's open.`);
     return { saved: false, path: explicitPath || _currentScenePath, reason: 'switching' };
   }
+  if (isUnsavableMark(notAuthored)) {
+    console.warn(`[Editor] Save refused — ${notAuthored}.`);
+    return { saved: false, path: explicitPath || _currentScenePath, reason: 'unsavable', error: notAuthored! };
+  }
   if (notAuthored) {
     console.warn(`[Editor] Save refused — ${notAuthored}. Stop preview/play (and let it finish reverting) before saving so preview mutations don't reach disk.`);
     return { saved: false, path: explicitPath || _currentScenePath, reason: 'playing' };
@@ -1580,7 +1610,21 @@ export async function saveScene(opts: {
   let savedAt = captureSavePoint();
   // Saving is the authored write that persists identity — commit minted guids
   // to the live world so subsequent refs resolve and the next save is stable.
-  const scene = await serializeScene({ assignGuids: true });
+  let scene: SceneFile;
+  try {
+    scene = await serializeScene({ assignGuids: true });
+  } catch (err) {
+    if (err instanceof SerializeSupersededError) {
+      console.warn(`[Editor] Save refused — ${err.message}.`);
+      return { saved: false, path: explicitPath || _currentScenePath, reason: 'superseded' };
+    }
+    // A serialize that marked the world unsavable (a tree with no record to write, `instanceSave.ts`) refused the save:
+    // answered as every later save is, from the mark.
+    const refused = whyWorldNotAuthored();
+    if (!refused) throw err;
+    console.warn(`[Editor] Save refused — ${refused}.`);
+    return { saved: false, path: explicitPath || _currentScenePath, ...(isUnsavableMark(refused) ? { reason: 'unsavable' as const, error: refused } : { reason: 'playing' as const }) };
+  }
   savedAt = settleSavePoint(savedAt); // the bytes are fixed: did anything move the world during the serialize's awaits?
   const content = jsonFileBody(scene);
 

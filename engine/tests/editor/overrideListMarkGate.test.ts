@@ -10,19 +10,21 @@
  *  Each case names the mutation that turns it red. */
 
 import { describe, it, expect } from 'vitest';
-import { getCurrentWorld, markOverride, findEntityById, getTraitByName } from '@modoki/engine/runtime';
+import { getCurrentWorld, findEntityById, getTraitByName } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { instantiatePrefab, captureInstanceOverrides, type PrefabFile } from '@modoki/engine/editor';
 import { collectInstanceOverrideTree } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { collectComparableTraits } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
 import { memberOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabChain';
+import { place, setFields } from '../../packages/modoki/src/editor/instance/instanceEdits';
 
 registerAllTraits();
 
 const TF = { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 };
 function makePrefab(): PrefabFile {
   return {
-    version: 1, name: 'mark-gate-1717', rootLocalId: 1,
+    // An id: the instance's source, which its record names (`place`).
+    id: '0c0a0f1e-0000-4000-8000-000000001717', version: 1, name: 'mark-gate-1717', rootLocalId: 1,
     entities: [
       { localId: 1, name: 'Root', traits: { Transform: { ...TF }, EntityAttributes: { name: 'Root', parentId: 0, layer: '3d' } } },
       { localId: 2, name: 'Child', traits: { Transform: { ...TF, x: 5 }, EntityAttributes: { name: 'Child', parentId: 1, layer: '3d' } } },
@@ -70,6 +72,7 @@ describe('the override list and the Inspector highlight show exactly what the sa
   it('a value that differs from its base with NO mark is not an override: not listed, not highlighted, not saved', () => {
     const prefab = makePrefab();
     const root = instantiatePrefab(prefab);
+    place(root); // its record, as a drop mints one
     setField(memberOf(root, 2), 'Transform', 'x', 99); // a divergence nobody recorded (a base moved under it)
     const s = surfaces(root, prefab, 2);
     expect(s.saved.has('Transform.x')).toBe(false);
@@ -81,9 +84,10 @@ describe('the override list and the Inspector highlight show exactly what the sa
   it('a MARKED difference is listed, highlighted and saved', () => {
     const prefab = makePrefab();
     const root = instantiatePrefab(prefab);
+    place(root); // its record, as a drop mints one
     const child = memberOf(root, 2);
     setField(child, 'Transform', 'x', 99);
-    markOverride(findEntityById(child)!, 'Transform', 'x');
+    setFields(findEntityById(child)!.id(), 'Transform', ['x']);
     const s = surfaces(root, prefab, 2);
     expect([s.saved.has('Transform.x'), s.listed.has('Transform.x'), s.highlighted.has('Transform.x')]).toEqual([true, true, true]);
   });
@@ -94,7 +98,8 @@ describe('the override list and the Inspector highlight show exactly what the sa
   it('a MARKED value equal to its base is a recorded override: listed and highlighted, as the save keeps it (#1709)', () => {
     const prefab = makePrefab();
     const root = instantiatePrefab(prefab);
-    markOverride(findEntityById(memberOf(root, 2))!, 'Transform', 'x'); // x stays 5, the base's own value
+    place(root); // its record, as a drop mints one
+    setFields(findEntityById(memberOf(root, 2))!.id(), 'Transform', ['x']); // x stays 5, the base's own value
     const s = surfaces(root, prefab, 2);
     expect(s.saved.has('Transform.x')).toBe(true);
     expect(s.listed.has('Transform.x')).toBe(true);
@@ -105,6 +110,7 @@ describe('the override list and the Inspector highlight show exactly what the sa
   it('an ADDED component is listed with no mark, as the save captures it whole', () => {
     const prefab = makePrefab();
     const root = instantiatePrefab(prefab);
+    place(root); // its record, as a drop mints one
     const child = memberOf(root, 2);
     const rot = getTraitByName('Rotate3D')!;
     findEntityById(child)!.add(rot.trait({ axis: 'y', speed: 3 }));

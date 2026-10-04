@@ -21,10 +21,10 @@
  *
  * ── The compatibility adapter (§ 10.1; deleted with the old stores in S8) ──
  * The old save still runs until S6, and reads stores today's spawner fed. Realize feeds them from the projection:
- * override marks from the list's own field records (`markRecords`), each frame's document record with the rows it could
+ * each frame's document record with the rows it could
  * not expand (`noteFrameDoc`, whose `unexpanded` the capture reads to tell an unexpanded row from a removed one), the
  * template-key candidates (`noteTemplateDoc`), a template reference node's own moves (`noteNodeMoves`), and the member-
- * token frames the derive resolves (`registerTemplateFrame`). The kept stores, pins and derived guids stay the settle's
+ * token frames the derive resolves (`registerTemplateFrame`). The pins and derived guids stay the settle's
  * (`settleEntryRows`), which every caller already runs after the spawn.
  */
 import type { Entity, World } from 'koota';
@@ -35,8 +35,6 @@ import { hasMemberToken } from '../core/templateRefs';
 import { markRowPlaceholder } from '../core/unresolvedPrefabRef';
 import { noteDamagedPrefab } from '../core/damagedPrefabs';
 import { noteFrameDoc, noteNodeMoves, type TemplateDoc } from '../core/ecs/identityParents';
-import { clearOverrideMarks, markOverride } from '../loaders/overrideMarks';
-import { fieldFate } from '../loaders/overrideFate';
 import { noteTemplateDoc } from '../loaders/templateKeyRecovery';
 import { spawnUnresolvedReference } from '../loaders/unresolvedPrefabRefs';
 import { nodeFrameAddress, rowFrameAddress } from '../loaders/frameAddress';
@@ -48,7 +46,7 @@ import {
 import { foldInstance, type FoldOptions } from './foldInstance';
 import {
   ROOT_ROW_KEY, hasDerivedGuid, rawTemplateNodeOf,
-  type DesiredNode, type FoldedInstance, type InstanceRecord, type Placeholder, type PrefabReader, type RecordTraits,
+  type DesiredNode, type FoldedInstance, type InstanceRecord, type Placeholder, type PrefabReader,
   type RowKey, type SceneOwnedNode,
 } from './instanceRecord';
 
@@ -164,7 +162,6 @@ export function projectInstance(world: World, rec: InstanceRecord, read: PrefabR
     if (!args.length) return undefined;
     if (n.templateKey) args.push(TemplateAddedKey({ key: n.templateKey }));
     const e = spawnEntity(world, ...(args as Parameters<World['spawn']>));
-    clearOverrideMarks(e); // the 8-bit generation wraps — see overrideMarks.ts
     if (templatePlain) queueRealizedMissing(world, e, missing);
     return e;
   };
@@ -241,7 +238,6 @@ export function projectInstance(world: World, rec: InstanceRecord, read: PrefabR
   }
 
   // ── The compatibility adapter (§ 10.1) ──
-  markRecords(byKey, rec, new Set(placeholders.map(([, e]) => e)));
   noteFrames(world, read, fold, byKey, isSkipped, opts.unnamedSource);
   registerTokenFrames(world, fold, byKey);
 
@@ -301,28 +297,6 @@ function spawnPlaceholder(world: World, ph: Placeholder, pin?: string, copy?: Ad
   }) as Parameters<World['spawn']>[0]);
   markRowPlaceholder(e as never, { source: ph.source, localId: ph.opens.row.localId, nodeGuid: ph.opens.row.nodeGuid ?? '', reason: ph.reason });
   return e;
-}
-
-/** Seed the override marks from the list (§ 10.1): every field the instance's own list records, as the old spawner
- *  marked every field the writer stated (#1914). A tag records as the empty field. Root default fields (name, order) are
- *  the placement's, which the caller marks: it knows whether the file stated them. */
-function markRecords(byKey: ReadonlyMap<RowKey, Entity>, rec: InstanceRecord, placeholders: ReadonlySet<Entity>): void {
-  for (const [key, row] of rec.list.rows) {
-    const e = byKey.get(key);
-    if (!e || placeholders.has(e)) continue;
-    markTraits(e, row.traits);
-  }
-}
-
-/** Mark the fields `traits` states on `e` (a record's, or the root's stated defaults). */
-export function markTraits(e: Entity, traits: RecordTraits | undefined): void {
-  for (const [name, data] of Object.entries(traits ?? {})) {
-    const meta = getTraitByName(name);
-    if (!meta) continue;
-    if (meta.category === 'tag') { if (data) markOverride(e, name, ''); continue; }
-    if (!isRecord(data)) continue;
-    for (const field of Object.keys(data)) if (fieldFate(meta, field) === 'applies') markOverride(e, name, field);
-  }
 }
 
 /** Each projected frame's document record (`noteFrameDoc`), with the nested rows it could not expand — a row placeholder

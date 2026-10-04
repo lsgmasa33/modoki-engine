@@ -49,6 +49,7 @@ vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   getAllEntities: () => getAllEntitiesImpl(),
   findEntity: (id: number) => index.get(id),
   markStructureDirty: vi.fn(),
+  getStructureVersion: () => 0, // the save checks its world did not move under its awaits
   deleteEntities: vi.fn(),
   readTraitData: () => null,
   // Mirrors the real readTraitDataFull: the keys a trait PERSISTS — its koota

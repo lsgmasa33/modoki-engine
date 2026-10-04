@@ -17,11 +17,20 @@ import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
 
 const prefabs = new Map<string, unknown>();
-vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (importOriginal) => ({
-  ...(await importOriginal<Record<string, unknown>>()),
-  getCachedPrefab: (ref: string) => prefabs.get(ref),
-  loadModelTemplates: async () => {},
-}));
+vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (importOriginal) => {
+  const real = await importOriginal<Record<string, unknown>>();
+  return {
+    ...real,
+    getCachedPrefab: (ref: string) => prefabs.get(ref),
+    // A write the editor lands replaces the loader's copy, as the real cache does for a prefab a loaded scene owns: a
+    // stand-in that kept the old document had every reader after a Replace fold the tree against it (#2001 S8b).
+    replaceCachedPrefab: (ref: string, data: unknown) => {
+      (real.replaceCachedPrefab as (r: string, d: unknown) => void)(ref, data);
+      for (const k of [ref, (data as { id?: string } | null)?.id]) if (k && prefabs.has(k)) prefabs.set(k, JSON.parse(JSON.stringify(data)));
+    },
+    loadModelTemplates: async () => {},
+  };
+});
 const writes: Array<{ path: string; content: string }> = [];
 vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -52,7 +61,7 @@ import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/sc
 import { buildPrefabEditScene, serializePrefabEditWorld, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { applyAssetPathMoves } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
-import { snapshotEntity, respawnFromSnapshot, copySnapshot, pasteEntityCopy, siblingDropRefusal } from '../../packages/modoki/src/editor/undo/entityActions';
+import { snapshotEntity, respawnFromSnapshot, copySnapshot, pasteEntityCopy, clipEntity, siblingDropRefusal } from '../../packages/modoki/src/editor/undo/entityActions';
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { redo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { tagCreatedPrefab } from '../../packages/modoki/src/editor/scene/prefabLink';
@@ -63,7 +72,7 @@ import { runAgentOp } from '../../app/debug/agentBridge';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { memberToken } from '../../packages/modoki/src/runtime/core/templateRefs';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { placeholderWriteRefusal } from '../../packages/modoki/src/editor/undo/placeholderGate';
 
 registerAllTraits();
@@ -309,10 +318,11 @@ describe('the placeholder reads as missing and keeps its record until it is re-e
     expect(entryOf(await save(), INST)).toEqual(entry);
   });
 
-  it('a scene entity under the placeholder stays its own entry when the prefab is restored with no reload', async () => {
-    // Mutation: keep `PrefabInstance` on the placeholder (`keepUnresolvedEntry`) — the scene save's structural pre-pass
-    // captures it as an instance of the restored P and claims Kid as an added node of an entry written from the record,
-    // so Kid is in neither.
+  it('a scene entity under the placeholder is kept when the prefab is restored with no reload', async () => {
+    // A user's node at a placeholder is the record's own content (§ 10.4b, #2001 S8b): the save states it once, by guid,
+    // on the entry's "/" row, and a reload hangs it back under the instance. The load links it there (`buildParentLinks`).
+    // Mutation: that link not written — Kid is in neither the entry nor an entity of its own. (Before S8b's records the
+    // guard was `keepUnresolvedEntry` dropping `PrefabInstance` from the placeholder; the save no longer reaches it here.)
     const KID = 'dddddddd-0000-4000-8000-000000001601';
     install(pDoc());
     await load(scene(P));
@@ -321,8 +331,12 @@ describe('the placeholder reads as missing and keeps its record until it is re-e
     uninstall(P);
     await load(control);
     install(pDoc());
-    const kid = (await save()).entities.find((e) => (e as { name?: string }).name === 'Kid') as { traits: { EntityAttributes: { guid: string; parentId: string } } } | undefined;
-    expect(kid?.traits.EntityAttributes).toMatchObject({ guid: KID, parentId: INST });
+    const saved = await save();
+    const own = ((entryOf(saved, INST) as { members?: Record<string, { own?: Array<{ guid: string }> }> }).members?.['/']?.own ?? []);
+    expect(own.map((n) => n.guid)).toEqual([KID]);
+    expect(saved.entities.filter((e) => (e as { name?: string }).name === 'Kid')).toEqual([]);
+    await load(saved);
+    expect(getAllEntities().find((e) => e.guid === KID)?.parentId).toBe(getAllEntities().find((e) => e.guid === INST)!.id);
   });
 
   it('a restored child prefab with no reload keeps an added node', async () => {
@@ -583,7 +597,7 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     install(pWith({ isActive: false }));
     await load(first);
     expect(ea(rootOf(INST)).isActive).toBe(false);
-    const marks = [...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === rootOf(INST))!) ?? [])];
+    const marks = [...(overrideKeysOf(getCurrentWorld().entities.find((e) => e.id() === rootOf(INST))!) ?? [])];
     expect(marks.filter((k) => k.startsWith('EntityAttributes.'))).toEqual(['EntityAttributes.sortOrder']);
   });
 
@@ -678,7 +692,7 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     install(q);
     await load(first);
     expect(ea(rootOf(QINST)).isActive).toBe(false);
-    const marks = [...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])];
+    const marks = [...(overrideKeysOf(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])];
     expect(marks.filter((k) => k.startsWith('EntityAttributes.'))).toEqual(['EntityAttributes.sortOrder']);
   });
 
@@ -688,7 +702,7 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     await nodeUnderA({});
     install(qDoc());
     writeTraitFieldWithUndo(rootOf(QINST), meta('EntityAttributes'), 'sortOrder', 5); // a marked reorder: a root override
-    const liveMarks = [...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])];
+    const liveMarks = [...(overrideKeysOf(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])];
     uninstall(Q);
     const first = await save();
     expect(addedUnderA(first).find((n) => n.guid === QINST)!.traits).toEqual({ EntityAttributes: { sortOrder: 5 } });
@@ -698,7 +712,7 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     install(qDoc());
     await load(first);
     expect(ea(rootOf(QINST)).sortOrder).toBe(5);
-    expect([...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])]).toEqual(liveMarks);
+    expect([...(overrideKeysOf(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])]).toEqual(liveMarks);
   });
 
   it('a node placeholder moved under another member keeps its sortOrder, and reloads at it (#1897 review F1, #1901)', async () => {
@@ -778,7 +792,7 @@ describe('a Missing Prefab placeholder that lands inside an instance reloads as 
     await loadWithQMissing();
     const A = inside(INST, 'A');
     expect(reparentEntity(idOf(SIB), A, 4)).toBe(true);
-    const pasted = pasteEntityCopy(snapshotEntity(idOf(QINST))!, A, () => {});
+    const pasted = pasteEntityCopy(clipEntity(idOf(QINST), 'copy')!, A, () => {})!;
     const pastedGuid = getAllEntities().find((e) => e.id === pasted)!.guid!;
     expect(placement(pasted)).toEqual({ sortOrder: 5, isActive: false });
     const dup = duplicateEntity(pasted, () => {})!;
@@ -833,7 +847,7 @@ describe('a Missing Prefab placeholder that lands inside an instance reloads as 
     reparentEntity(idOf(SIB), inside(INST, 'A'), 1);
     writeTraitFieldWithUndo(rootOf(QINST), meta('EntityAttributes'), 'sortOrder', 5);
     writeTraitFieldWithUndo(rootOf(QINST), meta('EntityAttributes'), 'isActive', false);
-    const liveMarks = [...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])].sort();
+    const liveMarks = [...(overrideKeysOf(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])].sort();
     const live = await save();
     uninstall(Q); // deleted outside the editor: the next load is cold
     await load(live);
@@ -843,7 +857,7 @@ describe('a Missing Prefab placeholder that lands inside an instance reloads as 
     install(qDoc()); // the prefab's return: the root override applies, and the marks are the live instance's
     await load(live);
     expect(placement(rootOf(QINST))).toEqual({ sortOrder: 5, isActive: false });
-    expect([...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])].sort()).toEqual(liveMarks);
+    expect([...(overrideKeysOf(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])].sort()).toEqual(liveMarks);
   });
 
   // #1901 close-out review F1: a node the TEMPLATE declares (a keyed node, supplied by the prefab) is the template's, and
@@ -1252,8 +1266,9 @@ describe('a scene entry whose prefab loads but expands to no root keeps its entr
   });
 
   it('a rebuild onto a document with no root leaves the live instance standing', async () => {
-    // Mutation: drop the `expandsToRoot` check in `rebuildTargetsByEntry` — the refresh counts an instance it did not
-    // rebuild (and dropping `rebuildFromEntry`'s own guard as well tears R and A down with nothing spawned in their place).
+    // Mutation: drop the `expandsToRoot` check in `reprojectFromStore` (the records route, #2001 S8b) or in
+    // `rebuildTargetsByEntry` (the capture route) — the refresh counts an instance it did not rebuild (and dropping
+    // `rebuildFromEntry`'s own guard as well tears R and A down with nothing spawned in their place).
     install(pDoc());
     await load(scene(P));
     const root = rootOf(INST);
@@ -1348,16 +1363,19 @@ describe('a live instance whose prefab vanished mid-session is written from its 
     expectSameBytes(entryOf(await save(), INST), entryOf(control, INST));
   });
 
-  it('Create Prefab over a tree holding it writes a REFERENCE row, not a flattened copy', async () => {
-    // Mutation: `planPrefabRows` reads the cache only — the row is flattened into plain R and A rows.
+  it('Create Prefab over a tree holding it refuses, and writes nothing (#2001 S8b)', async () => {
+    // It wrote a REFERENCE row for the instance (#1738), but the new prefab's instance record folds that row from P, which
+    // no cache holds: a placeholder, not the members the tree has, so the record could not state the tree it was made
+    // from. Create Prefab keeps the records exact or does not run. Mutation: drop the `unreadFramesInTreeRefusal` call in
+    // `createPrefabFromEntity` — the create lands, and the first expect goes red.
     await loaded();
     uninstall(P); uninstall(Q);
     const holder = getAllEntities().find((e) => e.guid === HOLDER)!.id;
+    const before = getAllEntities().map((e) => e.guid).sort();
     const created = await createPrefabFromEntity(holder, 'prefabs/Held.prefab.json', 'Held', async () => true);
-    expect(created && typeof created === 'object' && 'refused' in created).toBe(false);
-    const doc = JSON.parse(writes.filter((w) => w.path.endsWith('Held.prefab.json')).pop()!.content) as PrefabFile;
-    expect(doc.entities.filter((e) => e.prefab).map((e) => e.prefab)).toEqual([P]);
-    expect(doc.entities.map((e) => e.name)).not.toContain('A');
+    expect(created && typeof created === 'object' && 'refused' in created ? created.refused : created).toMatch(/is an instance of .*, which the editor can no longer read/);
+    expect(writes.some((w) => w.path.endsWith('Held.prefab.json'))).toBe(false);
+    expect(getAllEntities().map((e) => e.guid).sort()).toEqual(before);
   });
 });
 
@@ -1405,7 +1423,7 @@ describe('a pre-v5 legacy channel into a missing nested frame is written back (#
 
   it('the template side: a keyed template reference NODE keeps its own channel through a prefab-edit save', async () => {
     // T3 = R3 → row 2 expanding P, whose `added` authors the keyed node TK (T) under P's A; TK's channel reaches into
-    // T's row 3, whose Q is missing. Mutation: keep no legacy for a keyed node in `keepTemplateNodeOrphans` — the node is
+    // T's row 3, whose Q is missing. Mutation (before #2001 S8b deleted the kept stores): keep no legacy for a keyed node in `keepTemplateNodeOrphans` — the node is
     // written without its channel. (Its writer is `captureRowChannels`, through `finishTemplateReferenceNode`.)
     const T3 = 'cccccccc-0000-4000-8000-000000001741';
     uninstall(Q); // an earlier case left it installed; resolved, a v10 save states the channel as rows instead
@@ -1417,8 +1435,10 @@ describe('a pre-v5 legacy channel into a missing nested frame is written back (#
         traits: { EntityAttributes: { name: 'Prow', parentId: 1, guid: '' } } },
     ] };
     install(t3);
+    const editWorld = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: `/__prefab-edit__/${T3}` } as never);
     await load(buildPrefabEditScene(t3 as never) as SceneData);
     const out = serializePrefabEditWorld(T3);
+    editWorld.mockRestore();
     if ('error' in out) throw new Error(out.error);
     // Prefab v10 (#2001 S6): the node is the row's `own` under P's A; its channel names a frame that did not resolve, so
     // it is written back as it was read (the one legacy form a v10 writer keeps, docs/prefabs.md § Format rule).
@@ -1436,8 +1456,10 @@ describe('a pre-v5 legacy channel into a missing nested frame is written back (#
       { localId: 2, name: 'Trow', prefab: T, nestedOverrides: channel, traits: { EntityAttributes: { name: 'Trow', parentId: 1, guid: '' } } },
     ] };
     install(t2);
+    const editWorld = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: `/__prefab-edit__/${T2}` } as never);
     await load(buildPrefabEditScene(t2 as never) as SceneData);
     const out = serializePrefabEditWorld(T2);
+    editWorld.mockRestore();
     if ('error' in out) throw new Error(out.error);
     expect(out.prefab.entities.find((e) => e.localId === 2)?.nestedOverrides).toEqual(channel);
   });
@@ -1448,7 +1470,8 @@ describe('a pre-v5 legacy channel into a missing nested frame is written back (#
 // after pass 2 resolves parents — so the load used to put the child at the scene root for good.
 describe('a child under a node placeholder keeps its parent across a reload (#1738)', () => {
   it('the saved parent guid resolves once the expansion has spawned it, with the prefab missing and once it is back', async () => {
-    // Mutation: drop `retryGuidParents` from the loader — PhKid lands at the root, and the next save writes parentId ''.
+    // Mutations: drop `retryGuidParents` from the loader — PhKid lands at the root; `buildParentLinks` writes no link —
+    // the save states PhKid nowhere under QInst.
     const KID = 'dddddddd-0000-4000-8000-000000001609';
     install(pDoc(), qDoc());
     await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } }]));
@@ -1459,11 +1482,21 @@ describe('a child under a node placeholder keeps its parent across a reload (#17
     await load(control);
     const kid = () => getAllEntities().find((e) => e.guid === KID)!;
     expect(kid().parentId).toBe(rootOf(QINST));
-    const kidEntry = (sd: SceneData) => (sd.entities as unknown as Array<{ traits?: { EntityAttributes?: { guid?: string; parentId?: string } } }>).find((e) => e.traits?.EntityAttributes?.guid === KID);
+    // Saved where it hangs (#2001 S8b): QInst's node (own content of R's A row) links PhKid on its "/" row (§ 10.4b).
+    const nodeWithGuid = (v: unknown, g: string): Record<string, unknown> | undefined => {
+      if (Array.isArray(v)) { for (const x of v) { const hit = nodeWithGuid(x, g); if (hit) return hit; } return undefined; }
+      if (!v || typeof v !== 'object') return undefined;
+      const o = v as Record<string, unknown>;
+      if (o.guid === g && typeof o.prefab === 'string') return o;
+      for (const x of Object.values(o)) { const hit = nodeWithGuid(x, g); if (hit) return hit; }
+      return undefined;
+    };
+    const kidLink = (sd: SceneData) => ((nodeWithGuid(sd.entities, QINST) as { members?: Record<string, { own?: Array<{ guid?: string }> }> } | undefined)?.members?.['/']?.own ?? []).find((n) => n.guid === KID);
     const s3 = await save();
-    expect(kidEntry(s3)?.traits?.EntityAttributes?.parentId).toBe(QINST);
+    expect(kidLink(s3)).toBeDefined();
+    expect(JSON.stringify(s3.entities).split(KID).length - 1).toBe(2); // stated once: its link's guid and its own EntityAttributes.guid
     await load(s3);
-    expectSameBytes(kidEntry(await save()), kidEntry(s3)); // S3 == S4: the placement round-trips with the prefab missing
+    expectSameBytes(kidLink(await save()), kidLink(s3)); // S3 == S4: the placement round-trips with the prefab missing
     install(qDoc());
     await load(s3);
     expect(kid().parentId).toBe(rootOf(QINST));
@@ -1471,7 +1504,8 @@ describe('a child under a node placeholder keeps its parent across a reload (#17
   });
 });
 
-// #1788: R2's kept store (orphan member rows, unreached legacy channels) is keyed by a stored root's guid BESIDE the
+// #1788 (the store this names was deleted in #2001 S8b: the record holds this state, and the snapshot's `kept` is read
+// from it): R2's kept store (orphan member rows, unreached legacy channels) was keyed by a stored root's guid BESIDE the
 // tree, so a duplicate — a new root guid — used to carry none of it: the copy saved with neither, and only the original
 // took the scene's edit once the template brought the member (or frame) back. The kept state now rides in the entity
 // snapshot (`EntitySnapshot.kept`), with every identity it states re-minted for the copy.
@@ -1691,7 +1725,7 @@ describe('Create Prefab over R2 kept state: refuse a missing nested frame, bake 
 
   it('(2) an orphan row\'s EDIT goes into the new template and its identity stays in the scene; a SECOND instance gets the edit', async () => {
     // Mutation: drop `bakingKeptState` from the gate in `captureRowChannels` — the template has no row, and neither
-    // instance's Gone gets x = 4. Mutation: skip `settleSwallowedKeptState` — the scene writes no identity row, and the
+    // instance's Gone gets x = 4. Mutation (before #2001 S8b deleted the kept stores): skip `settleSwallowedKeptState` — the scene writes no identity row, and the
     // first instance's Gone comes back under a derived guid, not BEEF.
     install(pDoc());
     const sc = scene(P);
@@ -1714,6 +1748,20 @@ describe('Create Prefab over R2 kept state: refuse a missing nested frame, bake 
     expect(x(inside(SECOND, 'Gone'))).toBe(4);
     expect(guidOfEntity(inside(HOLDER, 'Gone'))).toBe(BEEF);
     expect(guidOfEntity(inside(SECOND, 'Gone'))).not.toBe(BEEF);
+  });
+
+  // #2001 S8b: the bake reads what is kept from the RECORD (`keptFromRecord`). A LIVE member's row can hold a part its
+  // member does not take, too (#1914 R4: here a field its component has no such field for): that part travels as well.
+  it('(2) the part of a LIVE member\'s row its member does not take goes into the new template (#1914 R4)', async () => {
+    // Mutation: in `keptFromRecord`, collect a live row's unused part nowhere — the template's row for A has no `bogus`.
+    install(pDoc());
+    const sc = scene(P);
+    (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.members = { [`/${gA}`]: { traits: { Transform: { bogus: 9 } } } };
+    await load(sc);
+    expect(refusalOf(await create())).toBe('');
+    const rowR = heldDoc().entities.find((e) => e.prefab === P)!;
+    expect((rowR.members as Record<string, unknown>)[`/${gA}`]).toEqual({ traits: { Transform: { bogus: 9 } } });
+    expect(JSON.stringify(await save())).not.toContain('bogus');
   });
 
   it('(2) a legacy channel into a row the template does not have yet goes into the new template, and a SECOND instance gets it', async () => {
@@ -1753,7 +1801,7 @@ describe('Create Prefab over R2 kept state: refuse a missing nested frame, bake 
   });
 
   it('(2) a baked legacy slot states no scene identity: its node\'s guid is not written into the template (close-out review F4)', async () => {
-    // Mutation: bake the kept legacy channels verbatim (`withKeptLegacy`) — the template states SG, and both instances
+    // Mutation (before #2001 S8b deleted the kept stores): bake the kept legacy channels verbatim (`withKeptLegacy`) — the template states SG, and both instances
     // spawn SN under that one guid (#1293).
     const SG = 'dddddddd-0000-4000-8000-00000000f004';
     install(tDoc(false));
@@ -2026,7 +2074,7 @@ describe('Apply\'s promotion of a scene-added reference node keeps its kept R2 s
 
   it('the promoted row carries the edit in template form, and the scene keeps only its identity', async () => {
     // Mutations: drop `withKeptStateBake` around the promotion's recapture — the row has no `members`; drop the settle after
-    // the refresh — the scene save no longer holds BEEF.
+    // the refresh (before #2001 S8b deleted the kept stores) — the scene save no longer holds BEEF.
     const { key } = await setUp();
     expect((await applyToPrefabSelective(rootOf(INST), new Set([key]))).applied).toBe(true);
     const promoted = written(P)!.entities.find((e) => e.prefab === Q)!;
@@ -2181,7 +2229,7 @@ describe('Create Prefab refuses a tree holding a frame built from other rows tha
 describe('Create Prefab from an instance ROOT drops the old prefab\'s kept rows on it — an unpack (#1814, hub ruling)', () => {
   // INST, an instance of P, keeps an orphan member row `/DEAD` (a member P dropped). Create Prefab over INST makes an
   // ORIGINAL and relinks INST to it; the row stayed on INST, keyed in P's identity, and every save wrote it again. Unity
-  // drops an unpacked instance's unused overrides. Mutation for the drop cases: make `dropUnpackedRootKeptState` return
+  // drops an unpacked instance's unused overrides. Mutation for the drop cases (before #2001 S8b deleted the kept stores): make `dropUnpackedRootKeptState` return
   // before clearing — the scene save still writes `/DEAD` on INST.
   const DEAD = 'eeeeeeee-0000-4000-8000-00000000d814';
   const BEEF = 'eeeeeeee-0000-4000-8000-00000000b814';
@@ -2288,21 +2336,21 @@ describe('an Assets delete of a prefab a live instance uses (#1805, I9 — the e
 // STORED mark, so an unedited instance of Q pasted into P's prefab edit wrote `sortOrder: 0` as a nested row's override
 // — a record nobody made, in a world F7 says records nothing. Two sources: a fresh instance (the order only implied), and
 // one reopened from a save, whose file states the order its root records (the load marks what the file states).
-// Mutations: capture `getOverrideMarkSet` in `snapshotEntity` — both red; let `getCarriedOverrideMarks` return the stored
-// set whole — the reopened one red.
+// Mutations (before #2001 S8b): capture the view in `snapshotEntity` — both red; carry the stored set whole — the reopened
+// one red. Since S8b a snapshot carries no override set at all, so the case pins the outcome.
 describe("a scene instance copied into prefab edit carries no implied root order (#1914 close-out review)", () => {
   for (const reopened of [false, true]) {
     it(`an unedited instance${reopened ? ', reopened from its save,' : ''} pasted into P's edit writes no override`, async () => {
       install(pDoc(), qDoc());
       await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 0 } } }]));
       if (reopened) await load(await save());
-      const snap = snapshotEntity(rootOf(QINST))!;
+      const clip = clipEntity(rootOf(QINST), 'copy')!;
       await load(buildPrefabEditScene(pDoc() as unknown as PrefabFile) as SceneData);
       // Under A, which has no children, so the paste's place is the template root's own (0) and records nothing.
       const a = getAllEntities().find((e) => e.name === 'A')!;
       const editWorld = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: `/__prefab-edit__/${P}` } as never);
       try {
-        expect(pasteEntityCopy(snap, a.id, () => {})).toBeGreaterThan(0);
+        expect(pasteEntityCopy(clip, a.id, () => {})).toBeGreaterThan(0);
         const out = serializePrefabEditWorld(P);
         if ('error' in out) throw new Error(out.error);
         const nested = out.prefab.entities.find((e) => e.prefab === Q)!;

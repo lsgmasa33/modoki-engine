@@ -23,7 +23,6 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData, type SceneEntityEntry,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
@@ -143,7 +142,7 @@ const withoutRows = (scene: { entities: unknown[] }) => {
   return copy as unknown as SceneData;
 };
 
-beforeEach(() => { setRunMode('stopped'); prefabs.clear(); clearKeptMemberOrphans(); });
+beforeEach(() => { setRunMode('stopped'); prefabs.clear(); });
 afterAll(() => { getCurrentWorld()?.destroy(); });
 
 describe('a scene stores its prefab instances` member guids (#1468)', () => {
@@ -262,14 +261,12 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     expect(warn.mock.calls.map((c) => String(c[0])).some((m) => m.includes('name no node the template'))).toBe(false);
     warn.mockRestore();
 
-    // …and its IDENTITY is dropped on the next save, which is R2's other half verbatim: "if the
-    // instance's `removed[]` names it, drop silently". Un-removing it then derives a fresh guid,
-    // exactly as it does today — undo is what restores the old one, by restoring the scene entry.
-    // Since Phase 4 the removal itself lives on the member's row, so the row survives as exactly
-    // that statement: `removed`, and no guid (the member is not live, so it has none to state).
-    expect(badgeGuid).toBeTruthy(); // the fixture really had a row to drop
+    // …and its IDENTITY is kept on the next save: the record states the row as the file did, pin and all, so un-removing
+    // it brings back the same guid (#2001 S6's visible change "a removed member keeps its pin"; before, R2 dropped it
+    // silently). Since Phase 4 the removal itself lives on the member's row, beside the pin.
+    expect(badgeGuid).toBeTruthy(); // the fixture really had a row
     const resaved = await serializeScene() as unknown as { entities: unknown[] };
-    expect(instanceEntry(resaved).members![badgeKey]).toEqual({ removed: true });
+    expect(instanceEntry(resaved).members![badgeKey]).toEqual({ guid: badgeGuid, name: 'Badge', removed: true });
     expect(instanceEntry(resaved).removed).toBeUndefined();
   });
 
@@ -334,14 +331,12 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
         ent(4, 'Pip', 'ffffffff-0000-4000-8000-0000000000f8', 'ffffffff-0000-4000-8000-0000000000f9'),
       ],
     } as unknown as SceneData);
-    const child = createPrefabFrom('Badge', CHILD);   // Badge → an instance of CHILD, with Pip inside
-    const outer = createPrefabFrom('Root', PREFAB);   // …and a nested reference row of PREFAB
+    createPrefabFrom('Badge', CHILD);   // Badge → an instance of CHILD, with Pip inside
+    createPrefabFrom('Root', PREFAB);   // …and a nested reference row of PREFAB
     await load({
       id: 's', version: 8, name: 'S', resources: [],
       entities: [{ id: 1, prefab: PREFAB, guid: ROOT, traits: { EntityAttributes: { name: 'Root', parentId: 0 } } }],
     } as unknown as SceneData);
-    const nestedRow = outer.entities.find((e) => e.prefab === CHILD)!;
-    const pipNode = child.entities.find((e) => e.name === 'Pip')!.nodeGuid!;
     const before = guidOf('Pip');
     expect(before).toBeTruthy();
 
@@ -351,15 +346,13 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     // The MEMBER keeps its guid — that is the rule. (The root keeps its under every reading.)
     expect(guidOf('Pip')).toBe(before);
 
-    // …and the rows relocate: out of the outer entry's members, into the reference node the promoted
-    // instance is now captured as, re-keyed to its OWN frame (no outer-row prefix).
-    const scene = await serializeScene() as unknown as { entities: unknown[] };
-    const entry = instanceEntry(scene);
-    expect(Object.keys(entry.members ?? {})).not.toContain(`/${nestedRow.nodeGuid}/${pipNode}`);
-    // Scene v20 (#2001 S6): a reference node is inline on its anchor's row (`own`).
-    const ref = Object.values((entry.members ?? {}) as Record<string, { own?: Array<{ prefab?: string; members?: Record<string, { guid?: string }> }> }>).flatMap((r) => r.own ?? []).find((n) => n.prefab === CHILD);
-    expect(ref, 'the promoted instance is captured as a reference node').toBeDefined();
-    expect(ref!.members?.[`/${pipNode}`]?.guid).toBe(before);
+    // …and the save: the raw promotion records nothing (no gesture promotes a root while its outer instance lives — the
+    // editor refuses to drag an owned nested instance out of its instance), so the tree holds an instance no record
+    // states, and the save refuses it rather than capture it (#2001 S8b; the rows' relocation was the capture's).
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(serializeScene()).rejects.toThrow(/instance "Badge" \(.*\) in instance "Root" \(.*\) has no instance record to write/);
+    } finally { err.mockRestore(); }
   });
 
   it('never writes member rows into a prefab TEMPLATE, only into a scene', async () => {

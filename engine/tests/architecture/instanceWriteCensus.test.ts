@@ -4,13 +4,14 @@
  *  not write the record by definition — it writes the live entity — so that census could not fail on the class it was
  *  cited against (review R3). This one counts the authoring surfaces' raw ECS write primitives instead: every production
  *  file under `editor/`, `app/editor/` and `app/debug/` whose code calls one is listed with EXACTLY the primitives it calls,
- *  and why its writes to a prefab-supplied entity either reach the door, mark the store stale (an op S7 moves onto
- *  records), or never touch an authored member. A new raw write fails here until its author says which.
+ *  and why its writes to a prefab-supplied entity either reach the door, project the live tree from the store, or never
+ *  touch an authored member. (A fourth standing, "marks the store stale", went with the mark in #2001 S8b: every op keeps
+ *  its records.) A new raw write fails here until its author says which.
  *
  *  What it cannot see: a write through a local alias of a trait handle (`e.set(ea, …)`), a game system at priority ≥ 200,
  *  an agent `eval`. Those are the save-time drift check's (`editor/instance/instanceDrift.ts`, review R3(b)). Comments are
- *  stripped, so a docblock naming a primitive is not a call. The I25 shadow (`tests/editor/prefabFuzz/shadow.ts`) is what
- *  proves a "door" row's writes actually reach the record. */
+ *  stripped, so a docblock naming a primitive is not a call. The fuzzer's P1 (`tests/editor/prefabFuzz/shadow.ts`: each record
+ *  projected from the store is its live instance) is what proves a "door" row's writes actually reach the record. */
 
 import { describe, it, expect } from 'vitest';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -22,8 +23,6 @@ import { fileURLToPath } from 'node:url';
 const PRIMITIVES: Record<string, RegExp> = {
   writeTraitField: /\bwriteTraitField\(/,
   writeTraitFieldMarked: /\bwriteTraitFieldMarked\(/,
-  markOverride: /\bmarkOverride\(/,
-  restoreOverrideMarks: /\brestoreOverrideMarks\(/,
   spawnEntity: /\bspawnEntity\(/,
   'trait.set': /\.set\(\s*[\w.]*\.trait\b/,
   'trait.add': /\.add\(\s*[\w.]*\.trait\b/,
@@ -35,8 +34,6 @@ type Primitive = keyof typeof PRIMITIVES;
 type Standing =
   /** Its member writes call `instanceEdits` (`editor/instance/instanceEdits.ts`) — directly, or through the recorder. */
   | 'door'
-  /** It is one of the ops S7 moves onto records, and it marks the store stale (`staleAround`, `markStale`). */
-  | 'stale'
   /** It never writes an authored member's list-bearing state: identity (a guid, a scene stamp), a new non-instance
    *  entity, an edit world's or a device's own state, a live frame a commit records through the door. */
   | 'notAuthored'
@@ -45,9 +42,10 @@ type Standing =
   | 'projection';
 
 const E = 'engine/packages/modoki/src/editor';
-/** For a door row: the door entries its code must call (`instanceEdits.<verb>(`, or the recorder by name). */
+/** For a door row: the door entries its code must call (`instanceEdits.<verb>(`, or the recorder by name) — in `doorIn` when the
+ *  op that holds the file's writes calls the door for them. */
 type DoorCalls = string[];
-const CENSUS: Record<string, { calls: Primitive[]; standing: Standing; why: string; markedIn?: string; doorCalls?: DoorCalls; projects?: string[] }> = {
+const CENSUS: Record<string, { calls: Primitive[]; standing: Standing; why: string; doorCalls?: DoorCalls; doorIn?: string; projects?: string[] }> = {
   [`${E}/instance/instanceEdits.ts`]: {
     calls: ['writeTraitField', 'trait.add', 'trait.remove'], standing: 'projection', projects: ['foldInstance'],
     why: 'the door itself: an undo or redo of a field or component step puts its rows back (`putRows`, #2046 S7.2) and '
@@ -55,24 +53,24 @@ const CENSUS: Record<string, { calls: Primitive[]; standing: Standing; why: stri
       + 'presence), never a gesture of its own',
   },
   [`${E}/instance/instanceReproject.ts`]: {
-    calls: ['trait.set', 'markOverride'], standing: 'projection', projects: ['rebuildFromEntry'],
-    why: 'rebuilds an instance tree from its STORED record (`reprojectFromStore`, #2046 S7): the record is written as v20 '
-      + 'and loaded back; the raw set and marks put the root\'s placement and its placement marks as the record states them',
+    calls: ['trait.set'], standing: 'projection', projects: ['rebuildFromRecord'],
+    why: 'rebuilds an instance tree from its STORED record (`reprojectFromStore`, #2046 S7; #2001 S8b projects the record '
+      + 'directly): the raw set puts the root\'s placement as the record states it',
   },
   [`${E}/undo/entityActions.ts`]: {
-    calls: ['writeTraitField', 'writeTraitFieldMarked', 'markOverride', 'restoreOverrideMarks', 'spawnEntity', 'trait.set', 'trait.add', 'trait.remove'],
+    calls: ['writeTraitField', 'writeTraitFieldMarked', 'spawnEntity', 'trait.set', 'trait.add', 'trait.remove'],
     standing: 'door',
-    doorCalls: ['instanceEdits.beginAddChild', 'instanceEdits.addChild', 'instanceEdits.afterCopy', 'instanceEdits.beginDelete',
-      'instanceEdits.beginReparent', 'instanceEdits.beginRemoveComponent', 'instanceEdits.addComponent', 'instanceEdits.prepare'],
+    doorCalls: ['instanceEdits.addChild', 'instanceEdits.beginDelete',
+      'instanceEdits.beginReparent', 'instanceEdits.beginRemoveComponent', 'instanceEdits.addComponent'],
     why: 'every census writer of the review (create, duplicate, paste, delete, add/remove component, reparent and its '
-      + 'compensated pose) calls its `instanceEdits` verb at commit; the raw writes in its undo/redo bodies run inside '
-      + '`undoStep`, which marks the store stale',
+      + 'compensated pose) calls its `instanceEdits` verb at commit; the raw writes in its undo/redo bodies put back the '
+      + 'live side of records each step seats itself (`instanceHistory.ts`), or roll back with `undoStep`'
   },
   [`${E}/undo/overrideMarkWrites.ts`]: {
-    calls: ['writeTraitField', 'writeTraitFieldMarked', 'markOverride', 'restoreOverrideMarks'],
+    calls: ['writeTraitField', 'writeTraitFieldMarked'],
     standing: 'door', doorCalls: ['instanceEdits.setFields'],
-    why: 'the recorder: `recordOverridesByDiff` calls `instanceEdits.setFields` before it marks, so every field writer '
-      + '(Inspector, gizmo, UI handles, collider, renumber) reaches the door; `putMarkState`/`restoreMarks` run in undo bodies',
+    why: 'the recorder: `recordOverridesByDiff` calls `instanceEdits.setFields`, so every field writer '
+      + '(Inspector, gizmo, UI handles, collider, renumber) reaches the door; `putFieldRows`/`takeUnmarkedFromBase` run in undo bodies',
   },
   [`${E}/scene/uiHandleCommit.ts`]: {
     calls: ['trait.set'], standing: 'door', doorCalls: ['recordOverridesByDiff'],
@@ -85,51 +83,42 @@ const CENSUS: Record<string, { calls: Primitive[]; standing: Standing; why: stri
       + '`markOverrideIfInstance` → the recorder → the door, § 3.3, a continuous gesture; its undo and redo put back the rows)',
   },
   [`${E}/scene/prefabInstantiate.ts`]: {
-    calls: ['spawnEntity', 'trait.set'], standing: 'door', doorCalls: ['instanceEdits.beginAddChild', 'instanceEdits.place'],
+    calls: ['spawnEntity', 'trait.set'], standing: 'door', doorCalls: ['instanceEdits.place'],
     why: 'a placement spawns the instance (and mints its root guid); `instantiatePrefabInstance` then calls '
       + '`instanceEdits.place`, which mints the record and links it into the member it lands under',
   },
   [`${E}/scene/prefabApplyStructure.ts`]: {
-    calls: ['writeTraitField'], standing: 'stale', markedIn: `${E}/scene/prefabApply.ts`,
-    why: 'Apply\'s structural writes; Apply (`applyToPrefabSelective`) and its fan-out (`refreshInstances`) mark the store '
-      + 'stale until S7 moves Apply onto records',
-  },
-  [`${E}/scene/prefabBase.ts`]: {
-    calls: ['markOverride'], standing: 'stale', markedIn: `${E}/scene/prefabLink.ts`,
-    why: '`withLeftBehindRecorded` marks for the length of Create Prefab\'s capture and unmarks in `finally`; Create Prefab '
-      + '(`tagCreatedPrefab`) marks the records of the tree it tags stale (#2046 S7.5)',
+    calls: ['writeTraitField'], standing: 'door', doorCalls: ['instanceEdits.promoteAdded'], doorIn: `${E}/scene/prefabApply.ts`,
+    why: 'Apply\'s promotion parks a survivor dragged under a promoted node at the scene root for the refresh and hangs it '
+      + 'back under that node, by the guid the promotion keeps; the promotion\'s records follow it through the door, called '
+      + 'by the Apply (`instanceEdits.promoteAdded`, #2001 S8b), or the Apply is refused before it writes',
   },
   [`${E}/scene/prefabLink.ts`]: {
-    calls: ['restoreOverrideMarks', 'trait.set', 'trait.add', 'trait.remove'], standing: 'stale',
-    why: 'Detach, re-attach, Create Prefab\'s tag and untag: Detach is wrapped in `staleAround`; the others in '
-      + '`staleTreeAround`, which marks the records of the tree they act on (#2046 S7.5)',
-  },
-  [`${E}/scene/prefabCapture.ts`]: {
-    calls: ['restoreOverrideMarks'], standing: 'stale', markedIn: `${E}/scene/prefabLink.ts`,
-    why: 'Create Prefab\'s capture stores a scene-added reference node\'s implied root-order mark before it stamps the '
-      + 'node\'s template key (#1947, F7): a mark on a node of the tree being created, whose records Create Prefab marks '
-      + 'stale (`staleTreeAround`, #2046 S7.5)',
+    calls: ['trait.set', 'trait.add', 'trait.remove'], standing: 'door', doorCalls: ['beginDetach', 'beginCreatePrefab'],
+    why: 'Detach, re-attach, Create Prefab\'s tag and untag: Detach and the tag go through the door (`beginDetach`, '
+      + '`beginCreatePrefab`) or refuse; their undos seat back the records the step took before it (#2001 S8b)',
   },
   [`${E}/scene/prefabRebuild.ts`]: {
-    calls: ['writeTraitField'], standing: 'stale',
-    why: 'a rebuild/rebase respawns instances from the old capture; `rebuildStaleFrames` and `refreshInstances` mark the '
-      + 'store stale when they rebuild anything',
+    calls: ['writeTraitField'], standing: 'projection', projects: ['reprojectFromStore', 'keepsRecord'],
+    why: 'a rebuild/rebase reprojects each tree from its record; one its record cannot rebuild is left as it was while its '
+      + 'entry holds a fresh record, and only an entry holding none is respawned from the capture (#2001 S8b)',
   },
   [`${E}/scene/prefabReimport.ts`]: {
-    calls: ['writeTraitField', 'trait.set'], standing: 'stale',
-    why: 'an outside edit or git pull reimports prefabs into the open scene; both exports are wrapped in `staleAround` '
-      + '(outsideEdit) until S7 reprojects instead',
+    calls: ['writeTraitField', 'trait.set'], standing: 'projection', projects: ['seatLoadedEntry', 'reprojectFromStore'],
+    why: 'an outside edit or git pull reimports prefabs into the open scene: its rebase is `prefabRebuild.ts`\'s; its own '
+      + 'writes re-expand an entry placeholder (its root\'s guid and the scene stamp), then seat the records the placeholder '
+      + 'held and reproject the tree from them; one holding no record stays a placeholder (#2001 S8b)',
   },
   [`${E}/scene/authoredSnapshot.ts`]: {
-    calls: ['writeTraitField'], standing: 'stale',
-    why: 'Stop restores the authored world (review R6): `restoreAuthoredSnapshot` marks the world it leaves stale and its '
-      + 'reload takes back only the records it banked exactly (#2046 S7.6); `restoreAuthoredEntities` marks the base '
-      + 'scenes\' trees it replays',
+    calls: ['writeTraitField'], standing: 'projection', projects: ['reprojectFromStore'],
+    why: 'Stop restores the authored world (review R6): its reload takes back the records it banked exactly (#2046 S7.6), '
+      + 'and `seatBaseRecords` seats each base scene\'s records as they stood and reprojects their trees from them; the '
+      + 'raw field writes replay a base scene\'s authored values that Play moved (#2001 S8b)',
   },
   [`${E}/scene/prefabEdit.ts`]: {
     calls: ['trait.set'], standing: 'notAuthored',
     why: '`applyEditWorldMoves` places nodes of the PREFAB-EDIT world, whose save is the template writer, not a scene '
-      + 'instance\'s list; the I25 shadow does not judge an edit world',
+      + 'instance\'s list; P1 does not project an edit world',
   },
   [`${E}/scene/sceneDirty.ts`]: {
     calls: ['writeTraitField'], standing: 'notAuthored',
@@ -190,30 +179,27 @@ function census(): Map<string, Primitive[]> {
 describe('P4: every raw entity write of the authoring surfaces is accounted for against the door (#2014)', () => {
   it('the census matches the code, file by file and primitive by primitive', () => {
     // One occurrence per (file, primitive) the scan finds; each CENSUS row pays for the primitives it lists, with its
-    // reason. Unpaid: a new raw writer — route it through `instanceEdits` (or mark the store stale, for an op S7 moves),
-    // or add a row saying why it never writes a prefab-supplied entity. Over-paid: a row naming a write that is gone.
+    // reason. Unpaid: a new raw writer — route it through `instanceEdits`, or add a row saying why it never writes a prefab-supplied entity. Over-paid: a row naming a write that is gone.
     const found = census();
     assertExemptionLedger({
       label: 'CENSUS in instanceWriteCensus (P4, #2014)',
       population: [...found].flatMap(([file, calls]) => calls.map((c) => ({ item: `${file}::${c}`, site: file }))),
       exempt: Object.entries(CENSUS).flatMap(([file, row]) => row.calls.map((c) => ({ item: `${file}::${c}`, reason: `${row.standing}: ${row.why}` }))),
       floor: 20,
-      fix: 'route the write through `instanceEdits` (or `markStale`/`staleAround` for an op S7 moves onto records), or add a CENSUS row saying why it never writes a prefab-supplied entity',
+      fix: 'route the write through `instanceEdits`, or add a CENSUS row saying why it never writes a prefab-supplied entity',
     });
   });
 
-  // A "door" or "stale" row is a claim about the code; pin the call that makes it true, so deleting it fails here too.
-  it('each door row calls the door, each stale row marks, and each projection row projects', () => {
-    const marks = /\bstaleAround\(|\bmarkStale\(/;
+  // A "door" or "projection" row is a claim about the code; pin the call that makes it true, so deleting it fails here too.
+  it('each door row calls the door, and each projection row projects', () => {
     // The door directly, or the recorder that calls it (`recordOverridesByDiff` → `instanceEdits.setFields`). Each named
     // call, with the paren (a called-symbol guard must require it).
     const code = (rel: string) => readScannedSource(fileURLToPath(new URL(`../../../${rel}`, import.meta.url))).code;
     for (const [file, row] of Object.entries(CENSUS)) {
       if (row.standing === 'door') {
         expect(row.doorCalls?.length, `${file} is a door row naming no door call`).toBeGreaterThan(0);
-        for (const c of row.doorCalls!) expect(new RegExp(`\\b${c.replace('.', '\\.')}\\(`).test(code(file)), `${file} no longer calls ${c}(`).toBe(true);
+        for (const c of row.doorCalls!) expect(new RegExp(`\\b${c.replace('.', '\\.')}\\(`).test(code(row.doorIn ?? file)), `${row.doorIn ?? file} no longer calls ${c}(`).toBe(true);
       }
-      if (row.standing === 'stale') expect(marks.test(code(row.markedIn ?? file)), `${file} is a stale row but ${row.markedIn ?? 'it'} marks nothing`).toBe(true);
       if (row.standing === 'projection') {
         expect(row.projects?.length, `${file} is a projection row naming no projecting call`).toBeGreaterThan(0);
         for (const c of row.projects!) expect(new RegExp(`\\b${c}\\(`).test(code(file)), `${file} no longer calls ${c}(`).toBe(true);

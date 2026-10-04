@@ -197,7 +197,11 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
     // scene directly: each is the copy-less form.
     expect(seen.shownB).toBe(0);
     expect(seen.shownD).toBeGreaterThan(0);
-    expect(preS5Forms).toBeGreaterThan(0);
+    // #2001 S8b: the save writes a user's node AT a placeholder where its record links it (an `own` link), not as an entity
+    // of its own beside the placeholder (S5's save, whose capture of a placeholder was the record it loaded with). So no
+    // saved scene needs the pre-S5 rewrite any more: the record form is judged on the saved scene itself
+    // (`reached.ownAtPlaceholder` below), and a scene that wrote such a node outside its record again would count here.
+    expect(preS5Forms).toBe(0);
     // The "same scene without its copies" variant (#2033) has nothing to strip from a v20 file: it never runs, and rule D
     // is judged on the saved scene itself (`shownD` above).
     expect(ruledDNoCopies).toBe(0);

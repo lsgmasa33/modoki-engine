@@ -10,16 +10,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
 
-/** Runs once, inside the expansion's first pass (the mark reset every spawned row goes through): where a spawn could
- *  change the world under the call. */
+/** Runs once, right after the call's first spawn (the expansion's first row): where a spawn could change the world under
+ *  the call. */
 const hook = vi.hoisted(() => ({ during: null as null | (() => void) }));
-vi.mock('../../packages/modoki/src/runtime/loaders/overrideMarks', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../packages/modoki/src/runtime/loaders/overrideMarks')>();
+vi.mock('../../packages/modoki/src/runtime/core/ecs/world', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../packages/modoki/src/runtime/core/ecs/world')>();
   return {
     ...real,
-    clearOverrideMarks: (...a: Parameters<typeof real.clearOverrideMarks>) => {
+    spawnEntity: (...a: Parameters<typeof real.spawnEntity>) => {
+      const spawned = real.spawnEntity(...a);
       const f = hook.during; hook.during = null; f?.();
-      return real.clearOverrideMarks(...a);
+      return spawned;
     },
   };
 });

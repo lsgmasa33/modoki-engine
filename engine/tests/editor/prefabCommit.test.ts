@@ -34,11 +34,20 @@ import { createHash } from 'node:crypto';
 import { createWorld } from 'koota';
 
 const prefabs = new Map<string, unknown>();
-vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (importOriginal) => ({
-  ...(await importOriginal<Record<string, unknown>>()),
-  getCachedPrefab: (ref: string) => prefabs.get(ref),
-  loadModelTemplates: async () => {},
-}));
+vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (importOriginal) => {
+  const real = await importOriginal<Record<string, unknown>>();
+  return {
+    ...real,
+    getCachedPrefab: (ref: string) => prefabs.get(ref),
+    // A write the editor lands replaces the loader's copy, as the real cache does for a prefab a loaded scene owns: a
+    // stand-in that kept the old document had every reader after a Replace fold the tree against it (#2001 S8b).
+    replaceCachedPrefab: (ref: string, data: unknown) => {
+      (real.replaceCachedPrefab as (r: string, d: unknown) => void)(ref, data);
+      for (const k of [ref, (data as { id?: string } | null)?.id]) if (k && prefabs.has(k)) prefabs.set(k, JSON.parse(JSON.stringify(data)));
+    },
+    loadModelTemplates: async () => {},
+  };
+});
 
 /** The fake route's disk: path → the exact text it holds. */
 const route = vi.hoisted(() => ({ disk: new Map<string, string>(), failRead: null as string | null, failWrites: false, gate: null as Promise<void> | null, waiting: 0, posts: [] as string[], beforeWrite: null as null | ((path: string) => void) }));

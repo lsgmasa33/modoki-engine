@@ -6,16 +6,20 @@
  * ── What is not the record's ──
  * - **Placement** (parent, sibling order, folder): scene data, like a plain entity's, read off the live root
  *   ({@link placedAsLive}).
- * - **The content of a scene-owned node** (rule 7: the user's node is the scene's, the list holds its link). Until S8
- *   deletes the old capture it is that capture's inline form of the node (`ownContentOf`), read from the live tree; a
- *   reference node the scene added carries its own record's list, from the store.
- * - **A stale record** (an op that does not maintain the list yet marks it, § 10.7): re-seeded from the capture before
- *   it is written (`treeForWrite`), as the door re-seeds it before its own write.
+ * - **The content of a scene-owned node** (rule 7: the user's node is the scene's, the list holds its link): read off the
+ *   live node as a plain entity's is (`instanceOwnContent.ts`, #2001 S8b), and a reference node the scene added carries
+ *   its own record's list, from the store. A linked node that is not live is the record's to hold (`held.heldOwn`: a
+ *   load holds one the tree does not show, `holdUnspawnedOwn`).
  *
  * ── When there is no record to write ──
- * A root with no durable guid, or a tree the capture cannot state, has none (`treeForWrite` false). The caller's legacy
- * entry — what the old save wrote for it — is then CONVERTED: parsed by the rules of its own form and written by the
- * same writer, so the file still holds one form (the format rule).
+ * A root with no durable guid, or a tree holding no record (`treeForWrite` false), has none, and nothing re-seeds it from
+ * the capture. The save is REFUSED (hub ruling, 2026-10-05): it says so naming the instance, writes nothing, and marks the
+ * world unsavable until a load replaces it. A save from the live tree would be a capture, which loses what only the
+ * record holds (a linked node the tree does not show, `held.heldOwn`): silent data loss, the #2128 class. Every door
+ * records what it makes and every load records what it reads, so a tree reaching here is a defect, said where it shows.
+ * The one exception is a Missing Prefab placeholder's own entry (`legacy`): what it holds verbatim is the record it was
+ * loaded with, not a capture, and it is CONVERTED: parsed by the rules of its own form and written by the same writer, so
+ * the file still holds one form (the format rule).
  *
  * ── What the entry consumes ──
  * Every live node the written entry states by guid is the entry's, and is not also written as an entity of its own
@@ -30,17 +34,18 @@ import { findEntity, getAllEntities } from '../../runtime/core/ecs/entityUtils';
 import type { ExpansionReader, SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
 import { recordsOf } from '../../runtime/prefab/instanceLoad';
 import { parseInstanceRecord } from '../../runtime/prefab/parseInstanceRecord';
-import { freshInstanceRecord, markStale } from '../../runtime/prefab/instanceStore';
-import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { storedRecord } from '../../runtime/prefab/instanceStore';
 import type { InstanceEntryJson } from '../../runtime/prefab/serializeInstanceRecord';
-import { ROOT_ROW_KEY, type ParsedInstance, type PrefabDoc, type PrefabReader } from '../../runtime/prefab/instanceRecord';
+import { ROOT_ROW_KEY, type PrefabDoc, type PrefabReader } from '../../runtime/prefab/instanceRecord';
 import { getCachedPrefabSync } from '../scene/prefabCache';
 import { templateKeyOf } from '../../runtime/core/templateIdentity';
 import { durableGuid, isStoredRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { withFrameRecords } from '../scene/prefabRebuild';
 import { guidOfEntity, instanceKeyMap, storedRootsUnder } from './instanceKeys';
 import { editorPrefabReader, treeForWrite } from './instanceSync';
-import { ownContentOf, writtenEntryOf } from './instanceReproject';
+import { writtenEntryOf } from './instanceReproject';
+import { liveOwnContent } from './instanceOwnContent';
+import { markWorldUnsavable, NO_RECORD_TO_WRITE, recordlessInstanceIn } from './instanceRollback';
 
 type Bag = Record<string, unknown>;
 
@@ -52,12 +57,16 @@ export interface SavedInstance {
   unstated: number[];
 }
 
-/** A legacy entry for the root and the scene version its form reads as (see the header). */
+/** A placeholder's verbatim entry and the scene version its form reads as (see the header). */
 export type LegacyEntry = () => { entry: SceneEntityEntry; version: number; consumed?: readonly number[] } | null;
 
-/** The v20 entry the save writes for stored root `rootId` (an outermost one), or null when nothing can state it.
+/** The save's refusal of a tree with no record (see the header). */
+export { NO_RECORD_TO_WRITE };
+
+/** The v20 entry the save writes for stored root `rootId` (an outermost one), or null when nothing can state it. Throws
+ *  for a live tree with no record (see the header). `legacy`: a placeholder's verbatim entry, for one with no record.
  *  `resolved`: the root's own document as the save resolved it, when the caches no longer hold it (see `read` below). */
-export function savedEntryOf(rootId: number, legacy: LegacyEntry, resolved?: { source: string; doc: unknown }): SavedInstance | null {
+export function savedEntryOf(rootId: number, legacy: LegacyEntry | undefined, resolved?: { source: string; doc: unknown }): SavedInstance | null {
   const world = getCurrentWorld();
   const guid = guidOfEntity(rootId);
   // The documents: the editor's caches, then the root's own as the save resolved it, then the ones this tree's live
@@ -71,63 +80,48 @@ export function savedEntryOf(rootId: number, legacy: LegacyEntry, resolved?: { s
     const doc = (resolved && g === resolved.source ? resolved.doc : frames(g)) as PrefabDoc | null | undefined;
     return doc ? { doc } : cached;
   };
-  // A member the live tree cannot KEY (a pre-v5 document's row carries no node guid, so its `PrefabInstance` has none)
-  // is one the door cannot record on: an edit of it, or a node hung under it, reached no record, and the record stayed
-  // fresh. The capture states such a member by its localId and the parse keys it (`preV5NodeGuid`), so the tree is
-  // re-seeded from the capture before it is written, as a stale one is: written from the fresh record, the save dropped
-  // a prefab instance the user had moved under such a member.
-  if (guid && freshInstanceRecord(world, guid) && hasUnkeyedMember(rootId)) {
-    markStale(world, 'unkeyedMembers', [rootId, ...storedRootsUnder(rootId)].map(guidOfEntity).filter(Boolean));
-  }
-  const wasFresh = !!guid && !!freshInstanceRecord(world, guid);
-  const rec = guid && treeForWrite(rootId, world) ? freshInstanceRecord(world, guid) : undefined;
-  // The live entities the capture states: asked for the nodes it states WITHOUT a guid (see `consumedBy`).
+  const rec = guid && treeForWrite(rootId, world) ? storedRecord(world, guid) : undefined;
+  // The live entities the entry states: asked for the nodes it states WITHOUT a guid (see `consumedBy`).
   const captured = new Set<number>();
-  let content = rec ? ownContentOf(rootId, false, captured) : null;
-  let converted: ParsedInstance[] | undefined;
-  if (!content) {
-    // No capture through the caches: the caller's legacy entry, parsed by the rules of its own form.
-    const old = legacy();
-    if (old) {
-      for (const id of old.consumed ?? []) captured.add(id);
-      const held = new Set<string>();
-      const ea = getTraitByName('EntityAttributes')!;
-      for (const e of world.entities) { const g = (e.get(ea.trait) as { guid?: string } | undefined)?.guid; if (g) held.add(g); }
-      const opts = { held: (g: string) => held.has(g), sceneVersion: old.version };
-      converted = recordsOf(parseInstanceRecord(old.entry, read, opts), read, opts);
-      content = new Map(converted.map((p) => [p.record.rootGuid, p]));
-    }
-  }
+  // A value the file held that no reader took, where the save now states something else: said, never dropped unsaid
+  // (owner ruling F-CB1(a), as the capture's save said it before #2001 S8b).
+  const superseded = (owner: string, values: readonly { path: readonly string[] }[]): void => {
+    console.warn(`[save] ${owner}: the save states its own value where the file held one no reader took; that value is not written back: ${values.map((v) => v.path.join('.')).join(', ')}`);
+  };
   let entry: InstanceEntryJson;
-  if (rec) entry = writtenEntryOf(rec, rootId, content ?? new Map(), undefined, undefined, read);
-  else if (converted) entry = writtenEntryOf(converted[0].record, rootId, content!, undefined, (g) => content!.get(g)?.record, read);
-  else return null;
-  // Only where the entry IS the capture's statement (a record re-seeded from it here, or the converted legacy entry): a
-  // record the door maintained links durable guids alone, and states no unguided node.
-  return { entry, ...consumedBy(rootId, entry, rec && wasFresh ? new Set() : captured) };
-}
-
-/** Is a LINKED node of the tree at `rootId` (a member, or a nested frame's) one no row key names? */
-function hasUnkeyedMember(rootId: number): boolean {
-  const pi = getTraitByName('PrefabInstance');
-  if (!pi) return false;
-  const keyed = new Set<number>();
-  for (const id of [rootId, ...storedRootsUnder(rootId)]) for (const k of instanceKeyMap(id).keys()) keyed.add(k);
-  const all = getAllEntities();
-  const parent = new Map(all.map((e) => [e.id, e.parentId] as const));
-  const under = (id: number): boolean => { for (let a = parent.get(id) ?? 0, n = 0; a && n < 1024; a = parent.get(a) ?? 0, n++) if (a === rootId) return true; return false; };
-  return all.some((e) => {
-    if (keyed.has(e.id) || !under(e.id)) return false;
-    const h = findEntity(e.id);
-    return !!h && h.has(pi.trait) && !isStoredRoot(h.get(pi.trait) as MemberPi, e.id) && !unresolvedRefOf(h as never);
-  });
+  if (rec) {
+    // The scene-owned content the record links, read off the live tree and the store (`instanceOwnContent.ts`).
+    entry = writtenEntryOf(rec, rootId, liveOwnContent(captured), undefined, undefined, read, superseded);
+  } else if (!legacy) {
+    // Named: the instance in the tree that holds no record (the root's own, or a nested one's), and the tree it is in.
+    const why = `${recordlessInstanceIn(rootId, true)} has no instance record to write`;
+    console.error(`[save] ${why}: the save is refused, nothing is written, and the world is marked unsavable — reopen the scene. A save from its live tree would be a capture, losing what only the record holds.`);
+    markWorldUnsavable(world, NO_RECORD_TO_WRITE);
+    throw new Error(`[save] ${why}`);
+  } else {
+    // A placeholder with no record: its verbatim entry, parsed by the rules of its own form and written by the same writer.
+    const old = legacy();
+    if (!old) return null;
+    for (const id of old.consumed ?? []) captured.add(id);
+    const held = new Set<string>();
+    const ea = getTraitByName('EntityAttributes')!;
+    for (const e of world.entities) { const g = (e.get(ea.trait) as { guid?: string } | undefined)?.guid; if (g) held.add(g); }
+    const opts = { held: (g: string) => held.has(g), sceneVersion: old.version };
+    const converted = recordsOf(parseInstanceRecord(old.entry, read, opts), read, opts);
+    if (!converted.length) return null;
+    const content = new Map(converted.map((p) => [p.record.rootGuid, p]));
+    entry = writtenEntryOf(converted[0].record, rootId, content, undefined, (g) => content.get(g)?.record, read, superseded);
+  }
+  // The guid-less nodes the entry states: the ones the live read wrote for a link (`instanceOwnContent.ts`), or the ones
+  // the converted legacy entry consumed.
+  return { entry, ...consumedBy(rootId, entry, captured) };
 }
 
 /** Which live entities under `rootId` the entry states, and which scene-owned ones it does not. Stated means named by
  *  guid where a row names a NODE: a row's pin, a node in its `own` (or whole `added`) list, that node's children, and the
  *  rows of a reference node among them. A guid inside a component's value (an entity reference a member holds to a
  *  plain child) states nothing: read as a statement, that child was written nowhere and the save lost it. */
-function consumedBy(rootId: number, entry: InstanceEntryJson, unguided: ReadonlySet<number>): { consumed: number[]; unstated: number[] } {
+export function consumedBy(rootId: number, entry: InstanceEntryJson, unguided: ReadonlySet<number>): { consumed: number[]; unstated: number[] } {
   const stated = new Set<string>();
   const isBag = (v: unknown): v is Bag => !!v && typeof v === 'object' && !Array.isArray(v);
   const walkNode = (n: unknown): void => {

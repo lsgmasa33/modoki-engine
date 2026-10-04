@@ -25,10 +25,11 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode,
-  loadSceneFile, instantiatePrefabIntoWorld, writeTraitField, destroyEntity, spawnEntity, type SceneData,
+  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, spawnEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction, clearHistory, serializeScene } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { place } from '../../packages/modoki/src/editor/instance/instanceEdits';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { remintSceneEntityGuids } from '../../plugins/asset-fs-ops';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -126,11 +127,19 @@ const asV17 = (saved: unknown): SceneData => {
   return out as unknown as SceneData;
 };
 
-/** The saved scene with Panel (an O member) moved under `under`, a keyed node. */
+/** The saved scene with Panel (an O member) moved under `under`, a keyed node: Panel's member row names it as its parent,
+ *  as a file written before #1869 states a member move (#1437; no gesture makes one since). */
 async function savedWithPanelUnder(under: 'Extra' | 'Kid'): Promise<unknown> {
   await load(scene(18));
-  writeTraitField(named('Panel').id, getTraitByName('EntityAttributes')!, 'parentId', named(under).id);
-  return serializeScene();
+  const panel = named('Panel').guid, parent = named(under).guid;
+  const saved = await serializeScene();
+  let rows = 0;
+  JSON.stringify(saved, (_k, v: unknown) => {
+    if (v && typeof v === 'object' && (v as { guid?: unknown }).guid === panel && 'name' in v && !('traits' in v && (v as { prefab?: unknown }).prefab)) { (v as Record<string, unknown>).parent = parent; rows++; }
+    return v;
+  });
+  expect(rows, "premise: one member row pins Panel").toBe(1);
+  return saved;
 }
 beforeEach(() => {
   setRunMode('stopped');
@@ -234,6 +243,7 @@ describe('a v17 STORED root under a keyed node is not a held guid (control)', ()
     for (const e of getCurrentWorld().entities) {
       if (e.id() === id) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as Record<string, unknown>), guid: STORED });
     }
+    place(id!); // the drop's door: the keyed node's row links the new instance, and its record is stored
     const saved = await serializeScene();
     expect(JSON.stringify(saved)).toContain(`/a+${KX}`); // premise: the node row, keyed
     await load(asV17(saved));

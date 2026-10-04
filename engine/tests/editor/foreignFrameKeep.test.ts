@@ -7,6 +7,8 @@
  *  Driven through the real loader, rebuild and save (the rebuild's own harness shape, `rebuildNestedReapply.test.ts`). */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { whyWorldNotAuthored } from '../../packages/modoki/src/editor/scene/authoredWorld';
+import { NO_RECORD_TO_WRITE } from '../../packages/modoki/src/editor/instance/instanceRollback';
 import { createWorld } from 'koota';
 
 const prefabs = new Map<string, unknown>();
@@ -23,11 +25,11 @@ import {
 import { setActionCallback, pushAction, clearHistory, serializeScene, writeTraitFieldWithUndo } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { legacyView } from './memberRowView';
 import { readTraitData, deleteEntities } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { findEntityByGuid } from '../../packages/modoki/src/runtime/core/ecs/world';
+import { dropInstanceRecord, storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { frameRootDoc, noteFrameRootDoc } from '../../packages/modoki/src/runtime/core/ecs/identityParents';
 
 registerAllTraits();
@@ -79,7 +81,6 @@ const byName = (nm: string) => getAllEntities().filter((e) => e.name === nm);
 beforeEach(() => {
   setRunMode('stopped');
   clearHistory();
-  clearKeptMemberOrphans();
   prefabs.clear();
   for (const [k, d] of Object.entries(docs)) { prefabs.set(k, d); setPrefabCache(k, d as never); }
   for (const k of ['log', 'warn', 'info'] as const) vi.spyOn(console, k).mockImplementation(() => {});
@@ -135,18 +136,47 @@ describe('#1877 close-out review: a frame two levels down whose prefab is missin
 describe('#1880 F7a: an entry whose OWN prefab is trashed is loaded from its record', () => {
   // A rebuild of any frame is the load of its outermost entry. With the entry's prefab gone from the cache (a trash, the
   // frame kept live, #1862), the load reads the document the entry was built from — its record (`entryDocOf`). The old
-  // per-frame rebuild was the fallback there until F7. Mutation: `entryDocOf` answers the cache only — the refresh of Q
-  // rebuilds nothing, counts 0, and Q's new row never arrives.
-  it('O trashed: a refresh of the Q frame inside it still lands, and O\'s own rows stay', async () => {
+  // per-frame rebuild was the fallback there until F7. That load is the capture's, and #2001 S8b leaves every entry whose
+  // instance holds no record as it was (hub ruling): the case that reached it, every record dropped, is now refused —
+  // said, and the world marked unsavable. Mutation: drop `leftRecordless` from `rebuildTargetsByEntry` — the capture
+  // rebuilds it (counted 1, QC arrives).
+  it('O trashed, its records dropped: the refresh leaves the entry as it was and blocks the save', async () => {
     await load(scene());
+    for (const g of [...storedInstances(getCurrentWorld()).keys()]) dropInstanceRecord(getCurrentWorld(), g);
     prefabs.delete(O);
     setPrefabCache(O, null);
     const qDoc = docs[Q] as { entities: unknown[] };
     const qNext = { ...qDoc, entities: [...qDoc.entities, row(4, 'QC', 1)] };
     prefabs.set(Q, qNext); setPrefabCache(Q, qNext as never);
-    expect(refreshInstances(Q, [byName('QRoot')[0]!.id], qDoc as never, qNext as never)).toBe(1);
-    expect(byName('QC')).toHaveLength(1);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(refreshInstances(Q, [byName('QRoot')[0]!.id], qDoc as never, qNext as never)).toBe(0);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('has no instance record')), 'said').toBe(true);
+    } finally { warn.mockRestore(); }
+    expect(byName('QC')).toHaveLength(0);
     for (const nm of ['ORoot', 'QRoot', 'QA', 'QB', 'Plain', 'ZRoot', 'ZLeaf']) expect(byName(nm), nm).toHaveLength(1);
+    expect(whyWorldNotAuthored()).toBe(NO_RECORD_TO_WRITE);
+  });
+
+  it('O trashed, its records fresh: the refresh leaves the entry as it was, records and all, and says why (#2001 S8b)', async () => {
+    // Its record cannot rebuild it (O is not loaded), and a rebuild from the live tree re-derives the records from it, so
+    // the entry is left until a reload builds it from its record. Before, it was rebuilt from the capture and its records
+    // marked stale, for the next write to re-seed from the live tree.
+    await load(scene());
+    const before = structuredClone(storedInstances(getCurrentWorld()).get(ROOT)!.record);
+    prefabs.delete(O);
+    setPrefabCache(O, null);
+    const qDoc = docs[Q] as { entities: unknown[] };
+    const qNext = { ...qDoc, entities: [...qDoc.entities, row(4, 'QC', 1)] };
+    prefabs.set(Q, qNext); setPrefabCache(Q, qNext as never);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // MUTATION TARGET: drop the `keepsRecord` skip (`prefabRebuild.ts`) and the capture rebuilds it, counting 1.
+    expect(refreshInstances(Q, [byName('QRoot')[0]!.id], qDoc as never, qNext as never)).toBe(0);
+    expect(warn.mock.calls.map((c) => String(c[0]))).toContain(`[Prefab] rebuild of ${Q} skipped: its prefab ${O} is not loaded`);
+    warn.mockRestore();
+    expect(byName('QC')).toHaveLength(0);
+    for (const nm of ['ORoot', 'QRoot', 'QA', 'QB', 'Plain', 'ZRoot', 'ZLeaf']) expect(byName(nm), nm).toHaveLength(1);
+    expect(storedInstances(getCurrentWorld()).get(ROOT)!.record).toEqual(before);
   });
 });
 
@@ -307,13 +337,12 @@ describe('#1880 F7d close-out review: where the record reader must not reach, an
   });
 
   // Review 2. An instance whose root is on a RUNTIME guid (#1210 — game code spawning into the editor world, a legacy
-  // entry): the Revert of a NESTED frame mints the entry root's durable guid (F7c), and the frame kept its runtime guid,
-  // which the rebuilt frame no longer carries — the Revert answered the entry's ROOT, and its undo was refused ("no longer
-  // an instance of Z"). The frame's own guid is minted too now, and the entry pins it. Mutation: drop that mint in
-  // `captureEntrySide` — the result is ORoot, and the undo leaves x at 0.
-  it('a Revert of a nested frame in a runtime-guid instance answers that frame, and its undo puts the edit back', async () => {
+  // entry). Before #2001 S8b the Revert of a NESTED frame minted the entry root's and the frame's durable guids (F7c) and
+  // re-seeded their records from the capture. The store keys an instance by its root's durable guid, and nothing re-seeds
+  // any more: such an instance holds no record, so the Revert is refused and changes nothing — no guid minted either.
+  // Mutation: mint the guids (`ensureGuid`) ahead of the record gate in `prefabRevert.ts`, as before — red.
+  it('a Revert of a nested frame in a runtime-guid instance is refused, and changes nothing', async () => {
     const { revertOverridesWithUndo } = await import('../../packages/modoki/src/editor/undo/revertPrefabUndo');
-    const { undo } = await import('../../packages/modoki/src/editor/undo/undoManager');
     const { instantiatePrefab } = await import('@modoki/engine/editor');
     const { setPrefabSource } = await import('../../packages/modoki/src/editor/scene/prefabCache');
     const { isRuntimeGuid } = await import('../../packages/modoki/src/runtime/core/assetRefRules');
@@ -326,11 +355,9 @@ describe('#1880 F7d close-out review: where the record reader must not reach, an
     const tfm = getTraitByName('Transform')!;
     writeTraitFieldWithUndo(byName('ZLeaf')[0]!.id, tfm, 'x', 9);
     const lid = (readTraitData(byName('ZLeaf')[0]!.id, getTraitByName('PrefabInstance')!) as { localId: number }).localId;
-    const res = await revertOverridesWithUndo(byName('ZRoot')[0]!.id, new Set([`${lid}.Transform.x`]));
-    expect(getAllEntities().find((e) => e.id === res?.newRootId)?.name).toBe('ZRoot');
-    expect((readTraitData(byName('ZLeaf')[0]!.id, tfm) as { x: number }).x).toBe(0);
-    await undo();
+    expect(await revertOverridesWithUndo(byName('ZRoot')[0]!.id, new Set([`${lid}.Transform.x`]))).toBeNull();
     expect((readTraitData(byName('ZLeaf')[0]!.id, tfm) as { x: number }).x).toBe(9);
+    expect(isRuntimeGuid(getAllEntities().find((e) => e.id === root)!.guid), 'no durable guid minted').toBe(true);
   });
 
   // Review 1, the undo side: a Revert done while Q2 was readable, then Q2 trashed with its two records disagreeing — the

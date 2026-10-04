@@ -21,8 +21,9 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
 
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode,
-  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, getOverrideMarkSet, registerTrait, type SceneData,
+  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, registerTrait, type SceneData,
 } from '@modoki/engine/runtime';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import {
   duplicateEntity, writeTraitFieldWithUndo, setActionCallback, pushAction, clearHistory, serializeScene,
   reparentEntity, deleteEntitiesWithUndo,
@@ -47,7 +48,8 @@ import { undo, redo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { legacyView, legacySceneView } from './memberRowView';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { whyWorldNotAuthored } from '../../packages/modoki/src/editor/scene/authoredWorld';
+import { NO_RECORD_TO_WRITE } from '../../packages/modoki/src/editor/instance/instanceSave';
 import { relinkDetachedMembers } from '../../packages/modoki/src/runtime/core/ecs/memberHome';
 import { worldIdentityParents, openIdentityScope, closeIdentityScope } from '../../packages/modoki/src/runtime/core/ecs/identityParents';
 
@@ -158,6 +160,15 @@ const idAt = (path: string): number => {
   return e.id;
 };
 const guidAt = (path: string): string => getAllEntities().find((e) => e.id === idAt(path))!.guid ?? '';
+/** The save refuses a tree holding an instance (`guid`) no record states: it names it, writes nothing, and leaves the
+ *  world unsavable until a load replaces it (#2001 S8b, hub ruling 2026-10-05). */
+async function expectRefused(guid: string): Promise<void> {
+  const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    await expect(serializeScene()).rejects.toThrow(new RegExp(`instance "InnerRoot" \\(${guid}\\) in instance "OuterRoot" \\(${ROOT}\\) has no instance record to write`));
+  } finally { err.mockRestore(); }
+  expect(whyWorldNotAuthored()).toBe(NO_RECORD_TO_WRITE);
+}
 // Through the undoable path, which marks an instance-root rename as an override so it is saved.
 const rename = (id: number, name: string) => writeTraitFieldWithUndo(id, getTraitByName('EntityAttributes')!, 'name', name);
 const targetsOf = (id: number): string[] => {
@@ -194,7 +205,6 @@ const scene = (holderRefs: string[], rootRefs: string[] = []): SceneData => ({
 const MEMBERS = ['OuterRoot/Panel/Button', 'OuterRoot/Panel/InnerRoot/Leaf', 'OuterRoot/Panel/Button/InnerRoot/Leaf'];
 
 beforeEach(() => {
-  clearKeptMemberOrphans(); // R2's kept rows are process state: a rebuild here keeps a dropped member's row (#1535), and it must not reach the next case
   setRunMode('stopped');
   clearHistory();
   prefabs.clear();
@@ -244,11 +254,16 @@ describe('an editor duplicate carries refs to prefab members through save + relo
       .toEqual(MEMBERS.slice(1).map((m) => `Holder/${m}`));
   });
 
-  // #1338 review, finding 2. Mutation: classify by "live guid equals its derivation" again.
+  // #1338 review, finding 2. Mutation (measured, #2001 S8b): the copy not remapping the guid values it carries
+  // (`remapGuidValues` in the duplicate) — red. Classifying every kept member an anchor leaves this file green.
+  // #2001 S8b: a guid-less root holds no record (the store keys an instance by its root's durable guid), so its edits
+  // are refused until a save stores the guid it was given and a reopen records it. The legacy file is saved and
+  // reopened first, as that refusal asks; its members keep the guids the legacy file stated.
   it('duplicating a LEGACY (guid-less) instance root: its members reload under the copy\'s saved root guid', async () => {
     await load(legacyScene([]));
     const paths = ['Holder/OuterRoot/Panel/Button', 'Holder/OuterRoot/Panel/InnerRoot/Leaf'];
     await load(legacyScene(paths.map(guidAt), paths.map(guidAt)));
+    await load(await serializeScene() as unknown as SceneData);
     const holder = idAt('Holder');
     const copyId = duplicateEntity(idAt('Holder/OuterRoot'), () => {})!;
     rename(copyId, 'Twin');
@@ -383,10 +398,11 @@ describe('an owned nested instance that leaves its row stays gone after save + r
   });
 
   // #1436 review: the drop keeps the world pose by rewriting the root's local Transform, and on a LINKED root
-  // those values are overrides the save keeps only when marked. Unmarked, the root reloaded at the prefab's
-  // x, under a parent at x=10: it jumped by the parent's offset. y carries a file override (marked at load)
-  // and must keep it. Mutations: drop the markCompensatedTransform call in reparentEntity's apply, its
-  // `restoreMarks` on undo, or its re-mark on redo — each turns this red.
+  // those values are overrides the save keeps only when recorded. Unrecorded, the root reloaded at the prefab's
+  // x, under a parent at x=10: it jumped by the parent's offset. y carries a file override (recorded at load)
+  // and must keep it. Mutation: pass no `compensated` pose to reparentEntity's `beginReparent` commit — red. Its undo's
+  // and redo's seats (`seatAround`) are NOT pinned here: running either side's writes without its seat stays green
+  // (measured, #2001 S8b).
   it('a top-level instance dropped under a moved parent keeps its world pose through save + reload; undo drops the marks, redo restores them', async () => {
     const sc = withShelf() as unknown as { entities: Array<Record<string, unknown>> };
     sc.entities.push({ id: 4, prefab: INNER, guid: 'bbbbbbbb-0000-4000-8000-0000000000c5', overrides: { 1: { Transform: { y: 4 } } }, traits: { EntityAttributes: { name: 'InnerRoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } });
@@ -395,16 +411,16 @@ describe('an owned nested instance that leaves its row stays gone after save + r
     rename(solo, 'Solo'); // Panel already holds an owned InnerRoot
     const panel = idAt('Holder/OuterRoot/Panel');
     const entityOf = (id: number) => [...getCurrentWorld().entities].find((x) => x.id() === id)!;
-    const before = [...(getOverrideMarkSet(entityOf(solo)) ?? [])].sort();
+    const before = [...(overrideKeysOf(entityOf(solo)) ?? [])].sort();
     // Panel "moved" to x=10 in the LIVE world: the reparent reads the chains on demand, never the per-frame cache (#1848).
     const tfTrait = getTraitByName('Transform')!.trait;
     entityOf(panel).set(tfTrait, { ...(entityOf(panel).get(tfTrait) as object), x: 10 });
     reparentEntity(solo, panel);
-    expect(getOverrideMarkSet(entityOf(solo))?.has('Transform.x')).toBe(true);
+    expect(overrideKeysOf(entityOf(solo))?.has('Transform.x')).toBe(true);
     await undo();
-    expect([...(getOverrideMarkSet(entityOf(solo)) ?? [])].sort()).toEqual(before);
+    expect([...(overrideKeysOf(entityOf(solo)) ?? [])].sort()).toEqual(before);
     await redo();
-    expect(getOverrideMarkSet(entityOf(solo))?.has('Transform.x')).toBe(true);
+    expect(overrideKeysOf(entityOf(solo))?.has('Transform.x')).toBe(true);
     await load(await serializeScene() as unknown as SceneData);
     const tf = entityOf(idAt('Holder/OuterRoot/Panel/Solo')).get(getTraitByName('Transform')!.trait) as { x: number; y: number };
     expect(linked(idAt('Holder/OuterRoot/Panel/Solo'))).toBe(true);
@@ -497,6 +513,7 @@ describe('a SECOND nested instance at a prefab row is independent, not the row i
     entities: Array<{ prefab?: string; added?: unknown[] }>;
   }).entities.find((e) => e.prefab === OUTER)!;
   const guidOf = (id: number) => getAllEntities().find((e) => e.id === id)!.guid ?? '';
+  const idOfGuid = (guid: string) => getAllEntities().find((e) => e.guid === guid)!.id;
   const xOf = (id: number) => ((([...getCurrentWorld().entities].find((z) => z.id() === id)!
     .get(getTraitByName('Transform')!.trait)) as { x: number }).x);
   /** Every INNER instance is back, each with its own Leaf — the count is what the bug reduced. */
@@ -509,11 +526,12 @@ describe('a SECOND nested instance at a prefab row is independent, not the row i
 
   it('the duplicate of an owned nested root survives save + reload beside its source', async () => {
     await load(plain());
-    const src = idAt('Holder/OuterRoot/Panel/InnerRoot');
-    const srcGuid = guidOf(src);
-    const copy = duplicateEntity(src, () => {})!;
+    const srcGuid = guidOf(idAt('Holder/OuterRoot/Panel/InnerRoot'));
+    const copy = duplicateEntity(idAt('Holder/OuterRoot/Panel/InnerRoot'), () => {})!;
     const copyGuid = guidOf(copy);
     expect(copyGuid).not.toBe(srcGuid); // precondition: the copy got its own guid
+    // By guid: the copy is on records (#2001 S8b), and its seat reprojects the instance it lands in, source included.
+    const src = idOfGuid(srcGuid);
     // The copy is independent AT CREATION (owner ruling, 2026-09-18) — not merely classified that
     // way later because the source happened to claim the row first. Asserted separately because the
     // partition alone would carry the round trip below, leaving the remint unfalsified.
@@ -554,10 +572,10 @@ describe('a SECOND nested instance at a prefab row is independent, not the row i
   // replaced is `removed`. Mutation: restore a pass that lets an unstamped candidate claim a free row.
   it('the copy keeps its edits when the SOURCE is deleted — a reference node, and the row removed', async () => {
     await load(plain());
-    const src = idAt('Holder/OuterRoot/Panel/InnerRoot');
-    const copy = duplicateEntity(src, () => {})!;
+    const srcGuid = guidOf(idAt('Holder/OuterRoot/Panel/InnerRoot'));
+    const copy = duplicateEntity(idOfGuid(srcGuid), () => {})!;
     writeTraitFieldWithUndo(copy, getTraitByName('Transform')!, 'x', 99);
-    deleteEntitiesWithUndo([src]);
+    deleteEntitiesWithUndo([idOfGuid(srcGuid)]); // by guid: the duplicate reprojected the source (#2001 S8b)
     const saved = await serializeScene() as unknown as { entities: Array<Record<string, unknown>> };
     const entry = view(saved).entities.find((e) => e.prefab === OUTER)!;
     expect(entry.added).toHaveLength(1);
@@ -567,30 +585,9 @@ describe('a SECOND nested instance at a prefab row is independent, not the row i
     expect(getAllEntities().filter((e) => e.name === 'InnerRoot').map((e) => xOf(e.id))).toEqual([99]);
   });
 
-  // #1354 close-out review, F3's mirror — the other direction of the same disagreement. A stamped
-  // candidate the partition did NOT give the row to used to be written TWICE (an added[] node AND
-  // nestedOverrides for that row), and the nestedOverrides write clobbered the claimant's own
-  // override. Latent today (both duplicate seams clear the stamp), so the stamp is forced here.
-  // Mutation: same as above.
-  it('a same-stamp pair is written once each, and the source override is not clobbered', async () => {
-    await load(plain());
-    const src = idAt('Holder/OuterRoot/Panel/InnerRoot');
-    writeTraitFieldWithUndo(src, getTraitByName('Transform')!, 'x', 11);
-    const copy = duplicateEntity(src, () => {})!;
-    writeTraitFieldWithUndo(copy, getTraitByName('Transform')!, 'x', 77);
-    // Force the pre-#1354 state: both instances stamped with row 4.
-    const piMeta = getTraitByName('PrefabInstance')!;
-    const live = [...getCurrentWorld().entities].find((e) => e.id() === copy)!;
-    live.set(piMeta.trait, { ...(live.get(piMeta.trait) as object), parentLocalId: 4 });
-    const saved = await serializeScene() as unknown as { entities: Array<Record<string, unknown>> };
-    const entry = view(saved).entities.find((e) => e.prefab === OUTER)!;
-    expect(entry.added).toHaveLength(1);
-    // The row's overrides are the SOURCE's, not the copy's.
-    expect(JSON.stringify(entry.nestedOverrides)).toContain('11');
-    expect(JSON.stringify(entry.nestedOverrides)).not.toContain('77');
-    await load(saved as unknown as SceneData);
-    expect(getAllEntities().filter((e) => e.name === 'InnerRoot').map((e) => xOf(e.id)).sort((a, b) => a - b)).toEqual([11, 77]);
-  });
+  // (#1354 close-out review, F3's mirror — a forced same-stamp pair written once each by the capture's partition — was
+  // retired by #2001 S8b: the pair is reachable only with every record dropped, and a save with no record knows no
+  // override since the marks went, so the capture's no-record save it exercised goes with them.)
 
   // #1354 close-out review, F4 — with TWO rows of one source under one member and one UNSTAMPED
   // instance, the old unstamped pass claimed the first row in prefab-file ORDER and wrote the OTHER
@@ -598,7 +595,9 @@ describe('a SECOND nested instance at a prefab row is independent, not the row i
   // independent (a reference node), BOTH rows are gone from the live tree and say so, and what reloads
   // is exactly what was live — one instance, its own guid.
   // Mutation: restore a pass that lets an unstamped candidate claim a free row.
-  it('an unstamped instance beside two rows of its source reloads as itself, and no row dies by file order', async () => {
+  // A row's expansion unstamped by hand: no load or gesture makes one (every row expansion is stamped, pinned below), and
+  // its record states it as the row. The save refuses the tree rather than guess which it is (#2001 S8b).
+  it('an unstamped instance beside two rows of its source: a state no gesture makes, and the save refuses it', async () => {
     const outerTwo = { id: OUTER, rootLocalId: 1, entities: [
       row(1, 'OuterRoot', 0), row(2, 'Panel', 1), row(4, 'N1', 2, { prefab: INNER }), row(5, 'N2', 2, { prefab: INNER }),
     ] };
@@ -609,15 +608,8 @@ describe('a SECOND nested instance at a prefab row is independent, not the row i
     const piMeta = getTraitByName('PrefabInstance')!;
     const first = [...getCurrentWorld().entities].find((e) => e.id() === roots[0]!.id)!;
     first.set(piMeta.trait, { ...(first.get(piMeta.trait) as object), parentLocalId: 0 });
-    const keptGuid = guidOf(roots[0]!.id);
     deleteEntitiesWithUndo([roots[1]!.id]);
-    const saved = await serializeScene() as unknown as { entities: Array<Record<string, unknown>> };
-    const entry = view(saved).entities.find((e) => e.prefab === OUTER)!;
-    expect(entry.removed).toEqual([4, 5]);
-    expect(entry.added).toHaveLength(1);
-    await load(saved as unknown as SceneData);
-    expectUniqueGuids();
-    expect(getAllEntities().filter((e) => e.name === 'InnerRoot').map((e) => e.guid)).toEqual([keptGuid]);
+    await expectRefused(guidOf(roots[0]!.id));
   });
 });
 
@@ -682,21 +674,18 @@ describe('an unstamped nested instance is independent, never a row (#1367)', () 
   // as a reference node while its row ALSO still expands — two instances. Strict presence is what
   // prevents it, so this is the test for that half. Mutation: make `nestedRowPresent` lenient again
   // (return true whenever an unstamped candidate sits at the row's anchor).
-  it('an unstamped expansion of a row reloads as ONE instance, keeping its guid and its edits', async () => {
+  // The legacy state #1367's strict presence guarded, an unstamped expansion of a row, cannot be loaded or made (the
+  // premise above). Made by hand, its tree holds an instance no record states: the save refuses it, and nothing is
+  // written that a reload would expand twice.
+  it('an unstamped expansion of a row is an instance no record states: the save refuses it', async () => {
     const sc = scene([]) as unknown as { entities: Array<Record<string, unknown>> };
     sc.entities[1]!.added = undefined;
     await load(sc as unknown as SceneData);
     const [inner] = panelInners();
-    const guid = inner!.guid;
     const piMeta = getTraitByName('PrefabInstance')!;
     const live = [...getCurrentWorld().entities].find((e) => e.id() === inner!.id)!;
     live.set(piMeta.trait, { ...(live.get(piMeta.trait) as object), parentLocalId: 0 });
-    deleteEntitiesWithUndo([getAllEntities().find((e) => e.name === 'Leaf' && e.parentId === inner!.id)!.id]);
-    await load(await serializeScene() as unknown as SceneData);
-    const guids = getAllEntities().map((e) => e.guid).filter(Boolean);
-    expect(guids.length).toBe(new Set(guids).size);
-    expect(panelInners().map((e) => e.guid)).toEqual([guid]);
-    expect(getAllEntities().filter((e) => e.name === 'Leaf' && e.parentId === panelInners()[0]!.id)).toHaveLength(0);
+    await expectRefused(inner!.guid!);
   });
 });
 

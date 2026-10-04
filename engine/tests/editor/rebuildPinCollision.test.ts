@@ -21,7 +21,6 @@ import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -82,7 +81,7 @@ const sharedGuids = () => {
 };
 const targetOf = (name: string) => ((readTraitData(named(name)[0]!.id, getTraitByName('UIAction')!) as { bindings: { target: string }[] }).bindings)[0]!.target;
 
-beforeEach(() => { setRunMode('stopped'); clearHistory(); prefabs.clear(); clearKeptMemberOrphans(); });
+beforeEach(() => { setRunMode('stopped'); clearHistory(); prefabs.clear(); });
 afterAll(() => { setPrefabCache(P, null); getCurrentWorld()?.destroy(); });
 
 /** #1777: a rebuild pins the member guids it carried across its teardown, then derives the rest, as the load does. Here

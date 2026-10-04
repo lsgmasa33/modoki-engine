@@ -5,6 +5,7 @@
  *  subtracted), and re-instantiating with that map must reproduce the value. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { record, clearRecorded } from '../helpers/recordedView';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
@@ -44,7 +45,12 @@ function writeTraitFieldImpl(id: number, meta: any, field: string, value: unknow
   e.set(meta.trait, { ...e.get(meta.trait), [field]: value });
 }
 
-vi.mock('../../src/runtime/core/ecs/world', () => ({
+// The record's override list, stated by the test (a fake ECS has no record store): `../helpers/recordedView.ts`.
+vi.mock('../../src/editor/instance/instanceOverrideView', async (orig) =>
+  (await import('../helpers/recordedView')).withRecordedView(await orig()));
+beforeEach(() => clearRecorded());
+vi.mock('../../src/runtime/core/ecs/world', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),
@@ -52,7 +58,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   unregisterEntity: (e: any) => index.delete(e.id()),
   destroyEntity: (e: any) => { ((e: any) => index.delete(e.id()))(e); e.destroy(); },
 }));
-vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
   getAllEntities: () => getAllEntitiesImpl(),
   findEntity: (id: number) => index.get(id),
   markStructureDirty: vi.fn(),
@@ -96,8 +103,6 @@ vi.mock('../../src/editor/undo/undoManager', () => ({ clearHistory: vi.fn() }));
 
 beforeEach(async () => {
   testWorld = createWorld(); index.clear(); guidN = 0;
-  const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
-  clearAllOverrideMarks();
 });
 
 const A = 'eeeeeeee-0000-4000-8000-0000000000aa';
@@ -128,17 +133,31 @@ function aRoot(): number {
   return id;
 }
 
+/** The instance as the editor's drop makes it (#2001 S8b): a durable root guid, and its record (`place`). A bare spawn holds
+ *  no record, and the save refuses a tree with none. */
+async function placed(root: number, setPrefabSource: (id: number, src: { id: string }) => void): Promise<number> {
+  setPrefabSource(root, { id: D });
+  const { ensureGuid } = await import('../../src/editor/undo/entityRef');
+  const { place } = await import('../../src/editor/instance/instanceEdits');
+  ensureGuid(root); place(root);
+  return root;
+}
+/** A scene edit of A's x, as the field-edit door records it on the record (`setFields`) and the view reads it. */
+async function edit(a: number, x: number): Promise<void> {
+  const { setFields } = await import('../../src/editor/instance/instanceEdits');
+  writeTraitFieldImpl(a, TRAITS[0], 'x', x); record(index.get(a), 'Transform', 'x'); setFields(a, 'Transform', ['x']);
+}
+
 describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
   it('writes the deep edit as a path-keyed row on the top instance', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const { serializeScene } = await import('../../src/editor/scene/serialize');
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     setPrefabCache(A, aPrefab as any); setPrefabCache(B, makeB() as any); setPrefabCache(D, dPrefab as any);
 
-    const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, { id: D });
+    await placed(instantiatePrefab(dPrefab as any), setPrefabSource);
     // Scene edit on A (two levels deep): x = 7.
     const a = aRoot();
-    writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(index.get(a), 'Transform', 'x');
+    await edit(a, 7);
 
     const scene = await serializeScene();
     const top = scene.entities.find((e) => e.prefab === D)!;
@@ -153,14 +172,13 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
   it('stores only the scene DELTA — fields the prefab chain already provides are subtracted', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const { serializeScene } = await import('../../src/editor/scene/serialize');
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     // B overrides A.y = 5 (middle layer). Scene will edit only A.x.
     setPrefabCache(A, aPrefab as any); setPrefabCache(B, makeB({ 1: { Transform: { y: 5 } } }) as any); setPrefabCache(D, dPrefab as any);
 
-    const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, { id: D });
+    await placed(instantiatePrefab(dPrefab as any), setPrefabSource);
     const a = aRoot();
     expect((index.get(a)!.get(Transform) as any).y).toBe(5); // B's override is live on A
-    writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(index.get(a), 'Transform', 'x');
+    await edit(a, 7);
 
     const scene = await serializeScene();
     const top = scene.entities.find((e) => e.prefab === D)!;
@@ -172,12 +190,11 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
   it('round-trips: re-instantiating with the serialized rows reproduces the value', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const { serializeScene } = await import('../../src/editor/scene/serialize');
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     setPrefabCache(A, aPrefab as any); setPrefabCache(B, makeB() as any); setPrefabCache(D, dPrefab as any);
 
-    const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, { id: D });
+    await placed(instantiatePrefab(dPrefab as any), setPrefabSource);
     const a = aRoot();
-    writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(index.get(a), 'Transform', 'x');
+    await edit(a, 7);
     const scene = await serializeScene();
     const members = scene.entities.find((e) => e.prefab === D)!.members;
 

@@ -54,7 +54,7 @@ function applyAsLoad(rootId: number, overrides: Record<number, Record<string, Re
     const data = d as { rootInstanceId?: number; localId?: number };
     if (data.rootInstanceId === rootId && data.localId) localToEcs.set(data.localId, e.id());
   });
-  applyOverridesByLocalToEcs(getCurrentWorld(), localToEcs, overrides, overrides);
+  applyOverridesByLocalToEcs(getCurrentWorld(), localToEcs, overrides);
 }
 
 const BANK = '[{"name":"skin","clip":"f1cc3b85-2c23-457b-938a-3470ada21b36"}]';

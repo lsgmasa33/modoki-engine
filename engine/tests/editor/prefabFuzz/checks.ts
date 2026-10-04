@@ -4,7 +4,9 @@
  *  Each check has a stable id. A failure's SIGNATURE is its id plus a detail class with the run's guids and numbers
  *  stripped, so the shrinker only keeps a smaller list that fails the SAME way, never one that slides onto another bug. */
 
-import { parseTemplateLists } from '../../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
+import { parseReferenceNode, parseTemplateLists } from '../../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
+import { editorPrefabReader } from '../../../packages/modoki/src/editor/instance/instanceSync';
+import { INSTANCE_MODEL_SCENE_VERSION } from '../../../packages/modoki/src/runtime/core/version';
 import { LEGACY_ROW_CHANNELS } from '../../../packages/modoki/src/runtime/prefab/templateFormDocument';
 import { getAllEntities } from '@modoki/engine/runtime';
 import { isRuntimeGuid } from '../../../packages/modoki/src/runtime/core/assetRefRules';
@@ -256,10 +258,34 @@ export function checkMarks(view: ReadonlyMap<string, string>, marks: MarkHistory
   return out;
 }
 
-/** The serialized scene passes the scene validator (schema, refs, member rows). */
+/** The serialized scene passes the scene validator (schema, refs, member rows), and states every scene-owned reference
+ *  node in the current form (#2001 S8b, docs/prefabs.md's format rule): its list on `members` rows, never the old
+ *  capture's channels — live or held (`withWrittenList`). The one old channel allowed is one the record HOLDS verbatim
+ *  because its target cannot be named (the format rule's exception, `held.pendingLegacy`: a nested prefab it runs
+ *  through is missing): the node's parse holds that channel whole, exactly as written. */
 export function checkScene(scene: unknown): Failure[] {
   const r = validateSceneData(scene, buildSceneSchema(), (ref) => getCachedPrefabSync(ref) ?? undefined);
-  return r.warnings.map((w) => ({ check: 'scene validator', detail: w }));
+  const out: Failure[] = r.warnings.map((w) => ({ check: 'scene validator', detail: w }));
+  const OLD = ['overrides', 'removed', 'removedTraits', 'moved', 'nestedOverrides', 'nestedStructure'];
+  const isBag = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+  const node = (n: unknown, at: string): void => {
+    if (!isBag(n)) return;
+    let old = typeof n.prefab === 'string' ? OLD.filter((k) => n[k] !== undefined) : [];
+    if (old.length) {
+      const held = parseReferenceNode(n as never, editorPrefabReader, { sceneVersion: INSTANCE_MODEL_SCENE_VERSION }).record.held.pendingLegacy as Record<string, unknown> | undefined;
+      old = old.filter((k) => JSON.stringify(held?.[k]) !== JSON.stringify(n[k]));
+    }
+    if (old.length) out.push({ check: 'a scene-owned reference node is written in an old form', detail: `${at} ${String(n.guid ?? '')}: ${old.join(', ')}` });
+    if (Array.isArray(n.children)) for (const c of n.children) node(c, at);
+    rows(n.members, `${at} ${String(n.guid ?? '')}`);
+  };
+  const rows = (members: unknown, at: string): void => {
+    if (!isBag(members)) return;
+    for (const [k, row] of Object.entries(members)) if (isBag(row) && Array.isArray(row.own)) for (const n of row.own) node(n, `${at}${k}`);
+  };
+  const entities = isBag(scene) && Array.isArray(scene.entities) ? scene.entities : [];
+  for (const e of entities) if (isBag(e)) rows(e.members, String(e.guid ?? ''));
+  return out;
 }
 
 // ── Identities ──────────────────────────────────────────────────────────────────────────────────────────────────

@@ -17,11 +17,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
 import {
-  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, spawnEntity, EntityAttributes, Transform,
+  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, spawnEntity, EntityAttributes, Transform, deriveInstanceMemberGuids,
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
 import { setRunMode } from '../../packages/modoki/src/runtime/core/playState';
-import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import {
   setPrefabCache, setPrefabSource, getCachedPrefabSync,
@@ -31,7 +31,7 @@ import { framesBuiltFromOtherRows } from '../../packages/modoki/src/editor/scene
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import {
-  detachPrefabInstance, reattachDetachedInstance, reattachPrefabInstance, tagEntityTreeAsInstance,
+  detachPrefabInstance, reattachPrefabInstance, tagEntityTreeAsInstance,
   untagEntityTreeAsInstance, unstampMemberGuids,
 } from '../../packages/modoki/src/editor/scene/prefabLink';
 import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/revertPrefabUndo';
@@ -40,7 +40,9 @@ import { ensureGuid } from '../../packages/modoki/src/editor/undo/entityRef';
 import { nestedFrameMoves } from '../../packages/modoki/src/editor/scene/prefabChain';
 import { undo, redo, canRedo, swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { freshInstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { storedRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { place, setFields } from '../../packages/modoki/src/editor/instance/instanceEdits';
+import { instanceKeyMap } from '../../packages/modoki/src/editor/instance/instanceKeys';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -77,7 +79,8 @@ const xOf = (id: number) => (entity(id).get(Transform) as { x: number }).x;
 const overrideX = (root: number, name: string, x: number) => {
   const e = entity(member(root, name));
   e.set(Transform, { ...(e.get(Transform) as object), x });
-  markOverride(e, 'Transform', 'x');
+  setFields(e.id(), 'Transform', ['x']);
+  setFields(e.id(), 'Transform', ['x']); // through the door, as the Inspector's write goes (#2001 S8b)
 };
 /** What a save of the instance would record against the editor's copy of its prefab. */
 const removedOnSave = (source: string) => captureInstanceStructure(rootOf(source), getCachedPrefabSync(source)!).removed;
@@ -91,11 +94,27 @@ beforeEach(() => {
   prev?.destroy();
 });
 
+/** A Ship instance placed as a drop places it (#2001 S8b): a root guid, its members' derived guids, and the door's record
+ *  (`place`). A Detach refuses a tree whose records cannot be had, and a raw spawn has none. */
+const placedShip = () => {
+  const root = instantiatePrefab(shipV1());
+  setPrefabSource(root, { id: SHIP });
+  return seated(root);
+};
+/** {@link placedShip}'s placement, for a root spawned from another document. */
+function seated(root: number): number {
+  ensureGuid(root);
+  deriveInstanceMemberGuids(getCurrentWorld());
+  place(root);
+  return root;
+}
+
 /** A Ship instance with Flame overridden to x=5, then that override reverted (x back to 0). */
 async function revertedShip() {
   setPrefabCache(SHIP, shipV1());
   const root = instantiatePrefab(shipV1());
   setPrefabSource(root, { id: SHIP });
+  seated(root);
   overrideX(root, 'Flame', 5);
   const flameKey = `${piOf(member(root, 'Flame'))!.localId}.Transform.x`;
   const result = await quietly(() => revertOverridesWithUndo(root, new Set([flameKey])));
@@ -158,6 +177,7 @@ describe('Revert undo/redo after the template changed (#1665)', () => {
     setPrefabCache(SHIP, doc(SHIP, 'Ship', [row(1, G(1), 'Ship', 0), row(2, G(2), 'Flame', 1), row(3, G(4), 'Mid', 1, { prefab: MID })]));
     const root = instantiatePrefab(getCachedPrefabSync(SHIP)!);
     setPrefabSource(root, { id: SHIP });
+    seated(root);
     overrideX(root, 'Flame', 5);
     const flameKey = `${piOf(member(root, 'Flame'))!.localId}.Transform.x`;
     expect(await quietly(() => revertOverridesWithUndo(root, new Set([flameKey])))).not.toBeNull();
@@ -185,12 +205,11 @@ describe('Revert undo/redo after the template changed (#1665)', () => {
 describe('Detach undo after the template changed (#1665 sibling)', () => {
   it('the reattached instance is brought onto the current template — nothing is saved as removed', async () => {
     setPrefabCache(SHIP, shipV1());
-    const root = instantiatePrefab(shipV1());
-    setPrefabSource(root, { id: SHIP });
-    const snapshot = detachPrefabInstance(root);
+    const root = placedShip();
+    detachPrefabInstanceWithUndo(root, 'Detach prefab "Ship"', '[test]');
     await templateChangesDetached(shipV2());
 
-    expect(await quietly(() => reattachDetachedInstance(snapshot))).toBe(0);
+    await quietly(() => undo());
     const live = rootOf(SHIP);
     expect(member(live, 'Extra')).not.toBe(0);
     expect(removedOnSave(SHIP)).toEqual([]);
@@ -218,6 +237,7 @@ describe('the review cases (#1665 close-out)', () => {
     setPrefabCache(SHIP, ship(false));
     const root = instantiatePrefab(getCachedPrefabSync(SHIP)!);
     setPrefabSource(root, { id: SHIP });
+    seated(root);
     overrideX(root, 'Flame', 5);
     expect(await quietly(() => revertOverridesWithUndo(root, new Set([`${piOf(member(root, 'Flame'))!.localId}.Transform.x`])))).not.toBeNull();
     await templateChanges(ship(true));
@@ -235,11 +255,17 @@ describe('the review cases (#1665 close-out)', () => {
     setPrefabCache(SHIP, doc(SHIP, 'Ship', [row(1, G(1), 'Ship', 0), row(2, G(2), 'Flame', 1), row(3, G(4), 'Mid', 1, { prefab: MID })]));
     const root = instantiatePrefab(getCachedPrefabSync(SHIP)!);
     setPrefabSource(root, { id: SHIP });
+    seated(root);
     const flame = member(root, 'Flame');
     const box = getAllEntities().find((e) => e.name === 'Box')!.id;
     // A move is recorded against the new parent's guid (`InstanceStructure.moved`), so both carry one.
     ensureGuid(flame); ensureGuid(box);
     entity(box).set(EntityAttributes, { ...(entity(box).get(EntityAttributes) as object), parentId: flame });
+    // No gesture writes a member move (U7): it is an older file's, and its record states it as the load parses one, a
+    // `parent` on the member's row (#2001 S8b — the re-seed that read it off the raw move is gone).
+    const rec = storedRecord(getCurrentWorld(), entity(root).get(EntityAttributes)!.guid)!;
+    const boxKey = instanceKeyMap(root).get(box)!;
+    rec.list.rows.set(boxKey, { ...(rec.list.rows.get(boxKey) ?? {}), parent: entity(flame).get(EntityAttributes)!.guid });
     const moves = nestedFrameMoves(root);
     expect(moves.map((m) => m.key)).toEqual(['~moved.3:2']); // precondition: the move is offered to the outer instance
 
@@ -266,19 +292,18 @@ describe('the review cases (#1665 close-out)', () => {
 
     await quietly(() => undo());
     expect(xOf(member(rootOf(SHIP), 'Flame'))).toBe(0); // its target is not in this template
-    const rec = freshInstanceRecord(getCurrentWorld(), ensureGuid(rootOf(SHIP)))!;
+    const rec = storedRecord(getCurrentWorld(), ensureGuid(rootOf(SHIP)))!;
     expect(rec.list.rows.get(`/${G(2)}`)?.traits?.Transform).toEqual({ x: 5 }); // kept, not lost
 
     // The template back: the rebase reprojects the tree from its record (#2046 S7.3), so the kept override applies again.
     await templateChanges(shipV1());
     expect(xOf(member(rootOf(SHIP), 'Flame'))).toBe(5);
-    expect(freshInstanceRecord(getCurrentWorld(), ensureGuid(rootOf(SHIP)))?.list.rows.get(`/${G(2)}`)?.traits?.Transform).toEqual({ x: 5 });
+    expect(storedRecord(getCurrentWorld(), ensureGuid(rootOf(SHIP)))?.list.rows.get(`/${G(2)}`)?.traits?.Transform).toEqual({ x: 5 });
   });
 
   it('Detach undo after the scene was RELOADED plain (the production route): brought onto the current template', async () => {
     setPrefabCache(SHIP, shipV1());
-    const root = instantiatePrefab(shipV1());
-    setPrefabSource(root, { id: SHIP });
+    const root = placedShip();
     detachPrefabInstanceWithUndo(root, 'Detach prefab "Ship"', '[test]');
     // The reload: the same plain entities, guids and parents, in a fresh world that recorded nothing.
     const plain = getAllEntities().map((e) => ({ id: e.id, name: e.name, parentId: e.parentId, guid: e.guid! }));
@@ -299,8 +324,7 @@ describe('the review cases (#1665 close-out)', () => {
 
   it('Detach undo → redo → undo: the member the first undo brought in is linked again, not left plain', async () => {
     setPrefabCache(SHIP, shipV1());
-    const root = instantiatePrefab(shipV1());
-    setPrefabSource(root, { id: SHIP });
+    const root = placedShip();
     detachPrefabInstanceWithUndo(root, 'Detach prefab "Ship"', '[test]');
     await templateChangesDetached(shipV2());
     await quietly(() => undo());
@@ -319,6 +343,7 @@ describe('the review cases (#1665 close-out)', () => {
     setPrefabCache(SHIP, shipV1());
     const root = instantiatePrefab(shipV1());
     setPrefabSource(root, { id: SHIP });
+    seated(root);
     const antenna = spawnEntity(getCurrentWorld(), EntityAttributes({ name: 'Antenna', parentId: root, guid: 'eeeeeeee-0000-4000-8000-000000011665' }), Transform({ x: 0, y: 0, z: 0 })).id();
     // Create Prefab → Replace Ship with this tree, the way assetOps does it: prior links snapshotted unstripped, the
     // new document cached, the tree retagged against it.

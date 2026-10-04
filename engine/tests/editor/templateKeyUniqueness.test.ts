@@ -40,7 +40,7 @@ import {
 import { setActionCallback, pushAction, clearHistory } from '@modoki/engine/editor';
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
-import { snapshotEntity, copySnapshot, respawnFromSnapshot, type EntitySnapshot } from '../../packages/modoki/src/editor/undo/entityActions';
+import { snapshotEntity, copySnapshot, respawnFromSnapshot, reparentEntity, type EntitySnapshot } from '../../packages/modoki/src/editor/undo/entityActions';
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { detachPrefabInstance } from '../../packages/modoki/src/editor/scene/prefabLink';
@@ -53,6 +53,9 @@ import { validatePrefabData } from '../../packages/modoki/src/runtime/loaders/sc
 import { memberPathRecords } from '../../packages/modoki/src/runtime/loaders/memberPaths';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { place } from '../../packages/modoki/src/editor/instance/instanceEdits';
+import { deriveInstanceMemberGuids } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { ensureGuid } from '../../packages/modoki/src/editor/undo/entityRef';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -130,11 +133,6 @@ const named = (name: string, root: string) => {
 };
 const rootId = (guid: string) => getAllEntities().find((e) => e.guid === guid)!.id;
 const handleOf = (id: number) => [...getCurrentWorld().entities].find((e) => e.id() === id)!;
-const setParent = (id: number, parentId: number) => {
-  const ea = getTraitByName('EntityAttributes')!;
-  const e = handleOf(id);
-  e.set(ea.trait, { ...(e.get(ea.trait) as object), parentId });
-};
 const find = (s: EntitySnapshot, name: string): EntitySnapshot | undefined => {
   const ea = s.traits.find((t) => t.meta.name === 'EntityAttributes')?.data as { name?: string } | undefined;
   if (ea?.name === name) return s;
@@ -308,7 +306,7 @@ describe('a promotion does not carry a key its target document already declares'
     detachPrefabInstance(rootId(ROOT));
     expect(templateKeyOf(handleOf(detached))).toBe(''); // #1874: the Detach strips it…
     setTemplateKey(handleOf(detached), KX); // …so the stale marker is planted
-    setParent(detached, named('SA', ROOT2).id);
+    expect(reparentEntity(detached, named('SA', ROOT2).id)).toBe(true); // through the door: the record links it
     const keys = collectInstanceOverrideKeys(named('SR', ROOT2).id, getCachedPrefabSync(S) as PrefabFile).added;
     expect(keys).toHaveLength(1); // premise: listed as an added node of the nested S instance
     const res = await applyToPrefabSelective(named('SR', ROOT2).id, new Set(keys), { perKey: { [keys[0]!]: O } });
@@ -339,7 +337,7 @@ describe('a promotion does not carry a key its target document already declares'
     const extras = [named('Extra', ROOT).id, named('Extra', ROOT2).id];
     detachPrefabInstance(rootId(ROOT));
     detachPrefabInstance(rootId(ROOT2));
-    for (const id of extras) setParent(id, named('SA', ROOT4).id);
+    for (const id of extras) expect(reparentEntity(id, named('SA', ROOT4).id)).toBe(true);
     const keys = collectInstanceOverrideKeys(named('SR', ROOT4).id, getCachedPrefabSync(S) as PrefabFile).added;
     expect(keys).toHaveLength(2); // premise
     await applyToPrefabSelective(named('SR', ROOT4).id, new Set(keys), { perKey: Object.fromEntries(keys.map((k) => [k, T])) });
@@ -364,6 +362,7 @@ describe('the derive does not climb past an unmarked node; the heal does (close-
     for (let i = 0; i < 2; i++) {
       const d = instantiatePrefab(getCachedPrefabSync(O) as PrefabFile, at);
       setPrefabSource(d, { id: O });
+      ensureGuid(d); deriveInstanceMemberGuids(getCurrentWorld()); place(d); // placed as a drop places it (#2001 S8b)
       detachPrefabInstance(d);
     }
     const extras = getAllEntities().filter((e) => e.name === 'Extra');

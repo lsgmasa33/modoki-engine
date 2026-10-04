@@ -26,12 +26,12 @@ import {
   getCurrentWorld, setCurrentWorld, getTraitByName, setRunMode, loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { clearKeptMemberOrphans, keptMemberOrphans, type SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { type SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import type { PrefabDoc, PrefabReader } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 import { memberIdentities } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { memberToken } from '../../packages/modoki/src/runtime/core/templateRefs';
 import { parseSteps } from '../../packages/modoki/src/runtime/core/assetRefRules';
-import { checkInstance, seen } from './foldOracle';
+import { checkInstance, seen, unusedLeaf } from './foldOracle';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { deleteEntitiesWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -73,7 +73,6 @@ async function load(data: SceneData): Promise<void> {
   const prev = getCurrentWorld();
   setCurrentWorld(createWorld());
   prev?.destroy();
-  clearKeptMemberOrphans();
   const eaMeta = getTraitByName('EntityAttributes')!;
   await loadSceneFile(JSON.parse(JSON.stringify(data)) as SceneData, {
     loadModels: false,
@@ -245,15 +244,19 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
 
     // A keyed node is a COPY only where it pairs with a template node anchored at the row's member (`pinAdded`). This test
     // stated an UNPAIRED one (P adds no k1) and expected the cut to take it, which is the parse's user node lost (#2041).
-    it('the cut takes the row\'s other records and a keyed copy, as before: only the user\'s links are kept', async () => {
+    // Under the records (#2001 S8b: every load records), every record under the cut is UNUSED and kept in the list
+    // untouched (plan § Rule 7 / M6) — the row's value and the keyed copy's row (its pin with it) — where the capture's
+    // save dropped both. The user's link is kept too.
+    it('the cut keeps the row\'s other records and a keyed copy\'s row as unused, and the user\'s links', async () => {
       const k1 = { parentLocalId: 2, guid: '', key: 'k1', name: 'K1', traits: { EntityAttributes: { name: 'K1' }, Transform: tf }, children: [] };
       install({ ...P, entities: [...P.entities.slice(0, 2), row(5, 'R', 1, { prefab: 'Q', added: [k1] })] }, Q);
       const keyed = { ...mine(2), guid: G(91), key: 'k1', name: 'K1' };
       const { lines, saved } = await loadSave({ version: 15, entities: [top({ members: cut({ [QA]: { traits: { Transform: { x: 4 } }, added: [keyed, mine(2)] } }) })] });
       expect(lines).toEqual([]);
       // Scene v20 (#2001 S6): the user's link is `own` on the cut row (appended, never a list that replaces).
-      expect(rowsOf(saved)[QA]).toEqual({ own: [expect.objectContaining({ guid: MINE })] });
-      expect(JSON.stringify(saved)).not.toContain(G(91));
+      expect(rowsOf(saved)[R]).toEqual({ removed: true });
+      expect(rowsOf(saved)[QA]).toEqual({ traits: { Transform: { x: 4 } }, own: [expect.objectContaining({ guid: MINE })] });
+      expect(rowsOf(saved)[`${R}/a+k1`]).toMatchObject({ guid: G(91) });
     });
 
     // …and a keyed node no template node pairs with is the user's (`pinAdded` links it `own` at the row): kept, in `own`,
@@ -282,7 +285,6 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       expect(first.lines).toEqual([]);
       expect(JSON.stringify(first.saved)).toContain(KID);
       await loadSave(first.saved);
-      expect(keptMemberOrphans(ROOT) ?? {}).toEqual({});
       const kidEntity = [...getCurrentWorld().entities].find((x) => (x.get(ea()) as { guid?: string } | undefined)?.guid === KID)!;
       deleteEntitiesWithUndo([kidEntity.id()]);
       const s1 = await save();
@@ -379,10 +381,8 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
             try {
               const first = await loadSave({ version: 15, entities: [top({ members: { [ALIAS]: alias } })] });
               expect(first.lines).toEqual([]);
-              expect(keptMemberOrphans(ROOT) ?? {}).toEqual({});
               await loadSave(first.saved);
               expect(live()).toHaveLength(1);
-              expect(keptMemberOrphans(ROOT) ?? {}).toEqual({});
               deleteEntitiesWithUndo([live()[0]!.id()]);
               const s1 = await save();
               expect(JSON.stringify(s1)).not.toContain(KID);
@@ -420,16 +420,18 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
           ['a reference copy\'s keyless added, at a member', () => install(withK1('S'), Q, S), { added: [{ ...k1('S'), added: [node(97, { parentLocalId: 2 })] }] }, { 97: `${NODE}${SA}` }],
           ['a reference copy\'s keyless added, at its root', () => install(withK1('S'), Q, S), { added: [{ ...k1('S'), added: [node(98, { parentLocalId: 1 })] }] }, { 98: NODE }],
         ];
-        // A copy's user node lifted onto a row the scene ALSO states: both lists kept, each node once.
+        // A copy's user node lifted onto a row the scene ALSO states: both lists kept, each node once. The copy's own values
+        // on its node row are unused under the cut and kept (#2001 S8b, plan § Rule 7 / M6).
         it('a lifted node lands beside the node row the scene states, each kept once', async () => {
           install(withK1(), Q, S);
           const first = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [NODE]: { own: [node(99)] }, [QA]: { added: [{ ...k1(), children: [kid] }] } } })] });
           expect(first.lines).toEqual([]);
           // In sibling order (both at sortOrder 0, so by guid): the writer's order, not the order the links were made in.
-          expect(rowsOf(first.saved)[NODE]).toEqual({ own: [expect.objectContaining({ guid: KID }), expect.objectContaining({ guid: G(99) })] });
+          expect(rowsOf(first.saved)[NODE]).toEqual({ traits: { EntityAttributes: { name: 'K1' }, Transform: tf }, own: [expect.objectContaining({ guid: KID }), expect.objectContaining({ guid: G(99) })] });
           expect(rowsOf((await loadSave(first.saved)).saved)).toEqual(rowsOf(first.saved));
         });
         // …and a guid the stated row holds in EITHER list is not lifted again (the #2041 review: one list at a time wrote it twice).
+        // Mutation: drop the guid check in the parse's `ListBuilder.own` — Kid is linked twice on the record's row.
         it('a lifted node the stated node row already holds, in its other list, is kept once', async () => {
           install(withK1(), Q, S);
           const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -497,7 +499,6 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
         expect(first.lines).toEqual([]);
         expect(JSON.stringify(first.saved)).toContain(KID);
         await loadSave(first.saved);
-        expect(keptMemberOrphans(ROOT) ?? {}).toEqual({});
         const kidEntity = [...getCurrentWorld().entities].find((x) => (x.get(ea()) as { guid?: string } | undefined)?.guid === KID)!;
         deleteEntitiesWithUndo([kidEntity.id()]);
         const s1 = await save();
@@ -578,6 +579,11 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       const parsed = parseInstanceRecord(e, reader, opts);
       return { parsed, f: foldInstance(reader, parsed.record) };
     };
+    /** The fold's unused records for `e`, as the oracle printed them before #2001 S8b retired its kept comparison: the
+     *  rules report each one (unused, with its cause), where today's load kept or dropped it. */
+    // A record the parse HOLDS (`held.pendingLegacy`) is one `legacy` part, at the row the fold keys it by: the old oracle
+    // read it in the stores' leaf vocabulary instead (`parent`, `own`, `-Light`). Each test asserts the held content too.
+    const unusedLines = async (e: SceneEntityEntry) => (await fold(e)).f.unused.map((u) => `${u.key} ${unusedLeaf(u)} (${u.cause})`);
 
     it('1, a ruled visible FIX: a move into a row a later removal deletes is refused, and the member stays (#2028: the load delivers it)', async () => {
       install(P([row(5, 'E', 1)]));
@@ -588,8 +594,9 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
 
     it('2: a plain row under a removed missing-prefab row goes with it, in either form (no dangling parent)', async () => {
       install(P([row(5, 'R', 1, { prefab: 'M-missing' }), row(6, 'X', 5)]));
-      // Today books the row\'s removal twice, kept AND applied (#2013, ruled today-wrong): the oracle marks it applied.
-      expect(await check(...same({ members: { [`/${g(5, 'R')}`]: { removed: true } } }))).toEqual([`kept-only unused /${g(5, 'R')} removed (applied)`]);
+      // Today booked the row\'s removal twice, kept AND applied (#2013, ruled today-wrong); the load keeps nothing beside
+      // the record now (#2001 S8b), and the record's removal is applied.
+      expect(await check(...same({ members: { [`/${g(5, 'R')}`]: { removed: true } } }))).toEqual([]);
       expect(await check(...same({ removed: [5] }))).toEqual([]);
     });
 
@@ -597,7 +604,8 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       install(P());
       expect(await check(...same({ members: { '/': { parent: SCENE } } }))).toEqual([]);
       // The legacy form: today drops it (lost on save); the rules report it ("never neither").
-      expect(await check(...same({ moved: { 1: SCENE } }))).toEqual(['fold-only unused / parent (gone)']);
+      expect(await check(...same({ moved: { 1: SCENE } }))).toEqual([]);
+      expect(await unusedLines(same({ moved: { 1: SCENE } })[1])).toEqual(['/ parent (gone)']);
     });
 
     it('4: under the instance\'s own removal, a template-keyed node\'s ignored parent is inert — kept, not unused', async () => {
@@ -618,7 +626,8 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       install(P());
       const e = top({ members: { [`/${g(3, 'B')}`]: { parent: '@member:4' } } });
       // Today keeps the row and ignores it; the rules report the record (unused, gone).
-      expect(await check([e], e)).toEqual([`fold-only unused /${g(3, 'B')} parent (gone)`]);
+      expect(await check([e], e)).toEqual([]);
+      expect(await unusedLines(e)).toEqual([`/${g(3, 'B')} legacy (gone)`]);
       const { parsed, f } = await fold(e);
       expect(f.nodes.get(`/${g(3, 'B')}` as never)?.parent).toEqual({ key: `/${g(2, 'A')}` });
       expect(parsed.record.held.pendingLegacy).toEqual({ members: { [`/${g(3, 'B')}`]: { parent: '@member:4' } } });
@@ -628,10 +637,12 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
     it('5 (review): the held token is still the member\'s ONE move — it replaces a lower one, and a legacy move of the same row', async () => {
       install(P([], { '2.3': '@member:4' }));
       const e = top({ members: { [`/${g(3, 'B')}`]: { parent: '@member:99' } } });
-      expect(await check([e], e)).toEqual([`fold-only unused /${g(3, 'B')} parent (gone)`]);
+      expect(await check([e], e)).toEqual([]);
+      expect(await unusedLines(e)).toEqual([`/${g(3, 'B')} legacy (gone)`]);
       install(P());
       const e2 = top({ moved: { 3: G(81) }, members: { [`/${g(4, 'C')}`]: { guid: G(81) }, [`/${g(3, 'B')}`]: { parent: '@member:99' } } });
-      expect(await check([e2], e2)).toEqual([`fold-only unused /${g(3, 'B')} parent (gone)`]);
+      expect(await check([e2], e2)).toEqual([]);
+      expect(await unusedLines(e2)).toEqual([`/${g(3, 'B')} legacy (gone)`]);
       expect((await fold(e2)).parsed.record.list.rows.get(`/${g(3, 'B')}` as never)?.parent).toBeUndefined();
     });
 
@@ -649,7 +660,8 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       const e = top({ members: { [`/${g(5, 'R')}/${g(2, 'QA')}`]: { added: [copy] } } });
       // Today applies the copy's x=7 and ignores the token: so does the fold. The token is kept as an unnameable remainder,
       // reported as a held copy whose node shows is — waiting, never removable (close-out review round 2).
-      expect(await check([e], e)).toEqual([`fold-only unused /${g(5, 'R')}/${g(2, 'QA')} own (unresolved)`]);
+      expect(await check([e], e)).toEqual([]);
+      expect(await unusedLines(e)).toEqual([`/${g(5, 'R')}/a+k1 legacy (unresolved)`]);
       const { parsed, f } = await fold(e);
       expect(parsed.record.held.pendingLegacy).toEqual({ members: { [`/${g(5, 'R')}/${g(2, 'QA')}`]: { added: [{ ...copy, traits: {}, children: [], members: { [`/${g(3, 'Q2B')}`]: { parent: '@member:2' } } }], heldRemainder: true } } });
       expect(f.unused.length).toBe(1);
@@ -749,7 +761,8 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       install(P([row(5, 'R', 1, { prefab: 'Q', added: [{ parentLocalId: 2, guid: '', key: 'k2', name: 'K2', traits: lightTf, children: [] }] })]), Q);
       const e = top({ members: { [`/${g(5, 'R')}/a+k2`]: { removedTraits: ['Light'] } } });
       // Today keeps Light (and its next save drops the row); the fold keeps Light and reports the held row.
-      expect(await check([e], e)).toEqual([`fold-only unused /${g(5, 'R')}/a+k2 -Light (gone)`]);
+      expect(await check([e], e)).toEqual([]);
+      expect(await unusedLines(e)).toEqual([`/${g(5, 'R')}/a+k2 legacy (gone)`]);
       const { parsed, f } = await fold(e);
       expect(parsed.warnings.some((w) => w.code === 'pendingLegacy' && w.key === `/${g(5, 'R')}/a+k2`)).toBe(true);
       expect(f.nodes.get(`/${g(5, 'R')}/a+k2` as never)?.traits.Light).toBeDefined();

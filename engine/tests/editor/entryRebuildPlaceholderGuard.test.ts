@@ -69,7 +69,7 @@ describe("an entry's no-op rebuild leaves a placeholder inside it a placeholder,
     await settle();
     const placeholders = () => authored().filter((e) => isUnder(e.id, h1().id) && unresolvedRefOf(findEntity(e.id) as never)?.source === f.prefabs.P.guid);
     expect(placeholders(), 'premise: the node under H1 reloads as a placeholder of P').toHaveLength(1);
-    pasteEntityCopy(clip!.snapshot, h1().id, () => {});
+    pasteEntityCopy(clip!, h1().id, () => {});
     await settle();
     const live = rootsOf(f.prefabs.P.guid).filter((e) => isUnder(e.id, h1().id));
     expect(live, 'premise: the paste is a live P frame').toHaveLength(1);

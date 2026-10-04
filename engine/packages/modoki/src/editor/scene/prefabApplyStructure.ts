@@ -66,9 +66,9 @@ export function insertAddedSubtree(
     let recaptured: { added?: AddedEntity[]; nestedStructure?: NestedStructurePaths; members?: Record<string, SceneMemberRow> } | undefined;
     if (liveChild) {
       const ref = captureInstanceReference(liveEcs, node.prefab, liveChild, { template: true, readOnly: tokens?.readOnly });
-      // The node is a SCENE root, and what R2 kept for it (orphan member rows, legacy channels no frame reaches) is Unity's
-      // unused overrides, which travel into the template with it: baked as Create Prefab bakes them (#1802, owner ruling D).
-      // Their identity stays in the scene: `settleSwallowedKeptState`, after the Apply's refresh.
+      // The node is a SCENE root, and what its record holds beyond its tree (orphan member rows, legacy channels no frame
+      // reaches) is Unity's unused overrides, which travel into the template with it: baked as Create Prefab bakes them
+      // (#1802, owner ruling D), read from the record (`keptFromRecord`), the scene identity taken out (`templateRowOf`).
       const rc = withKeptStateBake(true, () => captureRowChannels(liveEcs, node.prefab!, liveChild, ref, false, !!tokens?.readOnly));
       recaptured = { added: ref.added, nestedStructure: rc.nestedStructure, members: rc.members };
     }

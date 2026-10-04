@@ -12,6 +12,7 @@
  *  deep-nest override path and the async undo stack compose correctly. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { record, forget, clearRecorded } from '../helpers/recordedView';
 import { setRunMode } from '../../src/runtime/core/playState';
 import { createWorld, trait } from 'koota';
 
@@ -52,7 +53,11 @@ function writeTraitFieldImpl(id: number, meta: any, field: string, value: unknow
   e.set(meta.trait, { ...e.get(meta.trait), [field]: value });
 }
 
-vi.mock('../../src/runtime/core/ecs/world', () => ({
+// The record's override list, stated by the test (a fake ECS has no record store): `../helpers/recordedView.ts`.
+vi.mock('../../src/editor/instance/instanceOverrideView', async (orig) =>
+  (await import('../helpers/recordedView')).withRecordedView(await orig()));
+vi.mock('../../src/runtime/core/ecs/world', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),
@@ -60,7 +65,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   unregisterEntity: (e: any) => index.delete(e.id()),
   destroyEntity: (e: any) => { ((e: any) => index.delete(e.id()))(e); e.destroy(); },
 }));
-vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
   getAllEntities: () => getAllEntitiesImpl(),
   findEntity: (id: number) => index.get(id),
   markStructureDirty: vi.fn(),
@@ -107,8 +113,7 @@ beforeEach(() => { setRunMode('stopped'); });
 
 beforeEach(async () => {
   testWorld = createWorld(); index.clear(); guidN = 0;
-  const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
-  clearAllOverrideMarks();
+  clearRecorded();
   const { clearHistory } = await import('../../src/editor/undo/undoManager');
   clearHistory();
 });
@@ -137,12 +142,16 @@ describe('Missing Test 6 — deep-nested override + per-field edit + undo (real 
   it('undo restores the deep member to base (override gone); redo re-applies it', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const { serializeScene } = await import('../../src/editor/scene/serialize');
-    const { markOverride, clearOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
     const { pushAction, undo, redo } = await import('../../src/editor/undo/undoManager');
 
     setPrefabCache(A, aPrefab as any); setPrefabCache(B, bPrefab as any); setPrefabCache(D, dPrefab as any);
 
     const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, { id: D });
+    // As the editor's drop makes it (#2001 S8b): a durable root guid and its record. A bare spawn holds no record, and the
+    // save refuses a tree with none.
+    const { ensureGuid } = await import('../../src/editor/undo/entityRef');
+    const { place, setFields, fieldRecordOf, putFieldRecord } = await import('../../src/editor/instance/instanceEdits');
+    ensureGuid(root); place(root);
     const a = aRoot();
     expect(a).toBeGreaterThan(0);
     expect((index.get(a)!.get(Transform) as any).x).toBe(0); // base
@@ -151,12 +160,15 @@ describe('Missing Test 6 — deep-nested override + per-field edit + undo (real 
     // mark the override, with an undo that restores the prior value + clears the mark.
     const prior = 0;
     const next = 7;
-    const doEdit = () => { writeTraitFieldImpl(a, TRAITS[0], 'x', next); markOverride(index.get(a), 'Transform', 'x'); };
+    // The record's row is the override's home (#2001 S8b): the edit records it through the field-edit door, and the undo
+    // puts the row back as the Inspector's step does (`fieldRecordOf`/`putFieldRecord`).
+    const before = fieldRecordOf(a, 'Transform')!;
+    const doEdit = () => { writeTraitFieldImpl(a, TRAITS[0], 'x', next); record(index.get(a), 'Transform', 'x'); setFields(a, 'Transform', ['x']); };
     doEdit();
     pushAction({
       label: 'Edit A1.Transform.x',
-      redo: () => { writeTraitFieldImpl(a, TRAITS[0], 'x', next); markOverride(index.get(a), 'Transform', 'x'); },
-      undo: () => { writeTraitFieldImpl(a, TRAITS[0], 'x', prior); clearOverrideMarks(index.get(a)); },
+      redo: doEdit,
+      undo: () => { writeTraitFieldImpl(a, TRAITS[0], 'x', prior); forget(index.get(a)); putFieldRecord(before); },
     });
 
     // After the edit: the deep override is the row keyed by D's B-row then B's A-row (scene v20; pre-v5 documents, so each

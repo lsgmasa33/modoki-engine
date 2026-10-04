@@ -305,7 +305,7 @@ export function instanceRowKeysIn(rootId: number, world: World = getCurrentWorld
       const key = `${frameOf(p)}/a+${tk(id)}`;
       keyOf.set(id, key);
       grew = true;
-      if (refNode(id)) for (const [m, k] of memberRowKeysIn(id, world)) if (!keyOf.has(m)) keyOf.set(m, `${key}${k}`);
+      if (refNode(id)) for (const [m, k] of memberRowKeysIn(id, world, derivePreV5)) if (!keyOf.has(m)) keyOf.set(m, `${key}${k}`);
     }
   }
   return keyOf;

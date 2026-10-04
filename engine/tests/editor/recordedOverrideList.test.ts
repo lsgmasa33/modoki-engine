@@ -25,17 +25,16 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo } from '@modoki/engine/editor';
 import { pasteTraitValuesWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, addTraitToEntitiesWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { undo, redo, _setUndoClock } from '../../packages/modoki/src/editor/undo/undoManager';
 import { inFieldGesture } from '../../packages/modoki/src/editor/undo/fieldGesture';
-import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { makeLiveFieldEditAction } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';
 import { buildTransformUndoAction } from '../../packages/modoki/src/editor/scene/gizmoUndo';
 import { instanceTargetOf } from '../../packages/modoki/src/editor/instance/instanceKeys';
 import * as instanceEdits from '../../packages/modoki/src/editor/instance/instanceEdits';
-import { freshInstanceRecord, storedInstance } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { storedRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { writeTraitField } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
@@ -123,7 +122,6 @@ beforeEach(async () => {
   setRunMode('stopped');
   clearHistory();
   prefabs.clear();
-  clearKeptMemberOrphans();
   install(pDoc());
   await load(scene());
 });
@@ -164,7 +162,7 @@ describe('F2 by keystrokes: an Inspector field session records what its FINAL va
     await reloadUnder(await saved(), (d) => { (d.entities[5]!.traits as Record<string, Record<string, unknown>>).UIElement!.width = 120; });
     return field(member('U'), 'UIElement', 'width');
   };
-  const recorded = () => !!getOverrideMarkSet(findEntity(member('U'))!)?.has('UIElement.width');
+  const recorded = () => !!overrideKeysOf(findEntity(member('U'))!)?.has('UIElement.width');
 
   // Mutation: drop `resumeGesture`'s put-back — 1 and 10 leave the record, and the reload keeps 100 over the 120.
   it('100 retyped over its base by a SLOW typist (keystrokes past the undo window) records nothing', async () => {
@@ -195,7 +193,7 @@ describe('F2 by keystrokes: an Inspector field session records what its FINAL va
 
   // work-qa's live run on R3 (finding A): each slow keystroke is its own undo entry, and the redo re-recorded each one by
   // diff, so undo×3 → redo×3 left 100 (the base) recorded. Mutation: the redo re-records
-  // (`markFieldOverrideIfInstance` in place of `putMarkState(…, newMarks[i])` in `writeTraitFieldMultiWithUndo`) — red.
+  // (`markFieldOverrideIfInstance` in place of `putFieldRows(ids, newRows, …)` in `writeTraitFieldMultiWithUndo`) — red.
   it('undo×3 then redo×3 of a slow retype leaves the record the typing left: none (finding A)', async () => {
     type('f:1', [1, 10, 100]);
     for (let i = 0; i < 3; i++) await undo();
@@ -205,7 +203,7 @@ describe('F2 by keystrokes: an Inspector field session records what its FINAL va
   });
 
   // The single-entity writer's twin. Mutation: its redo re-records (`markFieldOverrideIfInstance` in place of
-  // `putMarkState(id, meta.name, newMarks)` in `writeTraitFieldWithUndo`) — red.
+  // `putFieldRows([id], newRows, …)` in `writeTraitFieldWithUndo`) — red.
   it('the same through the single-entity writer', async () => {
     for (const v of [1, 10, 100]) {
       now += 1000;
@@ -227,7 +225,7 @@ describe('F2 by keystrokes: an Inspector field session records what its FINAL va
   // The redo half above cannot tell a restored record from a re-derived one (150 is off the base either way; #1932 R4-L2).
   // They differ only once the base moves to the typed value between the undo and the redo: the redo must put back the
   // record the gesture ended with, as Unity's redo restores the recorded state. Mutation: the redo re-records
-  // (`markFieldOverrideIfInstance` in place of `putMarkState(…, newMarks[i]!)` in `writeTraitFieldMultiWithUndo`) — red.
+  // (`markFieldOverrideIfInstance` in place of `putFieldRows(ids, newRows, …)` in `writeTraitFieldMultiWithUndo`) — red.
   it('the gesture\'s redo puts back its record even after the base moved to the typed value', async () => {
     type('f:1', [1, 15, 150], 100); // inside the undo window: one entry
     await undo();
@@ -262,7 +260,7 @@ describe('F2 by keystrokes: an Inspector field session records what its FINAL va
     expect(await widthAfterTemplate120()).toBe(120);
   });
 
-  // Mutation: its redo re-records (`markFieldOverrideIfInstance` in place of `putMarkState(…, newMarks[i]!)`) — red.
+  // Mutation: its redo re-records (`markFieldOverrideIfInstance` in place of `putFieldRows(ids, newRows, …)`) — red.
   it('the per-entity writer: undo×3 then redo×3 of the retype leaves no record', async () => {
     typePerEntity([1, 10, 100]);
     for (let i = 0; i < 3; i++) await undo();
@@ -281,7 +279,7 @@ describe('a handle drag\'s record signals the editor (#1914, finding B)', () => 
     const before = { ...(readTraitData(u, meta('UIElement')) as Record<string, unknown>) };
     writeUIHandleValues(u, 'UIElement', { width: 140 });
     let seen = false;
-    const off = onEditorDirty(() => { seen = !!getOverrideMarkSet(findEntity(u)!)?.has('UIElement.width'); });
+    const off = onEditorDirty(() => { seen = !!overrideKeysOf(findEntity(u)!)?.has('UIElement.width'); });
     try {
       commitUIHandleDrag(u, 'UIElement', before, { ...(readTraitData(u, meta('UIElement')) as Record<string, unknown>) }, 'drag');
     } finally { off(); }
@@ -340,7 +338,7 @@ describe('F5: a record whose target is gone is kept as an unused override (#1914
 });
 
 describe('F7: every instance records its root sortOrder, Unity\'s rootOrder (#1914 R6)', () => {
-  // Mutation: `getOverrideMarkSet` never adds the implicit record (`recordsRootOrder` unconsulted) — the reload takes the
+  // Mutation: `overrideKeysOf` never adds the implicit record (`recordsRootOrder` unconsulted) — the reload takes the
   // template root's new order, 2. Its exclusions (the prefab-edit world, a template's copy by key or by its lost marker, a
   // root with no durable guid) are pinned elsewhere; the key and the lost-marker tests are twins, red only together.
   it('an untouched instance keeps its place when the template root\'s sortOrder changes', async () => {
@@ -356,7 +354,7 @@ describe('F7: every instance records its root sortOrder, Unity\'s rootOrder (#19
 // one change that tells a restored record from a re-derived one, then moves the template again: a restored record holds.
 // From the reference build of #1941 (10594bfbe); site 4 (duplicate and paste) lands with S7 step 4.
 describe('a redo puts back what its forward step left, after the base moved (#1941)', () => {
-  const recordedOn = (id: number, key: string) => !!getOverrideMarkSet(findEntity(id)!)?.has(key);
+  const recordedOn = (id: number, key: string) => !!overrideKeysOf(findEntity(id)!)?.has(key);
   const bTf = (d: ReturnType<typeof baseDoc>) => tfOf(d, 2);
 
   // Mutation: `writeTraitFieldsPerEntityWithUndo`'s redo re-records by diff (`writeMany`) — red.
@@ -397,15 +395,14 @@ describe('a redo puts back what its forward step left, after the base moved (#19
 });
 
 // #2046 S7.2 (rule 8): the two drag commits that write live and record at their end put back each side's EXACT rows, and
-// their undo and redo leave the records fresh (`maintainsRecords`).
+// their undo and redo leave each record exactly as that side had it.
 describe('a drag commit\'s undo and redo restore the exact rows (#2046 S7.2)', () => {
-  const stored = () => storedInstance(getCurrentWorld(), ROOT1);
-  /** The row now, read WITHOUT a re-seed: a stale record reads as none. */
-  const rowOf = (id: number) => { const t = instanceTargetOf(id); if (t?.kind !== 'member') throw new Error(`${id} is no instance member`); const key = t.key; return structuredClone(freshInstanceRecord(getCurrentWorld(), ROOT1)?.list.rows.get(key)); };
-  /** The row before the gesture, through the door (which re-seeds a record the load left stale, as the writer does). */
+  /** The row now, as the store holds it. */
+  const rowOf = (id: number) => { const t = instanceTargetOf(id); if (t?.kind !== 'member') throw new Error(`${id} is no instance member`); const key = t.key; return structuredClone(storedRecord(getCurrentWorld(), ROOT1)?.list.rows.get(key)); };
+  /** The row before the gesture, through the door. */
   const rowFirst = (id: number) => structuredClone(instanceEdits.rowsOf([id])![0]!.row);
 
-  // Mutation: drop `maintainsRecords` from `commitUIHandleDrag`'s entry — the undo leaves the records stale.
+  // Mutation: `commitUIHandleDrag`'s undo without its `putFieldRows` — the undo leaves the drag's row.
   it('a UI handle drag', async () => {
     const u = member('U');
     const was = rowFirst(u);
@@ -415,13 +412,12 @@ describe('a drag commit\'s undo and redo restore the exact rows (#2046 S7.2)', (
     const left = rowOf(u);
     expect(left).not.toEqual(was);
     await undo();
-    expect([stale(), rowOf(member('U'))]).toEqual([undefined, was]);
+    expect(rowOf(member('U'))).toEqual(was);
     await redo();
-    expect([stale(), rowOf(member('U'))]).toEqual([undefined, left]);
-    function stale() { return stored()?.stale; }
+    expect(rowOf(member('U'))).toEqual(left);
   });
 
-  // Mutation: drop `maintainsRecords` from `buildTransformUndoAction` — the undo leaves the records stale.
+  // Mutation: `buildTransformUndoAction`'s apply without its `putFieldRows` — the undo leaves the drag's row.
   it('a gizmo drag', async () => {
     const b = member('B');
     const was = rowFirst(b);
@@ -433,8 +429,8 @@ describe('a drag commit\'s undo and redo restore the exact rows (#2046 S7.2)', (
     const left = rowOf(b);
     expect(left?.traits?.Transform).toEqual({ x: 5 });
     await undo();
-    expect([stored()?.stale, rowOf(member('B')), field(member('B'), 'Transform', 'x')]).toEqual([undefined, was, 0]);
+    expect([rowOf(member('B')), field(member('B'), 'Transform', 'x')]).toEqual([was, 0]);
     await redo();
-    expect([stored()?.stale, rowOf(member('B')), field(member('B'), 'Transform', 'x')]).toEqual([undefined, left, 5]);
+    expect([rowOf(member('B')), field(member('B'), 'Transform', 'x')]).toEqual([left, 5]);
   });
 });

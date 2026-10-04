@@ -19,6 +19,19 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
     return { failed: [] };
   },
 }));
+// The placeholder record that names another root (the last describe): armed for ONE parse, the Detach commit's.
+const otherRoot = vi.hoisted(() => ({ on: false }));
+vi.mock('../../packages/modoki/src/runtime/prefab/parseInstanceRecord', async (orig) => {
+  const m = await orig<typeof import('../../packages/modoki/src/runtime/prefab/parseInstanceRecord')>();
+  return {
+    ...m,
+    parseInstanceRecord: (...a: Parameters<typeof m.parseInstanceRecord>) => {
+      const parsed = m.parseInstanceRecord(...a);
+      if (otherRoot.on) { otherRoot.on = false; parsed.record.rootGuid = 'ffffffff-0000-4000-8000-0000000020a1'; }
+      return parsed;
+    },
+  };
+});
 import { getAllEntities, getTraitByName } from '@modoki/engine/runtime';
 import { makeFuzzBackend } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, startRun, settle, piOf, flushWatcher, type Fixture } from './prefabFuzz/harness';
@@ -29,6 +42,10 @@ import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/e
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { detachPrefabInstance, reattachPrefabInstance } from '../../packages/modoki/src/editor/scene/prefabLink';
 import { unresolvedRefOf, rowPlaceholderOf } from '../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
+import { detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
+import { undo } from '../../packages/modoki/src/editor/undo/undoManager';
+import { getCurrentWorld } from '../../packages/modoki/src/runtime/core/ecs/world';
+import { storedInstance, storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
@@ -108,5 +125,94 @@ describe('#2099: Detach keeps a missing nested row as a Missing Prefab placehold
     const live = findEntity(byGuid(qrGuid)!.id);
     expect(rowPlaceholderOf(live as never)?.source).toBe(f.prefabs.Q.guid);
     expect(unresolvedRefOf(live as never)).toBeUndefined();
+  }, 60_000);
+});
+
+/** #2001 S8b: the Detach keeps the records. The placeholder it leaves is a stored root holding the record the reference
+ *  carries, read as a load reads it, so nothing is marked stale; the save → reload gives that record back, and the undo
+ *  drops it with the row placeholder's return.
+ *
+ *  Mutation (measured), `beginDetachImpl` (`instanceEdits.ts`): refusing a Detach that leaves a placeholder (the old
+ *  `markStale`) — both red; not seating the placeholder's record — both red; the undo not dropping it
+ *  (`detachPrefabUndo.ts`) — the undo case red. */
+describe('#2001 S8b: a Detach that leaves a missing row\'s placeholder keeps the records', () => {
+  it('its record is the reference\'s, and the save and reload give it back', async () => {
+    const f = await startRun(be, async () => {}, 'detach-row-records');
+    const qr = getAllEntities().find((x) => under(p1(f)).has(x.id) && x.name === 'QR')!;
+    const qrGuid = qr.guid!;
+    const m = getAllEntities().find((x) => under(qr.id).has(x.id) && x.name === 'M')!;
+    writeTraitFieldWithUndo(m.id, getTraitByName('Transform')!, 'x', 42);
+    await settle();
+    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    const qPath = f.prefabs.Q.path;
+    const before = be.snapshot();
+    expect((await deleteAssetFiles(deletionPathsFor(qPath, 'prefab', null))).ok).toBe(true);
+    unbindDeletedAssetEditors([qPath]);
+    await flushWatcher(be, before); await settle();
+    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded'); await settle();
+    expect(storedInstance(getCurrentWorld(), qrGuid), 'premise: a row placeholder holds no record').toBeUndefined();
+
+    detachPrefabInstanceWithUndo(p1(f), 'Detach', '[test]'); await settle();
+    const rec = storedInstance(getCurrentWorld(), qrGuid)?.record;
+    expect(rec?.source, 'the placeholder holds the reference\'s record').toBe(f.prefabs.Q.guid);
+    // M's edit is in it, under M's key.
+    expect(JSON.stringify([...rec!.list.rows.values()])).toContain('42');
+    const stated = JSON.stringify([...rec!.list.rows].sort(([a], [b]) => (a < b ? -1 : 1)));
+    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded'); await settle();
+    const reloaded = storedInstance(getCurrentWorld(), qrGuid);
+    expect(JSON.stringify([...reloaded!.record.list.rows].sort(([a], [b]) => (a < b ? -1 : 1))), 'what the reload reads').toBe(stated);
+  }, 60_000);
+
+  it('the undo drops the record the Detach made', async () => {
+    const f = await startRun(be, async () => {}, 'detach-row-records-undo');
+    const qrGuid = getAllEntities().find((x) => under(p1(f)).has(x.id) && x.name === 'QR')!.guid!;
+    const qPath = f.prefabs.Q.path;
+    const before = be.snapshot();
+    expect((await deleteAssetFiles(deletionPathsFor(qPath, 'prefab', null))).ok).toBe(true);
+    unbindDeletedAssetEditors([qPath]);
+    await flushWatcher(be, before); await settle();
+    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded'); await settle();
+    detachPrefabInstanceWithUndo(p1(f), 'Detach', '[test]'); await settle();
+    expect(storedInstance(getCurrentWorld(), qrGuid), 'premise').toBeDefined();
+    await undo(); await settle();
+    expect(rowPlaceholderOf(findEntity(byGuid(qrGuid)!.id) as never)?.source).toBe(f.prefabs.Q.guid);
+    expect(storedInstance(getCurrentWorld(), qrGuid), 'a row placeholder holds no record again').toBeUndefined();
+  }, 60_000);
+});
+
+/** #2001 S8b: a placeholder the Detach's commit cannot record — the record its reference carries names another root —
+ *  is not marked stale. The commit says why, the unpack is taken back out and the store rolled back (hub decision A),
+ *  and the Detach is refused: the records stand as they did, and the tree is an instance again, its row a placeholder.
+ *
+ *  The mismatch is supplied (`parseInstanceRecord` answering for another root): the unpack writes the node's own guid,
+ *  so nothing in the editor produces it today. Mutation: the old `markStale(world, 'detach'); return false` at the
+ *  mismatch in `beginDetachImpl` (`instanceEdits.ts`) — red; not taking the unpack back out (`detachPrefabInstance`) — red. */
+describe('#2001 S8b: a Detach whose placeholder record cannot be stated is rolled back', () => {
+  it('throws, and the records and the tree stand as they did before it', async () => {
+    const f = await startRun(be, async () => {}, 'detach-row-mismatch');
+    const qrGuid = getAllEntities().find((x) => under(p1(f)).has(x.id) && x.name === 'QR')!.guid!;
+    const qPath = f.prefabs.Q.path;
+    const before = be.snapshot();
+    expect((await deleteAssetFiles(deletionPathsFor(qPath, 'prefab', null))).ok).toBe(true);
+    unbindDeletedAssetEditors([qPath]);
+    await flushWatcher(be, before); await settle();
+    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded'); await settle();
+    const records = () => JSON.stringify([...storedInstances(getCurrentWorld())].map(([g, v]) => [g, [...v.record.list.rows]]).sort());
+    const was = records();
+    const rootGuid = getAllEntities().find((x) => x.id === p1(f))!.guid!;
+    const errs = vi.spyOn(console, 'error').mockImplementation(() => {});
+    otherRoot.on = true;
+    try {
+      expect(() => detachPrefabInstance(p1(f))).toThrow(/was not detached/);
+      expect(otherRoot.on, 'premise: the commit parsed the placeholder').toBe(false);
+    } finally { otherRoot.on = false; }
+    await settle();
+    expect(errs.mock.calls.some((c) => /rolled back/.test(String(c[0]))), 'the rollback is said').toBe(true);
+    errs.mockRestore();
+    expect(records(), 'every record as it stood').toBe(was);
+    const root = byGuid(rootGuid)!;
+    expect(piOf(root.id), 'P1 is an instance again').toMatchObject({ source: f.prefabs.P.guid, rootInstanceId: root.id });
+    expect(rowPlaceholderOf(findEntity(byGuid(qrGuid)!.id) as never)?.source, 'QR is the row\'s placeholder again').toBe(f.prefabs.Q.guid);
   }, 60_000);
 });

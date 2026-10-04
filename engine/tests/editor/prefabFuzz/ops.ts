@@ -8,7 +8,7 @@
 
 import { createWorld } from 'koota';
 import { getTraitByName, seedRng, rngNext, findEntity, readTraitData } from '@modoki/engine/runtime';
-import { getOverrideMarkSet } from '../../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { instanceBase } from '../../../packages/modoki/src/editor/scene/prefabChain';
 import { pushAction } from '@modoki/engine/editor';
 import { createPrefabFromEntity, deleteAssetFiles, deletionPathsFor, moveAsset, planDeleteOutcome, planRename } from '../../../packages/modoki/src/editor/panels/assetOps';
@@ -264,9 +264,9 @@ async function editRefusable(gesture: () => Outcome | Promise<Outcome>, st: RunS
   } catch (e) {
     // Only in a prefab-edit WORLD, the refusal's own ground truth (not `editing()`, which also needs the session flag):
     // outside one the refusal must never fire, and a gesture it refused there is a finding. The one reason that holds
-    // in the scene too is a new child under a Missing Prefab placeholder (#1831 M2), and a delete of a Missing Prefab
-    // row's node (#2028 close-out: the panels toast it; hunt seed 7395 read it as an op that threw).
-    if (!(e instanceof PrefabEditRefusalError) || (!isPrefabEditWorld() && e.reason !== 'under-missing-prefab' && e.reason !== 'missing-prefab-row')) throw e;
+    // in the scene too is a new child under a Missing Prefab placeholder (#1831 M2). (A delete of a Missing Prefab row's
+    // placeholder was one too until #2001 S8b, when the record began to hold it in every save.)
+    if (!(e instanceof PrefabEditRefusalError) || (!isPrefabEditWorld() && e.reason !== 'under-missing-prefab')) throw e;
     st.note = e.message;
     return 'refused';
   }
@@ -357,7 +357,7 @@ function outsideVariant(op: Op, st: RunState): Outcome {
     if (!pi || !ent || !e.traits.includes('Transform')) return [];
     const path = st.lastPrefabs?.get(pi.source)?.[0];
     if (!path || !st.be.read(path)) return [];
-    const fields = [...(getOverrideMarkSet(ent) ?? [])].filter((m) => m.startsWith('Transform.')).map((m) => m.slice(10)).sort();
+    const fields = [...(overrideKeysOf(ent) ?? [])].filter((m) => m.startsWith('Transform.')).map((m) => m.slice(10)).sort();
     return fields.map((f) => ({ id: e.id, pi, path, f }));
   });
   const c = pick(u[1], cands);
@@ -520,7 +520,7 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       }
       const pre = liveGuids();
       const clip = st.clip;
-      const r = await editRefusable(() => { pasteEntityCopy(clip.snapshot, parent, noSelect, clip.records); requirePastedFramesCurrent(pre); return 'done'; }, st);
+      const r = await editRefusable(() => { pasteEntityCopy(clip, parent, noSelect); requirePastedFramesCurrent(pre); return 'done'; }, st);
       for (const g of liveGuids()) if (!pre.has(g)) st.touched.paste.add(g);
       return r;
     }

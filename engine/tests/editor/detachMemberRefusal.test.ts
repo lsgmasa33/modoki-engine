@@ -18,7 +18,7 @@
  *    instead of `findEntity` → the parked-root case. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { createTestWorld, type TestWorld, setPlayState, getAllEntities, getTraitByName } from '@modoki/engine/runtime';
+import { createTestWorld, type TestWorld, setPlayState, getAllEntities, getTraitByName, getCurrentWorld, deriveInstanceMemberGuids } from '@modoki/engine/runtime';
 import { markSceneSaved, clearHistory, clearDirtyAssets } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
@@ -27,8 +27,12 @@ import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { detachRefusal, detachPrefabMenuItem, detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
+import { detachPrefabInstance } from '../../packages/modoki/src/editor/scene/prefabLink';
+import { canUndo } from '../../packages/modoki/src/editor/undo/undoManager';
+import { storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { ensureGuid } from '../../packages/modoki/src/editor/undo/entityRef';
 import { readTraitData, findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
+import { place } from '../../packages/modoki/src/editor/instance/instanceEdits';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -41,6 +45,10 @@ const row = (localId: number, nodeGuid: string, name: string, parentId: number) 
 const ship = () => ({ id: SHIP, version: 6, name: 'Ship', rootLocalId: 1, entities: [row(1, G(1), 'Ship', 0), row(2, G(2), 'Flame', 1)] }) as unknown as PrefabFile;
 
 const idOf = (name: string) => getAllEntities().find((e) => e.name === name)!.id;
+/** The root placed as a drop places it (#2001 S8b): a root guid, its members' derived guids, and the door's record. A
+ *  Detach refuses a tree whose records cannot be had, and the raw spawn above has none (its runtime guid is what the
+ *  refusal cases below read). */
+const placeRoot = () => { ensureGuid(root); deriveInstanceMemberGuids(getCurrentWorld()); place(root); };
 const linked = (id: number) => readTraitData(id, getTraitByName('PrefabInstance')!) != null;
 
 let game: TestWorld | undefined;
@@ -88,6 +96,7 @@ describe('Detach aimed at a member is refused, naming the instance root (#1764)'
 });
 
 describe('ACCEPT SIDE: the instance root still detaches on both surfaces (#1764)', () => {
+  beforeEach(placeRoot);
   it('the agent op detaches the whole instance from its root', async () => {
     const reply = await runAgentOp('prefab', { prefabAction: 'detach', entityGuid: ensureGuid(root) }) as { ok: boolean; detached: number };
     expect(reply.ok).toBe(true);
@@ -113,6 +122,7 @@ describe('ACCEPT SIDE: the instance root still detaches on both surfaces (#1764)
 // Close-out review: `rootInstanceId` 0 means "unset" everywhere a root is read (a legacy trait-form entry loads that way),
 // and a root that is not live names nothing to detach instead. Refused, the link could be cut on neither surface.
 describe('ACCEPT SIDE: a link with no live root to name is not a member (#1764 close-out review)', () => {
+  beforeEach(placeRoot);
   const setRoot = (id: number, rootInstanceId: number) => {
     const meta = getTraitByName('PrefabInstance')!;
     const e = findEntity(id)!;
@@ -153,5 +163,33 @@ describe('the member refusal changes nothing, not even the root\'s guid (#1764 c
     expect(err.message).toMatch(/^prefab detach refused: /);
     expect(guidOf(root)).toBe(before);
     expect(err.options?.[0]).toContain(before);
+  });
+});
+
+// #2001 S8b: a Detach keeps the records of the tree it unpacks exact, or it does not unpack. The raw spawn in `beforeEach`
+// has none (a runtime guid, no `place`), which no production placement leaves.
+describe('a Detach whose records cannot be had is refused before it unpacks anything (#2001 S8b)', () => {
+  const store = () => JSON.stringify([...storedInstances(getCurrentWorld())], (_k, v: unknown) => (v instanceof Map ? [...v] : v));
+  const REFUSED = /"Ship" was not detached: the records of its prefab instances could not be read, so nothing was changed/;
+
+  // Mutation: drop the refusal in `detachPrefabInstance` — the door unpacks the tree (the old path marked it stale), and
+  // the second line goes red. Drop it from `detachPrefabInstanceWithUndo` too (the same property, held twice) — the first.
+  it('refused by the wrapper both surfaces call and by the door itself, with every link in place and no undo entry', () => {
+    expect(() => detachPrefabInstanceWithUndo(root, 'Detach', '[test]')).toThrow(REFUSED);
+    expect(() => detachPrefabInstance(root)).toThrow(REFUSED);
+    expect(linked(root)).toBe(true);
+    expect(linked(flame)).toBe(true);
+    expect(canUndo()).toBe(false);
+  });
+
+  // A snapshot that leaves the tree linked (`strip: false`, the undo record of a caller about to relink it) changes
+  // nothing. Mutation: wrap it in the old `staleAround('detach', …)` — every record reads stale 'detach'.
+  it('a snapshot that leaves the tree linked changes no record', () => {
+    placeRoot();
+    const before = store();
+    expect(before).toContain(ensureGuid(root)); // premise: the root has its record
+    expect(detachPrefabInstance(root, { strip: false }).links).toHaveLength(2);
+    expect(store()).toBe(before);
+    expect(linked(root)).toBe(true);
   });
 });

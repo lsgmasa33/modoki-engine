@@ -25,14 +25,15 @@ import {
 } from '@modoki/engine/runtime';
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, deleteEntitiesWithUndo, removeTraitFromEntitiesWithUndo, reparentEntity,
-  addTraitToEntitiesWithUndo,
+  addTraitToEntitiesWithUndo, planReparent,
 } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { captureAuthoredSnapshot, restoreAuthoredSnapshot } from '../../packages/modoki/src/editor/scene/authoredSnapshot';
-import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { overrideKeysOf } from '../../packages/modoki/src/editor/instance/instanceOverrideView';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -101,7 +102,7 @@ const field = (id: number, trait: string, f: string) => (readTraitData(id, meta(
 const save = async () => JSON.parse(JSON.stringify(await serializeScene())) as SceneData;
 /** A save and a reopen: the rebuild that keeps the undo history. */
 const rebuild = async () => load(await save());
-const marksOf = (id: number) => [...(getOverrideMarkSet(findEntity(id)!) ?? [])].sort();
+const marksOf = (id: number) => [...(overrideKeysOf(findEntity(id)!) ?? [])].sort();
 
 /** Holder, and a scene instance of P (guid INST) at the root. */
 const scene = (): SceneData => ({
@@ -133,7 +134,7 @@ beforeEach(async () => {
 afterAll(() => { setPrefabCache(P, null); vi.unstubAllGlobals(); getCurrentWorld()?.destroy(); });
 
 describe("Detach's undo after a rebuild keeps the instance's overrides (#1794)", () => {
-  // Mutation: drop `restoreMarks(entity.id(), entry.marks)` from `reattachPrefabInstance` — the reload shows x 0, speed 1.
+  // Mutation: drop `seat()` from `reattachDetachedInstanceSeating` (the records the Detach dropped) — red.
   it('Detach, a save and reopen, the undo: the next save→reload keeps both overrides', async () => {
     await withOverrides();
     detachPrefabInstanceWithUndo(guidIdOf(INST), 'Detach prefab', '[test]');
@@ -178,9 +179,9 @@ describe("Detach's undo after a rebuild keeps the instance's overrides (#1794)",
 
 // #1853: the override on a NESTED member's node (A, inside O's nested P) after Detach, a rebuild and the undo. The fuzzer's
 // three #1853 entries could not see this any more (#1933 K1): an outside edit before each Detach keeps the undo stack since
-// #1873 R1, so the walk's identity checks run tainted and are skipped. Mutation: in `reattachPrefabInstance`, restore the
-// marks of the outermost frame's members only (`if (root === snapshot[0]!.rootRef.resolve()) restoreMarks(…)`) — this
-// test goes red and the flat #1794 tests above stay green, so it is the nested case's only cover.
+// #1873 R1, so the walk's identity checks run tainted and are skipped. Mutation: drop `seat()` from
+// `reattachDetachedInstanceSeating` — red, with the flat #1794 tests above (#2001 S8b: one record states both, so the
+// nested-only mutation this case was written for, restoring the outer frame's marks alone, has no counterpart).
 describe("Detach's undo after a rebuild keeps a NESTED member's overrides (#1853, #1933 K1)", () => {
   const OINST = 'dddddddd-0000-4000-8000-000000001853';
   const oScene = (): SceneData => ({
@@ -211,7 +212,7 @@ describe("Detach's undo after a rebuild keeps a NESTED member's overrides (#1853
 
 describe("Remove Component's undo after a rebuild keeps a TEMPLATE-defined component's override (#1800)", () => {
   // The study marked this case INFERRED (the fuzzer's editField writes Transform only). Driven here.
-  // Mutation: drop `restoreMarks(id, targets[i].marks)` from `removeTraitFromEntitiesWithUndo`'s revert — the reload
+  // Mutation: drop `putComponentRows(ids, oldRows, meta)` from `removeTraitFromEntitiesWithUndo`'s undo — the reload
   // shows the template's speed 1.
   it('remove Rotate3D, a save and reopen, the undo: the next save→reload keeps speed 5', async () => {
     await withOverrides();
@@ -226,11 +227,14 @@ describe("Remove Component's undo after a rebuild keeps a TEMPLATE-defined compo
   });
 });
 
-describe("a delete's undo after a rebuild relinks a member outside the tree with its marks (#1794's relink sibling)", () => {
+describe("a delete's undo after a rebuild relinks a member outside the tree with its records (#1794's relink sibling)", () => {
   // A nested frame's member moved elsewhere inside its outer instance (a legacy `moved` member: #1869 stops new ones
   // being authored, and existing files keep loading) is outside its own root's subtree, so deleting that root unlinks it
-  // where it stands, and the undo relinks it (`relinkDetachedMembers`). Mutation: in `relinkDetachedMembersMarked`, skip
-  // the restore — the reload shows x 0.
+  // where it stands, and the undo relinks it (`relinkDetachedMembers`). Its override is a row of the OUTER instance's
+  // record, outside R's subtree, so the delete never touches it and no undo step has to carry it (#2001 S8b: before, the
+  // relink put back marks the frame-ending had taken). Pinned by that shape, not by an undo step: dropping the undo's
+  // relink, or its seat of the records the delete changed, stays green (measured). A regression would be a delete that
+  // edits a row outside its subtree.
   it('delete the nested root, a save and reopen, the undo: the moved member keeps its override', async () => {
     await load(movedScene());
     expect(field(idOf('A'), 'Transform', 'x')).toBe(7);
@@ -251,8 +255,8 @@ describe('the relink sibling, by route (#1794 close-out review)', () => {
   const speedKept = async () => { await rebuild(); expect(field(idOf('A'), 'Rotate3D', 'speed')).toBe(5); };
 
   // A member both detached (by R's frame-ending) and deleted (as its own target, after R): its snapshot's respawn puts
-  // its marks back, and the relink must not wipe them. Mutation: record `[]` for a member that no longer resolves in
-  // `recordDetachedMarks` — A's marks are empty after the undo and the reload shows speed 1.
+  // its records back, and the relink must not wipe them. Mutation: the undo skips seating the records the delete changed
+  // (`seatAround(changed!, 'before', …)` → the snapshot alone) — A's record is gone after the undo.
   it('delete [R, A] in that order, the undo: A keeps its marks (and [A, R] does too)', async () => {
     for (const order of [['R', 'A'], ['A', 'R']]) {
       await load(movedScene());
@@ -265,8 +269,8 @@ describe('the relink sibling, by route (#1794 close-out review)', () => {
     }
   });
 
-  // Mutation: in the delete's redo, drop `recordDetachedMarks` — the redo's frame-ending records nothing, so the undo
-  // after the rebuild relinks A without its marks, and the reload shows speed 1.
+  // Pinned by the record's shape, as the first case above: A's row lives in the outer record, which neither the delete
+  // nor its redo touches. Dropping the redo's seat of the after-records, or the undo's relink, stays green (measured).
   it("the delete's redo records again: delete R, undo, redo, a save and reopen, undo: A keeps its override", async () => {
     await load(movedScene());
     clearHistory();
@@ -275,35 +279,6 @@ describe('the relink sibling, by route (#1794 close-out review)', () => {
     expect((await undoStep('redo')).did).toBe(true);
     await rebuild();
     expect((await undoStep('undo')).did).toBe(true);
-    await speedKept();
-  });
-
-  // #1450's route, which #1869 keeps (a stored root moves anywhere): OR dropped under a member of its own frame that a
-  // legacy file moved outside it unpacks that member, and the undo re-links it. Mutation: drop `restoreMarks(id, t.marks)`
-  // from reparent's `undoDetach` — the reload shows speed 1.
-  it('OR dropped under its own moved member A, a save and reopen, the undo: A keeps its override', async () => {
-    await load(movedScene(HOLDER));
-    clearHistory();
-    expect(reparentEntity(guidIdOf(INST), idOf('A'))).toBe(true);
-    expect(readTraitData(idOf('A'), meta('PrefabInstance'))).toBeNull(); // unpacked
-    await rebuild();
-    expect((await undoStep('undo')).did).toBe(true);
-    expect(readTraitData(idOf('A'), meta('PrefabInstance'))).not.toBeNull();
-    await speedKept();
-  });
-
-  // The same with a nested root: a legacy file moved R (the nested P frame's root, owned by OR's frame) under Holder; OR
-  // dropped under R unpacks R (#1450), and its member A with it (the move's plan strips both). Mutation: as above.
-  // (The move's own `endFrames` finds nothing more here: the plan already names every link the move splits. No route
-  // tried reaches that orphan list, so its `recordDetachedMarks` is held only by the relink guard.)
-  it("OR dropped under its own moved nested root R: R's member A comes back with its override", async () => {
-    await load(movedScene(undefined, HOLDER));
-    clearHistory();
-    expect(reparentEntity(guidIdOf(INST), idOf('R'))).toBe(true);
-    expect(readTraitData(idOf('A'), meta('PrefabInstance'))).toBeNull(); // unpacked with R
-    await rebuild();
-    expect((await undoStep('undo')).did).toBe(true);
-    expect(readTraitData(idOf('A'), meta('PrefabInstance'))).not.toBeNull();
     await speedKept();
   });
 });
@@ -348,7 +323,7 @@ async function liveThenReloaded(fields: [trait: string, field: string][]): Promi
 describe("an undo after a SAVED prefab edit takes UNMARKED fields from the CURRENT template (#1800 owner ruling)", () => {
   // y = 9 (the instance's own edit), then a saved prefab edit sets the template's A.y = 4, then undo: the instance no
   // longer overrides y, so it shows the template's 4, as the reload does, not the 0 the old template had.
-  // Mutation: drop the base resync from `putMarkState` — the undo shows y 0, the reload 4.
+  // Mutation: `putRows` skips writing an unlisted field from the fold — the undo shows y 0, the reload 4.
   it('field write: undo shows the current template value, as the reload does', async () => {
     writeTraitFieldWithUndo(idOf('A'), meta('Transform'), 'y', 9);
     await savedPrefabEdit((d) => { tplA(d).Transform.y = 4; });
@@ -373,8 +348,8 @@ describe("an undo after a SAVED prefab edit takes UNMARKED fields from the CURRE
   });
 
   // Remove Rotate3D (speed 5 marked, axis the template's), a saved prefab edit moves the template's axis to 'x', undo:
-  // axis follows the template, speed stays the instance's 5. Mutation: drop the base resync from `restoreMarks` — the
-  // undo shows axis 'y', the reload 'x'.
+  // axis follows the template, speed stays the instance's 5. Mutation: `putRows` skips writing an unlisted field from
+  // the fold, or the undo drops `putComponentRows` — each red.
   it('Remove Component: undo re-adds with the current template for unmarked fields, the marked override kept', async () => {
     await withOverrides();
     expect(removeTraitFromEntitiesWithUndo([idOf('A')], meta('Rotate3D'))).toBeNull();
@@ -400,7 +375,7 @@ describe("an undo after a SAVED prefab edit takes UNMARKED fields from the CURRE
 
   // Detach, a saved prefab edit (the plain tree reloads with the values it had), undo: re-attached, A takes the
   // template's new y and keeps its own x 7 / speed 5. Held by `reattachDetachedInstance`, which brings the re-attached
-  // instance onto the current template (#1665's sibling), not by `restoreMarks`' resync (dropping it leaves this green).
+  // instance onto the current template (#1665's sibling), not by `putRows`' fold write (dropping it leaves this green).
   it('Detach: undo re-attaches with the current template for unmarked fields, the marked overrides kept', async () => {
     await withOverrides();
     detachPrefabInstanceWithUndo(guidIdOf(INST), 'Detach prefab', '[test]');
@@ -442,21 +417,6 @@ describe("a relink after a SAVED prefab edit takes UNMARKED fields from the CURR
     expect(readTraitData(idOf('A'), meta('PrefabInstance'))).not.toBeNull();
     const { live, reloaded } = await liveThenReloaded(fields);
     expect(reloaded[0]).toBe('x');
-    expect(live).toEqual(reloaded);
-  });
-
-  // #1450's route: OR dropped under its own moved member A unpacks A; the saved prefab edit reloads A plain; the undo
-  // re-links it (reparent's `undoDetach`, through `restoreMarks`), and no rebase follows. Mutation: drop the base resync
-  // from `restoreMarks` — the undo shows axis 'y', the reload 'x'.
-  it('OR dropped under its own moved member A, a saved prefab edit, the undo: A shows the current template', async () => {
-    await load(movedScene(HOLDER));
-    clearHistory();
-    expect(reparentEntity(guidIdOf(INST), idOf('A'))).toBe(true);
-    await savedPrefabEdit(edit);
-    expect((await undoStep('undo')).did).toBe(true);
-    expect(readTraitData(idOf('A'), meta('PrefabInstance'))).not.toBeNull();
-    const { live, reloaded } = await liveThenReloaded(fields);
-    expect(reloaded).toEqual(['x', 0, 7, 5]); // y stays the move's 0
     expect(live).toEqual(reloaded);
   });
 });
@@ -671,18 +631,18 @@ describe('a legacy member moved out of its frame, relinked two levels down (#180
   });
 });
 
-// #1914 close-out review: F7's root order is IMPLIED by a role (`recordsRootOrder`), read through `getOverrideMarkSet`, so
+// #1914 close-out review: F7's root order is IMPLIED by a role (`recordsRootOrder`), read through the view, so
 // a carrier that captured that view put it back as a STORED mark, and the mark outlived the role. A legacy file moved
-// R (the nested frame's root, owned by OR's frame) under Holder: R records nothing. Deleting or detaching OR ends R's
+// R (the nested frame's root, owned by OR's frame) under Holder: R records nothing. Deleting OR ends R's
 // frame and makes R a scene root for the step, whose implied order the frame-ending captured; the undo relinked R with
-// it stored, and the save pinned R's order against the template. Mutation: capture `getOverrideMarkSet` instead of the
-// stored set in `recordDetachedMarks` — both red: R's marks gain `EntityAttributes.sortOrder` and its row a
-// `sortOrder: 0`.
+// it stored, and the save pinned R's order against the template. Mutation (before #2001 S8b): capture the view instead of
+// the stored set in the Detach carrier — both red: R's marks gain `EntityAttributes.sortOrder` and its row a
+// `sortOrder: 0`. Since S8b no carrier holds marks; the cases pin the outcome.
 describe("an undo's carried marks are the STORED set, never F7's implied root order (#1914 close-out review)", () => {
   const rRow = (data: SceneData) => (data.entities[0] as unknown as { members: Record<string, unknown> }).members[`/${gPN}`];
+  // (Detach OR was the second route: since #2001 S8b a Detach that would orphan R is refused, below.)
   for (const [label, step] of [
     ['delete OR', () => deleteEntitiesWithUndo([guidIdOf(INST)])],
-    ['detach OR', () => detachPrefabInstanceWithUndo(guidIdOf(INST), 'Detach prefab', '[test]')],
   ] as const) {
     it(`${label}, the undo: R's marks and its saved row are what they were`, async () => {
       await load(movedScene(undefined, HOLDER));
@@ -696,7 +656,8 @@ describe("an undo's carried marks are the STORED set, never F7's implied root or
 
     // …and an order R DID record in its owned role (the file states it) survives: the relink's record is taken after the
     // frame-ending made R a scene root for the step, so a capture less the order that role records dropped it (re-review).
-    // Mutation: `getCarriedOverrideMarks` in `recordDetachedMarks` — R's marks lose the order, its row the `sortOrder: 3`.
+    // Mutation (before #2001 S8b): the carrier took the stored set less the order — R's marks lose it, its row the
+    // `sortOrder: 3`.
     it(`${label}, the undo: an order R's file states stays recorded`, async () => {
       const s = movedScene(undefined, HOLDER) as unknown as { entities: Array<{ members: Record<string, Record<string, unknown>> }> };
       s.entities[0]!.members[`/${gPN}`] = { ...s.entities[0]!.members[`/${gPN}`], traits: { EntityAttributes: { sortOrder: 3 } } };
@@ -704,11 +665,68 @@ describe("an undo's carried marks are the STORED set, never F7's implied root or
       clearHistory();
       const state = async () => ({ marks: marksOf(idOf('R')), row: rRow(await save()), order: field(idOf('R'), 'EntityAttributes', 'sortOrder') });
       const before = await state();
-      expect(before.marks).toContain('EntityAttributes.sortOrder'); // precondition
+      expect(before.row).toMatchObject({ traits: { EntityAttributes: { sortOrder: 3 } } }); // precondition: its row records it
       expect(before.order).toBe(3);
       step();
       expect((await undoStep('undo')).did).toBe(true);
       expect(await state()).toEqual(before);
+    });
+  }
+});
+
+// #2001 S8b: a step off the record path (a delete of a frame a member moved out of) copies the
+// store before its forward and seats what it changed around its undo and redo (`changedSince`, `seatAround`).
+describe('a step off the record path seats the records it changed (#2001 S8b)', () => {
+  const store = () => JSON.stringify([...storedInstances(getCurrentWorld())], (_k, v: unknown) => (v instanceof Map ? [...v] : v));
+
+  // The snapshot undo's own refusal (R's parent OR is gone) comes after the records were seated for it to read: they go
+  // back as the undo found them, as a refusal applies nothing (I19). Mutation: drop the put-back in `seatAround`'s catch —
+  // the store keeps the pre-delete records.
+  it('an undo the snapshot refuses puts back the records it seated', async () => {
+    await load(movedScene());
+    clearHistory();
+    deleteEntitiesWithUndo([idOf('R')]);
+    const at = store();
+    destroyEntity(findEntity(guidIdOf(INST))!, getCurrentWorld());
+    const step = await undoStep('undo');
+    expect(step.failed?.refused, 'premise: the undo refused').toBe(true);
+    expect(store()).toBe(at);
+  });
+});
+
+// #2001 S8b, owner ruling 2026-10-04 (superseding #1450's 2026-09-19 "unpack, not refuse" for this state only): a legacy
+// file moved a member out of its frame. A move that would unlink it (OR dropped under it) and a Detach that would orphan it
+// (the frame ending under it) are refused before anything changes: the records cannot follow that unpack. Mutations: drop
+// `planReparent`'s 'moved-member' answer — the plan reads same-scene; drop `reparentEntity`'s refusal — the move lands; drop
+// `detachPrefabInstance`'s `hasOrphansOf` refusal — the unpack is taken back out by the door, refused for another reason.
+describe('the legacy moved-member state refuses (#2001 S8b, owner ruling 2026-10-04)', () => {
+  const state = async () => ({
+    store: JSON.stringify([...storedInstances(getCurrentWorld())], (_k, v: unknown) => (v instanceof Map ? [...v] : v)),
+    links: ['A', 'R', 'B'].map((n) => readTraitData(idOf(n), meta('PrefabInstance'))),
+    parent: field(guidIdOf(INST), 'EntityAttributes', 'parentId'),
+    // Less what every save stamps afresh (its time and id).
+    file: (({ createdAt: _t, id: _i, ...rest }) => rest)(await save() as SceneData & { createdAt?: string }),
+  });
+  const scenes = [['A, moved under Holder', () => movedScene(HOLDER), 'A'], ['R, moved under Holder', () => movedScene(undefined, HOLDER), 'R']] as const;
+
+  for (const [label, scene, member] of scenes) {
+    it(`OR dropped under its own moved member ${label}: refused, nothing changed`, async () => {
+      await load(scene());
+      clearHistory();
+      const before = await state();
+      expect(planReparent(guidIdOf(INST), idOf(member))).toEqual({ kind: 'refused', reason: 'moved-member' });
+      expect(reparentEntity(guidIdOf(INST), idOf(member))).toBe(false);
+      expect(await state()).toEqual(before);
+      expect((await undoStep('undo')).did, 'no undo entry').toBe(false);
+    });
+
+    it(`Detach OR, whose frame holds ${label}: refused, nothing changed`, async () => {
+      await load(scene());
+      clearHistory();
+      const before = await state();
+      expect(() => detachPrefabInstanceWithUndo(guidIdOf(INST), 'Detach prefab', '[test]')).toThrow(/an older version moved a member/);
+      expect(await state()).toEqual(before);
+      expect((await undoStep('undo')).did, 'no undo entry').toBe(false);
     });
   }
 });

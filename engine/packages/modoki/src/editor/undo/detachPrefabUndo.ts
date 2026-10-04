@@ -4,16 +4,23 @@
  *  #1665's sibling). Redo detaches AGAIN and keeps THAT snapshot: the undo's rebase can rebuild the instance onto a
  *  newer template, so its members are not the ones the first detach stripped. Replaying the first snapshot on the
  *  next undo left a member the rebase had brought in as a plain entity, which the save wrote as an unlinked copy
- *  beside the row it recorded as REMOVED (#1665 close-out review). */
+ *  beside the row it recorded as REMOVED (#1665 close-out review).
+ *
+ *  The instance records (#2001 S8b): the Detach drops those of the instances it unpacks (`beginDetach`), and its undo
+ *  seats back the ones it took before, ahead of the rebase. A redo takes them again before it detaches, as it takes its
+ *  snapshot again. */
 
 import { pushAction } from './undoManager';
 import { reportUndoFailure } from './undoFailure';
 import { entityRef, buildGuidIndex, requireWith, renamesOf, requireDetachedMembers, isInstanceRootCheck } from './entityRef';
-import { detachPrefabInstance, reattachDetachedInstance, type DetachSnapshot } from '../scene/prefabLink';
+import { detachPrefabInstance, detachRecordsRefusal, reattachDetachedInstance, requireLinks, type DetachSnapshot } from '../scene/prefabLink';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { isSuppliedByPrefab, outermostPrefabRoot } from '../scene/restructureRefusal';
 import type { ContextMenuItem } from '../components/ContextMenu';
+import { seatSide, takeTreeRecords, type TreeRecords } from '../instance/instanceHistory';
+import { dropInstanceRecord, storedInstances } from '../../runtime/prefab/instanceStore';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
 
 /** Why entity `id` cannot be detached, or undefined when it can. Detach unpacks an instance from its OUTERMOST root, as
  *  Unity's Unpack does (U17): `PrefabUtility.UnpackPrefabInstance` throws unless `IsOutermostPrefabInstanceRoot`
@@ -88,6 +95,9 @@ export function requireDetachedLinks(detached: DetachSnapshot): void {
     }, renames);
   }
   requireDetachedMembers(detached.orphans, idx, renames);
+  // …and every node whose template key it puts back (#1874): a key with no node left would leave the tree unlike the
+  // records the undo seats (#2001 S8b), so it refuses here with the links, before anything changes.
+  for (const k of detached.keys ?? []) requireWith(k.ref, idx, undefined, renames);
 }
 
 /** Detach instance `rootId` and record one undo entry. Returns the detach's snapshot. Throws `detachRefusal`'s reason for
@@ -97,25 +107,45 @@ export function detachPrefabInstanceWithUndo(rootId: number, label: string, logT
   // The one entry both surfaces call, so a caller that skipped the check cannot unpack a member on its own (#1764).
   const refused = detachRefusal(rootId);
   if (refused) throw new Error(refused.reason);
+  // The records the Detach drops, as they stand before it (#2001 S8b): its undo seats them back exactly. None to be had
+  // refuses the Detach before anything is unpacked, as `detachPrefabInstance` does.
+  let records = takeTreeRecords(rootId);
+  if (!records) throw detachRecordsRefusal(rootId);
+  // …and the records it makes (a missing row's placeholder becomes a stored root, #2099): its undo drops them.
+  const storeKeys = () => new Set(storedInstances(getCurrentWorld()).keys());
+  let had = storeKeys();
   const first = detachPrefabInstance(rootId);
+  let made = [...storeKeys()].filter((g) => !had.has(g));
   if (!first.links.length) return first;
   // Resolved by guid: redo detaches the right entity after a world rebuild (Play→Stop). Detach leaves PLAIN
   // entities, whose guids ARE serialized, so these refs survive a Play→Stop where Create Prefab's do not (#1272).
   const ref = entityRef(rootId);
   let snapshot = first;
+  const seat = (r: TreeRecords, gone: readonly string[]) => () => {
+    seatSide(r.side);
+    for (const g of gone) dropInstanceRecord(getCurrentWorld(), g);
+  };
+  let seatBack = seat(records, made);
   pushAction({
     label,
+    // Each direction keeps the records or marks them itself: the Detach through the door, the undo by seating them back.
     undo: async () => {
       requireDetachedLinks(snapshot);
-      const unresolved = await reattachDetachedInstance(snapshot);
+      // …and every prefab a link names must still exist: a trash since leaves the entities plain, never placeholders.
+      await requireLinks(snapshot, `"${label}"`, { everyLink: true });
+      const unresolved = await reattachDetachedInstance(snapshot, seatBack);
       // Reported, never discarded — that silence is what hid #1272 for as long as it did. Into the step (#1823), so
       // the undo answers PARTIAL rather than `did:true`.
       if (unresolved > 0) reportUndoFailure({ direction: 'Undo', label, detail: `${logTag} ${unresolved} prefab link(s) or template key(s) could not be put back — no longer addressable` });
     },
     redo: () => {
       const id = ref.require(); // I19: a root that is gone refuses, rather than reading as detached
+      records = takeTreeRecords(id);
+      if (!records) throw detachRecordsRefusal(id);
+      had = storeKeys();
       const again = detachPrefabInstance(id);
-      if (again.links.length) snapshot = again;
+      made = [...storeKeys()].filter((g) => !had.has(g));
+      if (again.links.length) { snapshot = again; seatBack = seat(records, made); }
     },
   });
   return first;

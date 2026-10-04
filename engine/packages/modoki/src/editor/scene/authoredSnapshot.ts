@@ -31,8 +31,11 @@ import { soaSchema, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchem
 import { registerPosedWorldSource } from './authoredWorld';
 import { registerUndoRestoreBarrier } from '../undo/undoManager';
 import { withRestore } from './sceneAdoption';
-import { markStale, staleAroundUnless, storedInstances, type StoredInstance } from '../../runtime/prefab/instanceStore';
-import { bankInstanceRecords, dropRecordBank, cloneInstanceStore, steadyRecords } from '../../runtime/prefab/recordBank';
+import { setInstanceRecord, storedInstance, storedInstances, type StoredInstance } from '../../runtime/prefab/instanceStore';
+import { rollBack, rollbackOnThrow, takeStore } from '../instance/instanceRollback';
+import { bankInstanceRecords, dropRecordBank, cloneInstanceStore, steadyRecords, storedText } from '../../runtime/prefab/recordBank';
+import { guidOfEntity, projectionRootOf } from '../instance/instanceKeys';
+import { reprojectFromStore, reprojectsExactly } from '../instance/instanceReproject';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import type { SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
 
@@ -207,7 +210,7 @@ export async function captureAuthoredSnapshot(opts: { bases?: boolean } = {}): P
 /** Put the authored world back: reload the primary under the snapshot's key, then replay the part
  *  the reload carries rather than rebuilds — every base.
  *  The caller has already checked that the key still names the live scene. */
-async function restoreAuthoredSnapshotUnmarked(snap: AuthoredSnapshot, by = 'stop', signal?: AbortSignal): Promise<void> {
+async function restoreAuthoredSnapshotUnmarked(snap: AuthoredSnapshot, signal?: AbortSignal): Promise<void> {
   // Counted from the FIRST synchronous line: Stop sets 'stopped' and calls this with no await between,
   // so the Play world is still live for the whole reload with the mode already reading 'stopped'.
   _restoring++;
@@ -215,7 +218,7 @@ async function restoreAuthoredSnapshotUnmarked(snap: AuthoredSnapshot, by = 'sto
     // The restore is the ADOPTER (#1698, hub): it reloads under the SAME key, so it writes no editor scene state, and an
     // older route whose world it replaced — a load still in its tail — adopts nothing.
     await withRestore(async (adoption) => {
-      const bank = snap.records ? bankInstanceRecords(snap.key ?? '', snap.records, snap.primary.entities as unknown as SceneEntityEntry[], by) : undefined;
+      const bank = snap.records ? bankInstanceRecords(snap.key ?? '', snap.records, snap.primary.entities as unknown as SceneEntityEntry[]) : undefined;
       try {
         const { world } = await sceneManager.loadScene(snap.key ?? '', { preloaded: snap.primary as unknown as SceneData, sceneCopies: snap.copies ?? new Map(), signal });
         adoption.restored(world);
@@ -225,6 +228,7 @@ async function restoreAuthoredSnapshotUnmarked(snap: AuthoredSnapshot, by = 'sto
       }
     });
     for (const base of snap.bases.values()) restoreAuthoredEntities(base.entities);
+    seatBaseRecords(snap.records);
     _restoreFailed = false;
   } catch (e) {
     // A caller's abort lands before the swap (the trash's reload: an edit landed), so the world it leaves is the authored
@@ -260,29 +264,63 @@ registerUndoRestoreBarrier(() => _restoring > 0);
 registerPosedWorldSource('the last Play/preview restore FAILED — reload the scene before saving', () => _restoreFailed);
 onWorldSwap(() => { _restoreFailed = false; });
 
-// #2046 S7.6: the restore's reload takes back the authored world's exact records (banked above) or parses fresh ones from
-// the snapshot, so a restore that lands marks nothing; one that throws marks the store stale, as before (`instanceStore.ts`).
-export const restoreAuthoredSnapshot = staleAroundUnless('stop', (snap: AuthoredSnapshot) => restoreAuthoredSnapshotUnmarked(snap), () => true);
+// #2046 S7.6 / #2001 S8b: the restore's reload takes back the authored world's exact records (banked above) or parses
+// fresh ones from the snapshot, and the bases' carried records are seated back where the session changed them
+// (`seatBaseRecords`), so a restore marks nothing. Before, it marked every record of the world it left stale first: a world
+// on its way out, but the mark rode the carry onto every base record. One that throws rolls back (`instanceRollback.ts`).
+export const restoreAuthoredSnapshot = rollbackOnThrow('stop', (snap: AuthoredSnapshot) => restoreAuthoredSnapshotUnmarked(snap));
 /** The same reload, for a trashed prefab's live frames (#2056, `deletedPrefabsMissing.ts`): the world just captured is put
  *  back through the load, which makes every instance of a prefab that no longer resolves a Missing Prefab placeholder.
  *
- *  Not wrapped in `staleAroundUnless` as Stop's is: its mark BEFORE the call is for an op that rebases the world it runs in,
- *  and this one touches the live world only by replacing it. A reload its caller ABORTS (an edit landed) keeps that world,
- *  and the pre-mark left every record in it stale, so the retry's capture banked stale records the load would not take
- *  (#2056 re-review). Any other throw marks, as Stop's does. */
+ *  Not wrapped in `rollbackOnThrow` as Stop's is: a reload its caller ABORTS (an edit landed) keeps that world as the edit
+ *  left it, which a rollback would take back (#2056 re-review). Any other throw rolls back (#2001 S8b: before, it marked
+ *  every record stale). */
 export async function reloadCapturedWorld(snap: AuthoredSnapshot, signal?: AbortSignal): Promise<void> {
+  const taken = takeStore();
   try {
-    await restoreAuthoredSnapshotUnmarked(snap, 'trash', signal);
+    await restoreAuthoredSnapshotUnmarked(snap, signal);
   } catch (e) {
-    if (!signal?.aborted) markStale(getCurrentWorld(), 'trash');
+    if (!signal?.aborted) rollBack(taken, 'trash', e);
     throw e;
   }
 }
 
-/** The base replay writes authored values onto a kept base's carried entities without the door, so the records of the
- *  trees it writes — every stored root a base scene owns (`sourceScene` set) — are stale after it. */
+/** The base replay writes authored values onto a kept base's carried entities without the door. The records of the trees
+ *  it writes are not marked (#2001 S8b): they state the authored world, which the session's posing never wrote, and one
+ *  an edit changed during the session is seated back by {@link seatBaseRecords}. */
 export function restoreAuthoredEntities(entries: SerializedEntity[]): void {
-  try { restoreAuthoredEntitiesUnmarked(entries); } finally { markStale(getCurrentWorld(), 'stop', baseStoredRoots()); }
+  restoreAuthoredEntitiesUnmarked(entries);
+}
+
+/** Seat back the record of every instance a kept base scene owns that differs from the snapshot's `records`, and rebuild
+ *  its tree from it (#2001 S8b). The reload carries a base's entities and records across as they stood, and the replay
+ *  puts back only the fields its entries state: a preview takes scene edits and drops them at its Exit, so a door write
+ *  to a base instance during it left a record stating the dropped edit. Before, the replay marked every base record stale
+ *  instead, and the next write re-seeded it from the live tree: the dropped edit's structure, and every field Play or the
+ *  pose moved that the entries do not state, went into the record (and the next save). A root the snapshot has no record
+ *  for (made during the session, or edited while the snapshot serialized: `steadyRecords`) keeps the one it has. A tree
+ *  that cannot be rebuilt exactly from its records is left as it was, its records seated, and says why (as a rebuild
+ *  does, `prefabRebuild.ts`; #2001 S8b: before, it was marked stale for a re-seed from the live tree). No `records` (a
+ *  snapshot built by hand): nothing to compare. An Apply's undo and redo that reload the scene seat a base's records the
+ *  same way, from the store as it stood on that side (`applyPrefabUndo.ts`). True when it rebuilt any tree (by new ids). */
+export function seatBaseRecords(records: ReadonlyMap<string, StoredInstance> | undefined): boolean {
+  if (!records) return false;
+  const world = getCurrentWorld();
+  // By guid: a rebuild respawns its tree under new ids.
+  const tops = new Set<string>();
+  for (const g of baseStoredRoots()) {
+    const was = records.get(g);
+    if (!was || storedText(was) === storedText(storedInstance(world, g))) continue;
+    setInstanceRecord(world, structuredClone(was.record));
+    const top = projectionRootOf(findEntityByGuid(g, world)!.id());
+    if (top) tops.add(guidOfEntity(top));
+  }
+  for (const g of tops) {
+    const top = findEntityByGuid(g, world)?.id();
+    if (top === undefined || (reprojectsExactly(top) && reprojectFromStore(top))) continue;
+    console.warn(`[Prefab] restore of instance ${g} left as it was: its records cannot rebuild it — reload its scene to update it`);
+  }
+  return tops.size > 0;
 }
 
 function baseStoredRoots(): string[] {

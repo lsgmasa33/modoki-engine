@@ -80,6 +80,7 @@ vi.mock('../../src/editor/scene/prefabFrames', () => ({
   // tag is the one in the prefabLink mock below (its kept-state settle has nothing to settle here).
   unexpandedNestedRefusal: () => null,
   staleFramesInTreeRefusal: () => null,
+  unreadFramesInTreeRefusal: () => null,
 }));
 vi.mock('../../src/editor/scene/prefabInstantiate', () => ({}));
 vi.mock('../../src/editor/scene/prefabChain', () => ({}));
@@ -126,6 +127,14 @@ vi.mock('../../src/editor/scene/prefabLink', () => ({
   requireLinks: async () => {},
 }));
 vi.mock('../../src/editor/scene/prefabRevert', () => ({}));
+// The records the tag replaces (#2001 S8b): taken before it, seated back by the undo once the links are. `null` = they
+// cannot be had, and the create tags nothing.
+const records = vi.hoisted(() => ({ side: { records: new Map() } as unknown, seated: [] as unknown[] }));
+vi.mock('../../src/editor/instance/instanceHistory', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  takeRecordsAround: () => records.side,
+  seatSide: (side: unknown) => { calls.push('seat'); records.seated.push(side); },
+}));
 
 const registerAssetSpy = vi.fn();
 // The real module under the spies: the write step's imports (the adoption owner, #1698) reach exports this file never
@@ -217,6 +226,7 @@ beforeEach(() => {
   mockFetch.mockClear();
   setPrefabCacheSpy.mockClear(); tagSpy.mockClear(); untagSpy.mockClear(); registerAssetSpy.mockClear();
   detachSpy.mockClear(); reattachSpy.mockClear(); calls.length = 0;
+  records.side = { records: new Map() }; records.seated.length = 0;
   reattachSpy.mockReturnValue(0); // links restored cleanly unless a test says otherwise
   runtimeExcludedFixture = 0;
   refState.gone = false;
@@ -264,22 +274,23 @@ describe('createPrefabFromEntity — undo', () => {
   });
 
   // #1272: undo no longer DEPENDS on the guid-keyed reattach resolving, but a miss must not be
-  // silent -- "restored nothing" and "restored everything" looking alike is what hid the bug.
-  it('reports the links it could not put back, and says nothing when it restored them all', async () => {
+  // silent -- "restored nothing" and "restored everything" looking alike is what hid the bug. #2001 S8b, hub decision A:
+  // the miss THROWS, so the step rolls back (`undoManager.ts`) and no record is seated over a tree unlike it. Mutation:
+  // report the miss and go on, as before — the undo resolves, and `seat` is called.
+  it('throws on a link it could not put back, before it seats any record, and says nothing when it restored them all', async () => {
     const quiet = await makeAction();
     const noErr = spyError();
     await quiet.undo();
     expect(noErr, 'a clean undo must not report').not.toHaveBeenCalled();
 
     const action = await makeAction();
-    const err = spyError();
-    reattachSpy.mockReturnValue(2);
-    await action.undo();
-
-    expect(err).toHaveBeenCalledTimes(1);
-    const msg = String(err.mock.calls[0][0]);
-    expect(msg).toContain('Undo');
-    expect(msg).toContain('2 prefab links');
+    calls.length = 0;
+    reattachSpy.mockReturnValueOnce(2);
+    const thrown = await Promise.resolve().then(() => action.undo()).then(() => null, (e: unknown) => e);
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown, 'a throw, which rolls back — not a refusal, which asserts nothing changed').not.toBeInstanceOf(UndoRefusedError);
+    expect(String((thrown as Error).message)).toContain('2 prefab links');
+    expect(calls).toEqual(['unstamp', 'untag', 'reattach']);
   });
 });
 
@@ -523,10 +534,22 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
     calls.length = 0;
     await action.undo();
     // #1461: the members' original guids go back BEFORE the links do — the snapshot addresses them by
-    // the guids they held before the tag. Mutation: move `unstamp()` after the reattach in assetOps.
-    expect(calls).toEqual(['unstamp', 'untag', 'reattach', 'rederive']);
+    // the guids they held before the tag. Mutation: move `unstamp()` after the reattach in assetOps. The records the tag
+    // replaced go back last (#2001 S8b), over what the relink left.
+    expect(calls).toEqual(['unstamp', 'untag', 'reattach', 'rederive', 'seat']);
+    expect(records.seated).toEqual([records.side]);
     expect(unstampSpy).toHaveBeenCalledWith(new Map([['g-old', 'g-derived']]));
     expect(reattachSpy).toHaveBeenCalledWith(PRIOR_LINKS, { rootEcsId: 7 });
+  });
+
+  // #2001 S8b: the create keeps every record exact or does not tag. Records it cannot take are records its undo could not
+  // put back. Mutation: drop the `!side` refusal in `tagKeeping` — the tag runs, and `calls` holds it.
+  it('tags nothing when the records the tag replaces cannot be had, and says so', async () => {
+    records.side = null;
+    const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(String(res));
+    expect(calls).toEqual([]);
+    expect(res.unlinked).toMatch(/was saved as .*, but the entity was not linked to it: the records of the prefab instances in it could not be read/);
   });
 
   it('undo of a REPLACE untags, then restores the prior links', async () => {
@@ -535,7 +558,7 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
     if (!res || res === 'declined' || 'refused' in res) throw new Error(String(res));
     calls.length = 0;
     await res.action.undo();
-    expect(calls).toEqual(['unstamp', 'untag', 'reattach', 'rederive']);
+    expect(calls).toEqual(['unstamp', 'untag', 'reattach', 'rederive', 'seat']);
     expect(reattachSpy).toHaveBeenCalledWith(PRIOR_LINKS, { rootEcsId: 7 });
   });
 

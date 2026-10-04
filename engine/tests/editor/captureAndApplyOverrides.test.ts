@@ -2,15 +2,17 @@
  *  hand-built world. */
 
 import { describe, it, expect } from 'vitest';
-import { getCurrentWorld, markOverride, findEntityById } from '@modoki/engine/runtime';
+import { getCurrentWorld, findEntityById } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { getTraitByName } from '@modoki/engine/runtime';
 import {
   instantiatePrefab,
   captureInstanceOverrides,
+  setPrefabCache,
   type PrefabFile,
 } from '@modoki/engine/editor';
 import { applyOverridesByLocalToEcs } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { place, setFields } from '../../packages/modoki/src/editor/instance/instanceEdits';
 
 registerAllTraits();
 
@@ -24,11 +26,13 @@ function applyAsLoad(rootId: number, overrides: Record<number, Record<string, Re
     const data = d as { rootInstanceId?: number; localId?: number };
     if (data.rootInstanceId === rootId && data.localId) localToEcs.set(data.localId, e.id());
   });
-  applyOverridesByLocalToEcs(getCurrentWorld(), localToEcs, overrides, overrides);
+  applyOverridesByLocalToEcs(getCurrentWorld(), localToEcs, overrides);
 }
 
 function makePrefab(): PrefabFile {
   return {
+    // An id: the instance's source, which its record names (`place`).
+    id: '0c0a0f1e-0000-4000-8000-00000000c0a0',
     version: 1,
     name: 'overrides-test',
     rootLocalId: 1,
@@ -61,6 +65,8 @@ describe('captureInstanceOverrides', () => {
   it('returns empty when no fields differ from the prefab base', () => {
     const prefab = makePrefab();
     const rootId = instantiatePrefab(prefab);
+    setPrefabCache(prefab.id!, prefab); // the template the record's name is read against
+    place(rootId, { sortOrder: 0 }); // its record, at the template root's order (a drop puts it last: a recorded order)
     const captured = captureInstanceOverrides(rootId, prefab);
     expect(captured).toEqual({});
   });
@@ -68,6 +74,7 @@ describe('captureInstanceOverrides', () => {
   it('captures per-localId field overrides on the live instance', () => {
     const prefab = makePrefab();
     const rootId = instantiatePrefab(prefab);
+    place(rootId); // its record, as a drop mints one
     const childId = findChildEcsId(rootId);
 
     // Edit the child's Transform.x and Renderable3D.material
@@ -81,8 +88,8 @@ describe('captureInstanceOverrides', () => {
     });
     // Mark them, exactly as the editor's inspector/gizmo edits do — capture is
     // mark-based so a deliberate edit is distinguished from a base divergence.
-    markOverride(findEntityById(childId)!, 'Transform', 'x');
-    markOverride(findEntityById(childId)!, 'Renderable3D', 'material');
+    setFields(findEntityById(childId)!.id(), 'Transform', ['x']);
+    setFields(findEntityById(childId)!.id(), 'Renderable3D', ['material']);
 
     const captured = captureInstanceOverrides(rootId, prefab);
     expect(captured[2]).toBeDefined();
@@ -99,16 +106,18 @@ describe('the load\'s apply of a captured map', () => {
 
     // First instance: edit a child field
     const rootA = instantiatePrefab(prefab);
+    place(rootA); // its record, as a drop mints one
     const childA = findChildEcsId(rootA);
     const tfMeta = getTraitByName('Transform')!;
     getCurrentWorld().query(tfMeta.trait).updateEach(([tf], entity) => {
       if (entity.id() === childA) (tf as Record<string, unknown>).x = 77;
     });
-    markOverride(findEntityById(childA)!, 'Transform', 'x');
+    setFields(findEntityById(childA)!.id(), 'Transform', ['x']);
     const captured = captureInstanceOverrides(rootA, prefab);
 
     // Second instance: fresh, no edits
     const rootB = instantiatePrefab(prefab);
+    place(rootB); // its record, as a drop mints one
     const childB = findChildEcsId(rootB);
     let childBPreX = -1;
     getCurrentWorld().query(tfMeta.trait).updateEach(([tf], entity) => {
@@ -130,6 +139,7 @@ describe('the load\'s apply of a captured map', () => {
     // Skipped means NOWHERE: not.toThrow alone stayed green with localId 99's override written onto the root (#1670).
     const prefab = makePrefab();
     const rootId = instantiatePrefab(prefab);
+    place(rootId); // its record, as a drop mints one
     const childId = findChildEcsId(rootId);
     expect(() => applyAsLoad(rootId, { 99: { Transform: { x: 1 } } }))
       .not.toThrow();

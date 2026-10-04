@@ -14,13 +14,12 @@ import type { Op } from './ops';
 import type { StepFailure } from './runner';
 import { type Failure } from './checks';
 import { placeholderGuids } from './harness';
-import { findEntityByGuid } from '../../../packages/modoki/src/runtime/core/ecs/world';
+import { findEntityByGuid, getCurrentWorld } from '../../../packages/modoki/src/runtime/core/ecs/world';
 import { rowPlaceholderOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/prefabCache';
 import { getAllAssets } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
-import { keptMemberOrphans } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { storedRecord } from '../../../packages/modoki/src/runtime/prefab/instanceStore';
 import { getAllEntities } from '../../../packages/modoki/src/runtime/core/ecs/entityUtils';
-import { getTraitByName } from '../../../packages/modoki/src/runtime/core/ecs/traitRegistry';
 
 export interface KnownOpen {
   issue: number;
@@ -61,79 +60,11 @@ export interface KnownOpen {
 // world, or a loaded BASE scene's tree (the trash's reload keeps a base rather than rebuilding it). Neither repro reaches the
 // first two; the fuzz fixture has no base scene, so whether either still reproduces through one is not known (parked).
 
-/** #1829 on P1 (#2058, hunt seed 7512): the same widening, seen by the store's projection instead of a reload. A respawn
- *  from the old capture (here Create Prefab's undo) marks every field of the partially stated added component, while the
- *  record keeps what the file stated, so the LIVE side carries a mark the projection lacks. Marks are sorted, so at the
- *  first differing index the live mark sorting first (or the projection ending) proves the live side has a mark the
- *  projection lacks (not that it has only that one: a projection that also states another field would match too, which is
- *  why its stop needs the observed route). The opposite direction, a record stating a field the live tree does not mark, is a re-seed that copied the capture's
- *  widening into the list, which S6 would write: fixed (`instanceSync.ts` `withoutUnstatedAddedFields`), never claimed. */
-const partialAddedOvermarkedLive = (f: StepFailure): boolean => {
-  if (f.check !== 'P1 the projection of a record is not its live instance') return false;
-  const m = /^([0-9a-f-]{36}) \/([0-9a-f-]{36})\/marks\/\d+: "(\w+)\.(\w+)" vs (?:"(\w+)\.(\w+)"|undefined)$/.exec(f.detail);
-  if (!m || m[1] !== m[2] || ['Transform', 'EntityAttributes', 'PrefabInstance'].includes(m[3]!)) return false;
-  if (m[5] !== undefined && (m[5] !== m[3] || !(m[4]! < m[6]!))) return false;
-  return (f.touched?.fileDirect ?? []).includes(m[1]!);
-};
-
-/** #1829 on the no-op rebuild's root mark set (hunt seed 178): the rebuild respawns from the old capture, so the REBUILT
- *  root marks a field of the partially stated added component that the live root (the file's statement) does not. Marks are
- *  sorted: at the first differing index the rebuilt side's mark sorts first, or the live side has ended. Same component on
- *  both sides, never a default one, and only a component the root's prefab does not give it (an ADDED one, which is what
- *  the old capture writes whole). The repro also asks that a file-direct write touched the root; the tolerance cannot (the
- *  runner's `tolerate` sees no step). */
-const partialAddedOvermarkedRebuild = (f: Failure, step?: StepFailure): boolean => {
-  if (f.check !== 'a no-op rebuild is not the identity') return false;
-  const m = /^\/([0-9a-f-]{36})\/marks\/\d+: (?:"(\w+)\.(\w+)"|undefined) vs "(\w+)\.(\w+)"$/.exec(f.detail);
-  if (!m || ['Transform', 'EntityAttributes', 'PrefabInstance'].includes(m[4]!)) return false;
-  if (m[2] !== undefined && (m[2] !== m[4] || !(m[5]! < m[3]!))) return false;
-  if (step && !(step.touched?.fileDirect ?? []).includes(m[1]!)) return false;
-  const root = getAllEntities().find((e) => e.guid === m[1]);
-  const pi = root ? (findEntityByGuid(m[1]!)?.get(getTraitByName('PrefabInstance')!.trait) as { source?: string; localId?: number } | undefined) : undefined;
-  const doc = pi?.source ? getCachedPrefabSync(pi.source) : undefined;
-  const row = (doc?.entities as Array<{ localId?: number; traits?: Record<string, unknown> }> | undefined)?.find((r) => r.localId === (doc as { rootLocalId?: number }).rootLocalId);
-  return !!row && !(m[4]! in (row.traits ?? {}));
-};
-
-/** #2013: today's load keeps a member's `removed` in its orphan store AND applies it — the fold removed that member too,
- *  which the oracle marks `(applied)`. Every divergence line of the step must be one (`foldCheck` reports them all). The
- *  `own` rows first waived here were NOT this: the fold keeps those in neither its anchors nor its unused (#2009 review). */
-const orphanBookedTwice = (f: StepFailure): boolean => {
-  if (f.check !== 'P1 the live instance is not the fold of its record') return false;
-  const lines = f.detail.replace(/^\S+ /, '').split(' ; ');
-  return lines.every((l) => /^kept-only unused \S+ removed \(applied\)$/.test(l));
-};
-
-/** #2100 (#2058, hunt seed 7645): a re-add of a removed component clears the removal in the record and the capture (G1),
- *  but the old kept-unused store still holds it: every line a kept removal the fold does not list. */
-const reAddedKeptRemoval = (f: StepFailure): boolean => {
-  if (f.check !== 'P1 the live instance is not the fold of its record') return false;
-  return f.detail.replace(/^\S+ /, '').split(' ; ').every((l) => /^kept-only unused \S+ -[A-Z]\w*$/.test(l));
-};
-
-/** #2063's sibling (hunt seed 8004): the old capture states a RESTORE (`traitRemovals: {T: false}`) on a member no layer
- *  removes T from, which the record (rightly) does not hold. Vacuous: a reload restores nothing, so only the file's bytes
- *  differ. Only a capture side that is all restores, with the record stating nothing there, and no cached prefab removing
- *  T at that node (its own row, or a reference row's member row for it). */
-const vacuousRestore = (f: Failure): boolean => {
-  if (f.check !== 'I25 the record is not the capture') return false;
-  const m = /^\S+ \S*\/([0-9a-f-]{36}): undefined vs (\{"traitRemovals":\{[^{}]*\}\})$/.exec(f.detail);
-  if (!m) return false;
-  const restores = (JSON.parse(m[2]!) as { traitRemovals: Record<string, boolean> }).traitRemovals;
-  if (Object.values(restores).some((v) => v !== false)) return false;
-  const node = m[1]!;
-  type Row = { nodeGuid?: string; removedTraits?: string[]; traitRemovals?: Record<string, boolean>; members?: Record<string, Row> };
-  const removes = (r: Row | undefined, t: string) => !!r && (r.removedTraits?.includes(t) || r.traitRemovals?.[t] === true);
-  return Object.keys(restores).every((t) => !getAllAssets().some((a) => a.type === 'prefab'
-    && !!(getCachedPrefabSync(a.guid)?.entities as Row[] | undefined)?.some((e) => (e.nodeGuid === node && removes(e, t))
-      || Object.entries(e.members ?? {}).some(([k, r]) => k.endsWith(node) && removes(r, t)))));
-};
-
 /** #2061: the end walk's redo of an instantiate respawns a FRESH instance after its nested prefab was trashed, so a missing
  *  nested row's placeholder takes the template row's name, while the no-op rebuild's capture names it from the kept orphan
- *  row the earlier reload stored under the same root guid (`"C" vs "QR"`). Only a name on a live ROW placeholder, and only
+ *  row the earlier reload kept in the record of the same root (`"C" vs "QR"`). Only a name on a live ROW placeholder, and only
  *  that pair: the live side (`before`) is the name a template row with the placeholder's nodeGuid states, and the rebuilt
- *  side is the name a kept orphan row carrying the placeholder's guid states. A rebuild that names it anything else is
+ *  side is the name a kept orphan row carrying the placeholder's guid states (in its instance's record, #2001 S8b). A rebuild that names it anything else is
  *  not this. */
 const redoFreshRowName = (f: Failure): boolean => {
   if (f.check !== 'a no-op rebuild is not the identity') return false;
@@ -145,88 +76,11 @@ const redoFreshRowName = (f: Failure): boolean => {
   const templateNamed = getAllAssets().some((a) => a.type === 'prefab'
     && !!getCachedPrefabSync(a.guid)?.entities?.some((e) => (e as { nodeGuid?: string }).nodeGuid === row.nodeGuid && e.name === live));
   const keptNamed = getAllEntities().some((e) => !!e.guid
-    && Object.values(keptMemberOrphans(e.guid) ?? {}).some((r) => r.guid === m[1] && r.name === rebuilt));
+    && [...(storedRecord(getCurrentWorld(), e.guid)?.list.rows.values() ?? [])].some((r) => r.guid === m[1] && r.name === rebuilt));
   return templateNamed && keptNamed;
 };
 
-/** #2102: the end walk leaves a member row holding an `added` list the start's row did not state. */
-const heldTemplatePlaceholderAfterUndo = (f: StepFailure): boolean =>
-  f.check === 'undo to the start does not restore the scene' && /^\/entities\/[0-9a-f-]{36}\/members\/[^:]*\/added: undefined vs \[\{/.test(f.detail);
-
 export const KNOWN_OPEN: KnownOpen[] = [
-  {
-    issue: 2102,
-    what: "#2102 (from #2001 S6; was a #1939 regression, hunt seeds 3266, 1269): the undo walk back across the detach re-seeds the record from the old capture while the template reference node is a placeholder; the capture states it as a row `added` node, the parse holds it, and the v20 save writes it back, so a Missing Prefab placeholder and its kept rows outlive the template dropping the node. Forward steps pass. Before:: a template reference node of a trashed prefab; a detach of the instance holding it makes its frame an ENTRY. A placeholder entry stays one across the reload, and since #2001 S5 an expanded one reloads as a placeholder too, keeping its list (ruling B: no copy expands)",
-    repro: [
-      {kind: 'prefabEdit', u: [0.2832771616522223, 0.07422894821502268, 0.7528395308181643, 0.3064988814294338, 0.2902603386901319, 0.7280649025924504, 0.5037771083880216, 0.8082152912393212], inner: [{kind: 'instantiate', u: [0.13935406086966395, 0.8303816181141883, 0.6744375759735703, 0.2890225602313876, 0.2257074019871652, 0.9767554379068315, 0.2289160017389804, 0.8437706183176488]}]},
-      {kind: 'trashPrefab', u: [0.21610835962928832, 0.40136740216985345, 0.25969059206545353, 0.9192028611432761, 0.3998060973826796, 0.17308109835721552, 0.8394311657175422, 0.928628564812243]},
-      {kind: 'saveReload', u: [0.6892608145717531, 0.4650746730621904, 0.21657891012728214, 0.23295434354804456, 0.3015429456718266, 0.5181264781858772, 0.30148910149000585, 0.7050725878216326]},
-      {kind: 'detach', u: [0.4603799900505692, 0.20984725933521986, 0.8734895254019648, 0.8137040538713336, 0.9327120224479586, 0.7904459990095347, 0.9528898776043206, 0.3289412825834006]},
-    ],
-    // Only the end walk's restore, only a row `added` list the start did not state, and only after a trash and a detach.
-    reproduces: (f) => heldTemplatePlaceholderAfterUndo(f),
-    stops: (f, ops) => heldTemplatePlaceholderAfterUndo(f) && ops.some((o) => o.kind === 'trashPrefab') && ops.some((o) => o.kind === 'detach'),
-  },
-  {
-    issue: 1829,
-    what: "#1829 seen by P1 (#2058, hunt seed 7512): a file-direct write states an added component partially (`Rotate3D: {speed: 2}`), Create Prefab turns the instance into a prefab and two undos bring it back. The undo respawns it from the old capture, which writes the component whole, so the live tree marks `axis` too, where the record keeps `speed` alone. The LIST is right (it is what the file stated); S6's save writes it, and the reload marks `speed` only. Values agree throughout. Hub ruling 2026-10-03: recorded on #1829, the old capture is not fixed",
-    repro: [
-      {kind: 'fileMutate', u: [0.4406395209953189, 0.13118481426499784, 0.531444427324459, 0.6088186670094728, 0.14829342090524733, 0.4819357134401798, 0.8098402046598494, 0.8826371389441192]},
-      {kind: 'editField', u: [0.1600618800148368, 0.12541370862163603, 0.3777471762150526, 0.8417782566975802, 0.8568708831444383, 0.2517908848822117, 0.9127532963175327, 0.2833624368067831], variant: 'toBase'},
-      {kind: 'createPrefab', u: [0.14408122119493783, 0.04904690128751099, 0.4958720800932497, 0.6683295532129705, 0.8172623903956264, 0.7895503570325673, 0.14383488637395203, 0.19527888391166925]},
-      {kind: 'undo', u: [0.19424327230080962, 0.12152680521830916, 0.4395646769553423, 0.23733717249706388, 0.051651057321578264, 0.4375051506794989, 0.49595680832862854, 0.802169177448377]},
-      {kind: 'undo', u: [0.07118040067143738, 0.4588431396987289, 0.9585348290856928, 0.08928052126429975, 0.29488438135012984, 0.1996025291737169, 0.08708830294199288, 0.12824086495675147]},
-    ],
-    reproduces: (f) => partialAddedOvermarkedLive(f),
-    // Only on the observed route: a file-direct write, a Create Prefab, then an undo (not checked to be that Create
-    // Prefab's, #2058 re-review). The first-diff line cannot exclude a projection that ALSO states a field the live tree
-    // lacks, so a bare shape would hide that (#2058 review).
-    stops: (f, ops) => {
-      if (!partialAddedOvermarkedLive(f)) return false;
-      const before = ops.slice(0, f.step + 1), file = before.findIndex((o) => o.kind === 'fileMutate');
-      const made = before.findIndex((o, i) => i > file && o.kind === 'createPrefab');
-      return file >= 0 && made > file && before.some((o, i) => i > made && o.kind === 'undo');
-    },
-  },
-  {
-    issue: 2100,
-    what: "#2100 (#2058, hunt seed 7645): a component removal the settle kept as unused (after an outside edit's rebuild), then the component re-added: the record and the save clear the removal (G1), the old kept-unused store keeps it. No save writes it; S8 deletes the store",
-    repro: [
-      {kind: 'removeComponent', u: [0.4056257554329932, 0.39117668056860566, 0.5714419099967927, 0.5315750995650887, 0.9070738325826824, 0.9020393050741404, 0.37790831131860614, 0.06581191555596888]},
-      {kind: 'instantiate', u: [0.8448484004475176, 0.6253486371133476, 0.5035986516159028, 0.8665857878513634, 0.5170961888507009, 0.7878143140114844, 0.18295332230627537, 0.7647610339336097]},
-      {kind: 'duplicate', u: [0.011624109465628862, 0.9367039608769119, 0.691789886681363, 0.7249870239757001, 0.4400071876589209, 0.8253199844621122, 0.6116923061199486, 0.45167486532591283]},
-      {kind: 'apply', u: [0.7985161130782217, 0.4567606549244374, 0.40499237342737615, 0.7974555031396449, 0.7602407394442707, 0.5543917084578425, 0.040601929649710655, 0.8694469735492021], check: 'rebuild-reload'},
-      {kind: 'outsideEdit', u: [0.9803751928266138, 0.571986474795267, 0.8921251546125859, 0.2460941793397069, 0.2755738932173699, 0.5028274613432586, 0.10348875285126269, 0.8907636271324009], check: 'rebuild-reload', variant: 'removeLeaf'},
-      {kind: 'addComponent', u: [0.33016201108694077, 0.14834991586394608, 0.16371638630516827, 0.3036507696378976, 0.5256671071983874, 0.1005841363221407, 0.04083234956488013, 0.5862007224932313]},
-    ],
-    reproduces: (f) => reAddedKeptRemoval(f),
-    stops: (f, ops) => reAddedKeptRemoval(f) && ops[f.step]?.kind === 'addComponent',
-  },  {
-    issue: 2013,
-    what: "#2013 (hunt seed 1062; #2009's P1 by the fold): today's load keeps a member's `removed` in its orphan store AND applies it, and the fold applies it too (the oracle marks it `(applied)`). Hub ruling 2026-10-02: a record is projected or unused, never both, so today is wrong; not patched on the old model, retired by #2001 S6 (save writes the record). Its `own` rows, first waived here, are #2018",
-    repro: [
-      {kind: 'delete', u: [0.5590389100834727, 0.7655044347047806, 0.44698118744418025, 0.02311297389678657, 0.09444080153480172, 0.98244315572083, 0.09199919365346432, 0.6827896372415125]},
-      {kind: 'apply', u: [0.6550896638073027, 0.3299250395502895, 0.3501399699598551, 0.08212947798892856, 0.8875960973091424, 0.30393532454036176, 0.4322215639986098, 0.8733348441310227], check: 'rebuild-reload'},
-      {kind: 'delete', u: [0.49076773901470006, 0.7339670513756573, 0.055244994116947055, 0.0027172567788511515, 0.8681969207245857, 0.6704316781833768, 0.3613628263119608, 0.6404079920612276]},
-      {kind: 'prefabEdit', u: [0.3152803545817733, 0.567811144515872, 0.8239632099866867, 0.25013977638445795, 0.11105125187896192, 0.500013978453353, 0.2667005807161331, 0.17943121818825603], inner: [{kind: 'delete', u: [0.5138724439311773, 0.41784890461713076, 0.45937095978297293, 0.8747622228693217, 0.01600198890082538, 0.9851582634728402, 0.42914512171410024, 0.8725892039947212]}]},
-    ],
-    reproduces: (f) => orphanBookedTwice(f),
-    // Tolerated, not a stop: frequent and benign (the save writes the row once), so the run goes on past it.
-    tolerates: (f) => orphanBookedTwice(f as StepFailure),
-  },
-  {
-    issue: 2063,
-    what: "#2063's sibling (hunt seed 8004, S7.3-exposed): duplicate, add a child, duplicate, Apply a member's component removal to its nested prefab; OR's record, reprojected fresh, states nothing on that member, while the old capture writes a vacuous restore (traitRemovals {Transform: false}) no layer needs. Main writes the same bytes with the record stale. The file's bytes differ, nothing a reload shows: an S6 writer acceptance case.",
-    repro: [
-      {kind: 'duplicate', u: [0.03413783456198871, 0.016128105344250798, 0.0018854951485991478, 0.3534541209228337, 0.7941476691048592, 0.6432676510885358, 0.9444652060046792, 0.07949005952104926]},
-      {kind: 'addChild', u: [0.12928652833215892, 0.42889489978551865, 0.265474597690627, 0.6893578884191811, 0.8305221966002136, 0.4527408753056079, 0.487001319648698, 0.5449036918580532]},
-      {kind: 'duplicate', u: [0.7256983604747802, 0.007711391197517514, 0.06003849231638014, 0.7175237217452377, 0.7810866506770253, 0.4057686429005116, 0.8911883099935949, 0.5475387549959123]},
-      {kind: 'apply', u: [0.8698288635350764, 0.23344396008178592, 0.2521734593901783, 0.3387978451792151, 0.18762129521928728, 0.006252508843317628, 0.6819386167917401, 0.11940287635661662]},
-      {kind: 'paste', u: [0.33335884497500956, 0.19453366426751018, 0.30241627083159983, 0.3949150762055069, 0.6194343185052276, 0.5457824829500169, 0.5210922542028129, 0.050197884906083345]},
-    ],
-    reproduces: (f) => vacuousRestore(f),
-    tolerates: (f) => vacuousRestore(f),
-  },
   {
     issue: 2061,
     what: "#2061 (the first three ops of #2058's hunt seed 7393, reached once #2059's fix cleared the P1 that stopped them): instantiate P, trash Q. The end walk's redo of the instantiate respawns P fresh, so QR's row placeholder takes P's row name \"C\"; the no-op rebuild names it \"QR\" from the kept orphan row the walk's earlier reload stored under that root guid. Pre-existing; S7 (#2046) moves undo respawns onto records",
@@ -238,19 +92,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
     reproduces: (f) => redoFreshRowName(f),
     // Tolerated, not a stop: it fires in the end-of-run respawn check, which REGRESSIONS reach too (#2058's 7393 for #2059).
     tolerates: (f) => redoFreshRowName(f),
-  },
-  {
-    issue: 1829,
-    what: "#1829 seen by the no-op rebuild's ROOT mark set (#2001 S6.0's check; hunt seed 178, first four ops): a file-direct write states an added component partially on an instance root (`Rotate3D: {speed: 2}` on the v20 root row); the load marks `speed`, and the record and the saved file state `speed` alone. The end walk's no-op rebuild goes through the old capture, which writes the component whole, so the rebuilt root marks `axis` too. Values agree. The same widening as the P1 entry above, by the rebuild instead of an undo's respawn. Hub ruling 2026-10-03 (recorded on #1829): the old capture is not fixed",
-    repro: [
-      {kind: 'agentInstantiate', u: [0.8289649484213442, 0.45128455059602857, 0.5751742965076119, 0.5908240049611777, 0.7225717976689339, 0.04018327035009861, 0.30001199222169816, 0.5947466057259589]},
-      {kind: 'prefabEdit', u: [0.43255663593299687, 0.4682694443035871, 0.1532983456272632, 0.29019599547609687, 0.4104846369009465, 0.9832396351266652, 0.5306948709767312, 0.7135171783156693], inner: [{kind: 'delete', u: [0.7833136622793972, 0.8184588793665171, 0.2849972709082067, 0.8266630317084491, 0.4073482546955347, 0.2752895476296544, 0.8164297712501138, 0.9005102918017656]}]},
-      {kind: 'duplicate', u: [0.5001395551953465, 0.5671875621192157, 0.7579644594807178, 0.9319786985870451, 0.05941782356239855, 0.3195134764537215, 0.7089909338392317, 0.7977708335965872]},
-      {kind: 'fileMutate', u: [0.05135307228192687, 0.1036165130790323, 0.8781819136347622, 0.6264823584351689, 0.9609711277298629, 0.36748331831768155, 0.6097434072289616, 0.9252105096820742]},
-    ],
-    reproduces: (f) => partialAddedOvermarkedRebuild(f, f),
-    // Tolerated, not a stop: it fires in the end-of-run rebuild check, after every other check of the run.
-    tolerates: (f) => partialAddedOvermarkedRebuild(f),
   },
 ];
 
@@ -301,6 +142,118 @@ export interface Reach {
 
 /** `runTag`: an entry re-pinned by editing its draws runs under the tag it was recorded with (`RunOpts.runTag`, #1946). */
 export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: Op[]; runTag?: number }[] = [
+  {
+    issue: 1829,
+    what: "Retired from KNOWN_OPEN by #2001 S8b step 6 (Detach's and Create Prefab's undo put the marks back as they were taken, `restoreMarksOnly`, and no longer derive more from the template: `restoreMarks`' added-component rule marked every field of the partially stated component, which was the widening; the records are seated next and projected). Before: #1829 seen by P1 (#2058, hunt seed 7512): a file-direct write states an added component partially (`Rotate3D: {speed: 2}`), Create Prefab turns the instance into a prefab and two undos bring it back. The undo respawns it from the old capture, which writes the component whole, so the live tree marks `axis` too, where the record keeps `speed` alone. The LIST is right (it is what the file stated); S6's save writes it, and the reload marks `speed` only. Values agree throughout. Hub ruling 2026-10-03: recorded on #1829, the old capture is not fixed",
+    reaches: { op: 4, outcome: 'done' },
+    repro: [
+      {kind: 'fileMutate', u: [0.4406395209953189, 0.13118481426499784, 0.531444427324459, 0.6088186670094728, 0.14829342090524733, 0.4819357134401798, 0.8098402046598494, 0.8826371389441192]},
+      {kind: 'editField', u: [0.1600618800148368, 0.12541370862163603, 0.3777471762150526, 0.8417782566975802, 0.8568708831444383, 0.2517908848822117, 0.9127532963175327, 0.2833624368067831], variant: 'toBase'},
+      {kind: 'createPrefab', u: [0.14408122119493783, 0.04904690128751099, 0.4958720800932497, 0.6683295532129705, 0.8172623903956264, 0.7895503570325673, 0.14383488637395203, 0.19527888391166925]},
+      {kind: 'undo', u: [0.19424327230080962, 0.12152680521830916, 0.4395646769553423, 0.23733717249706388, 0.051651057321578264, 0.4375051506794989, 0.49595680832862854, 0.802169177448377]},
+      {kind: 'undo', u: [0.07118040067143738, 0.4588431396987289, 0.9585348290856928, 0.08928052126429975, 0.29488438135012984, 0.1996025291737169, 0.08708830294199288, 0.12824086495675147]},
+    ],
+  },
+  {
+    issue: 2100,
+    what: "Retired from KNOWN_OPEN by #2001 S8b step 6 (an edit reprojects from the record without the load's settle, so the kept stores no longer follow the record and the fuzz no longer compares the fold's unused records with them; the save writes the record's unused part, which P1, P5 and the round trip check). Before: #2100 (#2058, hunt seed 7645): a component removal the settle kept as unused (after an outside edit's rebuild), then the component re-added: the record and the save clear the removal (G1), the old kept-unused store keeps it. No save writes it; S8 deletes the store",
+    reaches: { op: 5, outcome: 'done', skips: ['outsideEdit: redo to the end identity', 'outsideEdit: undo to the start identity'] },
+    repro: [
+      {kind: 'removeComponent', u: [0.4056257554329932, 0.39117668056860566, 0.5714419099967927, 0.5315750995650887, 0.9070738325826824, 0.9020393050741404, 0.37790831131860614, 0.06581191555596888]},
+      {kind: 'instantiate', u: [0.8448484004475176, 0.6253486371133476, 0.5035986516159028, 0.8665857878513634, 0.5170961888507009, 0.7878143140114844, 0.18295332230627537, 0.7647610339336097]},
+      {kind: 'duplicate', u: [0.011624109465628862, 0.9367039608769119, 0.691789886681363, 0.7249870239757001, 0.4400071876589209, 0.8253199844621122, 0.6116923061199486, 0.45167486532591283]},
+      {kind: 'apply', u: [0.7985161130782217, 0.4567606549244374, 0.40499237342737615, 0.7974555031396449, 0.7602407394442707, 0.5543917084578425, 0.040601929649710655, 0.8694469735492021], check: 'rebuild-reload'},
+      {kind: 'outsideEdit', u: [0.9803751928266138, 0.571986474795267, 0.8921251546125859, 0.2460941793397069, 0.2755738932173699, 0.5028274613432586, 0.10348875285126269, 0.8907636271324009], check: 'rebuild-reload', variant: 'removeLeaf'},
+      {kind: 'addComponent', u: [0.33016201108694077, 0.14834991586394608, 0.16371638630516827, 0.3036507696378976, 0.5256671071983874, 0.1005841363221407, 0.04083234956488013, 0.5862007224932313]},
+    ],
+  },
+  {
+    issue: 2013,
+    what: "Retired from KNOWN_OPEN by #2001 S8b step 6 (an edit reprojects from the record without the load's settle, so the kept stores no longer follow the record and the fuzz no longer compares the fold's unused records with them; the save writes the record's unused part, which P1, P5 and the round trip check). Before: #2013 (hunt seed 1062; #2009's P1 by the fold): today's load keeps a member's `removed` in its orphan store AND applies it, and the fold applies it too (the oracle marks it `(applied)`). Hub ruling 2026-10-02: a record is projected or unused, never both, so today is wrong; not patched on the old model, retired by #2001 S6 (save writes the record). Its `own` rows, first waived here, are #2018",
+    reaches: { op: 3, outcome: 'done', skips: ['prefabEditSave: redo refusal forgiven (rest of the walk not run)', 'prefabEditSave: undo to the start identity'] },
+    repro: [
+      {kind: 'delete', u: [0.5590389100834727, 0.7655044347047806, 0.44698118744418025, 0.02311297389678657, 0.09444080153480172, 0.98244315572083, 0.09199919365346432, 0.6827896372415125]},
+      {kind: 'apply', u: [0.6550896638073027, 0.3299250395502895, 0.3501399699598551, 0.08212947798892856, 0.8875960973091424, 0.30393532454036176, 0.4322215639986098, 0.8733348441310227], check: 'rebuild-reload'},
+      {kind: 'delete', u: [0.49076773901470006, 0.7339670513756573, 0.055244994116947055, 0.0027172567788511515, 0.8681969207245857, 0.6704316781833768, 0.3613628263119608, 0.6404079920612276]},
+      {kind: 'prefabEdit', u: [0.3152803545817733, 0.567811144515872, 0.8239632099866867, 0.25013977638445795, 0.11105125187896192, 0.500013978453353, 0.2667005807161331, 0.17943121818825603], inner: [{kind: 'delete', u: [0.5138724439311773, 0.41784890461713076, 0.45937095978297293, 0.8747622228693217, 0.01600198890082538, 0.9851582634728402, 0.42914512171410024, 0.8725892039947212]}]},
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S8b (hunt seed 9334): an Apply that promotes a scene-added node and applies the instance's removal of a nested row in one go stays on records (promoteAdded). The record keeps the inert statement it held under that removal (rule 3), which the fold now reports gone, since the row left the template; today's save drops it. The oracle skips the fold's side of a removed row as it skips today's (foldOracle.ts underRemoval). Mutation: no fold-side skip - red at the last Apply (P1 fold-only /N/A Transform.x (gone)).",
+    reaches: { op: 10, outcome: 'done' },
+    repro: [
+      {kind: 'reparent', u: [0.14729765825904906, 0.7056203151587397, 0.8803153492044657, 0.030130396829918027, 0.8929929926525801, 0.7160627292469144, 0.3103840632829815, 0.4190523289144039]},
+      {kind: 'agentSceneOps', u: [0.805107525549829, 0.9537722945678979, 0.6392960010562092, 0.933038136921823, 0.6509554900694638, 0.5157903232611716, 0.3023584894835949, 0.03925240854732692]},
+      {kind: 'reparent', u: [0.7541995225474238, 0.9714861051179469, 0.5314368749968708, 0.24240386858582497, 0.6897820972371846, 0.8380120473448187, 0.9928703384939581, 0.12475418951362371]},
+      {kind: 'reparent', u: [0.6580797890201211, 0.2474421274382621, 0.10527213080786169, 0.2181661098729819, 0.08366511529311538, 0.06062284857034683, 0.4337473716586828, 0.15453563444316387]},
+      {kind: 'apply', u: [0.2567939511500299, 0.8649849554058164, 0.18061125348322093, 0.13232987909577787, 0.5885519562289119, 0.2175396669190377, 0.6576776418369263, 0.7848888644948602], check: 'rebuild-reload'},
+      {kind: 'agentSceneOps', u: [0.2769585882779211, 0.11384347919374704, 0.7510635007638484, 0.016621330985799432, 0.77830107556656, 0.1575839463621378, 0.789320409996435, 0.28412280860356987]},
+      {kind: 'fileMutate', u: [0.070953119546175, 0.9601826823782176, 0.5106730277184397, 0.7922989814542234, 0.9922493558842689, 0.6635870523750782, 0.9985456804279238, 0.2039151145145297]},
+      {kind: 'duplicate', u: [0.2911684294231236, 0.4179104196373373, 0.4481188345234841, 0.7715089819394052, 0.5192979862913489, 0.4846566969063133, 0.8298155651427805, 0.6435194071382284]},
+      {kind: 'reparent', u: [0.5613875044509768, 0.13017440307885408, 0.9899658567737788, 0.25821774546056986, 0.315097042825073, 0.5929920275229961, 0.38747092382982373, 0.4807590413838625]},
+      {kind: 'delete', u: [0.6734134284779429, 0.933072647312656, 0.34962052246555686, 0.6165873224381357, 0.43744358769617975, 0.5164797233883291, 0.9786589797586203, 0.8907798260916024]},
+      {kind: 'apply', u: [0.0030093947425484657, 0.32409752323292196, 0.2056274393107742, 0.055924204643815756, 0.13344983733259141, 0.20460542268119752, 0.20157883618958294, 0.5832845808472484]},
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S8b (hunt seed 9339): a copy of a nested frame whose template list holds a legacy statement of a row the document dropped (a localId removedTraits, target gone) carries it verbatim on its own record. The fold keys it at the root as one legacy record; today's kept store reads the same statement as its leaves (-Transform). The oracle pairs such a held channel record leaf by leaf (foldOracle.ts heldChannel). Mutation: pairing only 'unresolved' records - red at the last duplicate (P1 fold-only legacy / kept-only -Transform).",
+    reaches: { op: 5, outcome: 'done' },
+    repro: [
+      {kind: 'delete', u: [0.4418386174365878, 0.3144390508532524, 0.3138002634514123, 0.8048170111142099, 0.11945514450781047, 0.2631049742922187, 0.06697587692178786, 0.1504045797046274]},
+      {kind: 'apply', u: [0.48616216657683253, 0.6910482398234308, 0.9840753083117306, 0.6103568868711591, 0.34366819355636835, 0.16473756544291973, 0.06712419097311795, 0.3385984217748046]},
+      {kind: 'addChild', u: [0.691345035796985, 0.9547003554180264, 0.5268418127670884, 0.17573576094582677, 0.21174548449926078, 0.599178233416751, 0.6074238216970116, 0.3162531307898462]},
+      {kind: 'duplicate', u: [0.07465214957483113, 0.5765944255981594, 0.1510369018651545, 0.5130520202219486, 0.8730962201952934, 0.8214969525579363, 0.3636237357277423, 0.45446476084180176]},
+      {kind: 'agentSceneOps', u: [0.1588041672948748, 0.15191168570891023, 0.8761150375939906, 0.9009287545923144, 0.7786258030682802, 0.6352745222393423, 0.9399119962472469, 0.726432231022045]},
+      {kind: 'duplicate', u: [0.16970122209750116, 0.3649371999781579, 0.4633252115454525, 0.2837028172798455, 0.5097466136794537, 0.5441570116672665, 0.06872722087427974, 0.34189283032901585]},
+    ],
+  },
+  {
+    issue: 1829,
+    what: "Retired from KNOWN_OPEN by #2001 S8b (a copy holding a node keeps its records, and a node the record holds no longer keeps its tree off records, so the end walk's no-op rebuild reprojects the tree from its records and the rebuilt root marks only what the file stated). Was: #1829 seen by the no-op rebuild's ROOT mark set (#2001 S6.0's check; hunt seed 178, first four ops): a file-direct write states an added component partially on an instance root (`Rotate3D: {speed: 2}` on the v20 root row); the load marks `speed`, and the record and the saved file state `speed` alone. The end walk's no-op rebuild goes through the old capture, which writes the component whole, so the rebuilt root marks `axis` too. Values agree. The same widening as the P1 entry above, by the rebuild instead of an undo's respawn. Hub ruling 2026-10-03 (recorded on #1829): the old capture is not fixed",
+    reaches: { op: 3, outcome: 'done' },
+    repro: [
+      {kind: 'agentInstantiate', u: [0.8289649484213442, 0.45128455059602857, 0.5751742965076119, 0.5908240049611777, 0.7225717976689339, 0.04018327035009861, 0.30001199222169816, 0.5947466057259589]},
+      {kind: 'prefabEdit', u: [0.43255663593299687, 0.4682694443035871, 0.1532983456272632, 0.29019599547609687, 0.4104846369009465, 0.9832396351266652, 0.5306948709767312, 0.7135171783156693], inner: [{kind: 'delete', u: [0.7833136622793972, 0.8184588793665171, 0.2849972709082067, 0.8266630317084491, 0.4073482546955347, 0.2752895476296544, 0.8164297712501138, 0.9005102918017656]}]},
+      {kind: 'duplicate', u: [0.5001395551953465, 0.5671875621192157, 0.7579644594807178, 0.9319786985870451, 0.05941782356239855, 0.3195134764537215, 0.7089909338392317, 0.7977708335965872]},
+      {kind: 'fileMutate', u: [0.05135307228192687, 0.1036165130790323, 0.8781819136347622, 0.6264823584351689, 0.9609711277298629, 0.36748331831768155, 0.6097434072289616, 0.9252105096820742]},
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S8b (hunt seed 9317, shrunk under the mutation): a scene-owned reference node held on its record (its anchor not projected) is held in the CURRENT form, its list as its own record states it (`withWrittenList`). A re-seed parses it from the old capture's row channels, and held as parsed it was written back in them (`checkScene`'s format check).",
+    reaches: { op: 7, outcome: 'done', skips: ['prefabEditSave: redo to the end identity', 'prefabEditSave: undo to the start identity'] },
+    repro: [
+      {kind: 'delete', u: [0.9828799574170262, 0.10072616045363247, 0.23528828634880483, 0.31568794255144894, 0.764273532666266, 0.8012104511726648, 0.07525429408997297, 0.31200877483934164]},
+      {kind: 'renamePrefab', u: [0.4524488812312484, 0.8915323240216821, 0.37610820308327675, 0.06658543669618666, 0.11171205644495785, 0.8784536041785032, 0.19051925605162978, 0.250859503634274]},
+      {kind: 'instantiate', u: [0.4822394766379148, 0.22965421620756388, 0.7153434860520065, 0.24475351558066905, 0.8790664344560355, 0.7368914561811835, 0.5478131780400872, 0.13776767090894282]},
+      {kind: 'createPrefab', u: [0.9144679121673107, 0.7058900769334286, 0.8589580885600299, 0.81836695689708, 0.9626131951808929, 0.09753766655921936, 0.18289162614382803, 0.3106644928921014]},
+      {kind: 'duplicate', u: [0.7197641741950065, 0.5161963822320104, 0.769292340381071, 0.8047973546199501, 0.03021568595431745, 0.6699770167469978, 0.9282924809958786, 0.2331722176168114]},
+      {kind: 'instantiate', u: [0.4107249095104635, 0.9674612185917795, 0.9147548852488399, 0.537292969180271, 0.42151154251769185, 0.9076637069229037, 0.044626150047406554, 0.46266292058862746]},
+      {kind: 'prefabEdit', u: [0.01621980289928615, 0.2982366569340229, 0.06940232473425567, 0.540405933978036, 0.8556878801900893, 0.917090741917491, 0.46071141003631055, 0.8548723545391113], inner: []},
+      {kind: 'apply', u: [0.7805455874186009, 0.7757968057412654, 0.6168932968284935, 0.6128117933403701, 0.5252006705850363, 0.8201435303781182, 0.32201238558627665, 0.5839786210563034]},
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S8b (hunt seed 9337's step-27 Apply, alone): an Apply promotes the user's node under HR's root into HR's prefab, under the guid it had (#1660), then re-seeds the tree. The re-seed carries the replaced record's links to nodes still hanging live under their row's node (`keepLiveLinks`, for a placeholder's capture, which states none), but NOT to one the tree now keys: carried, the promoted node was linked as the scene's own AND supplied as a member, and the fold placed it where nothing shows (P1).",
+    reaches: { op: 0, outcome: 'done' },
+    repro: [
+      {kind: 'apply', u: [0.3183270301669836, 0.08374947099946439, 0.037982882000505924, 0.8082847220357507, 0.15723491506651044, 0.1632392220199108, 0.141132983379066, 0.17808806337416172]},
+    ],
+  },
+  {
+    issue: 2102,
+    what: "Retired from KNOWN_OPEN by #2001 S8b (the Detach records the Missing Prefab placeholder of a template reference node whose frame it makes an entry, as a save writes it and a load reads it back: once the re-seed went, nothing else did; a Delete, a copy and the undo steps around a Missing Prefab placeholder keep its records, so the walk back across the detach seats records and no longer re-seeds from the capture): passes with its record judged, the trash leaving a placeholder live and the detach done. Before: #2102 (from #2001 S6; was a #1939 regression, hunt seeds 3266, 1269): the undo walk back across the detach re-seeds the record from the old capture while the template reference node is a placeholder; the capture states it as a row `added` node, the parse holds it, and the v20 save writes it back, so a Missing Prefab placeholder and its kept rows outlive the template dropping the node. Forward steps pass. Before:: a template reference node of a trashed prefab; a detach of the instance holding it makes its frame an ENTRY. A placeholder entry stays one across the reload, and since #2001 S5 an expanded one reloads as a placeholder too, keeping its list (ruling B: no copy expands)",
+    reaches: { op: 3, outcome: 'done' },
+    repro: [
+      {kind: 'prefabEdit', u: [0.2832771616522223, 0.07422894821502268, 0.7528395308181643, 0.3064988814294338, 0.2902603386901319, 0.7280649025924504, 0.5037771083880216, 0.8082152912393212], inner: [{kind: 'instantiate', u: [0.13935406086966395, 0.8303816181141883, 0.6744375759735703, 0.2890225602313876, 0.2257074019871652, 0.9767554379068315, 0.2289160017389804, 0.8437706183176488]}]},
+      {kind: 'trashPrefab', u: [0.21610835962928832, 0.40136740216985345, 0.25969059206545353, 0.9192028611432761, 0.3998060973826796, 0.17308109835721552, 0.8394311657175422, 0.928628564812243]},
+      {kind: 'saveReload', u: [0.6892608145717531, 0.4650746730621904, 0.21657891012728214, 0.23295434354804456, 0.3015429456718266, 0.5181264781858772, 0.30148910149000585, 0.7050725878216326]},
+      {kind: 'detach', u: [0.4603799900505692, 0.20984725933521986, 0.8734895254019648, 0.8137040538713336, 0.9327120224479586, 0.7904459990095347, 0.9528898776043206, 0.3289412825834006]},
+    ],
+  },
   {
     issue: 2001,
     what: "#2001 S6 (hunt seed 178 at the verify length; the oracle fuzz's seed 178): a delete of a nested instance that holds a user's instance with a removed member, in a tree a record of which the store cannot restore exactly — so its undo and redo fall back to the snapshot. The undo's save wrote the removed member's row without its pin (the delete had dropped the instance's record, so the re-seed had none to carry it from), and the redo's wrote no pin for the members inside the deleted instance (the re-seed dropped the pins under a row stated removed). Fixed: the fallback undo seats the before-records stale (the re-seed then carries the pin), and the re-seed carries the pins a stale record holds under a row stated removed. Mutations: without the seating, red at the undo; without the carry, red at the redo.",
@@ -449,7 +402,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   },
   {
     issue: 1914,
-    what: "#1914 R4 (hunt seeds 3121, 3189, 3256): a removal record an Apply made unused (the template stopped adding the component), then the member, or the nested frame root above it, deleted by the instance. The save after the delete put the load's kept unused part back for the gone member and the reload kept none, so save→reload→save differed. `withKeptUnused` now writes a kept part only for a member still live: the instance's delete takes the records with it (seed 3121)",
+    what: "#1914 R4 (hunt seeds 3121, 3189, 3256): a removal record an Apply made unused (the template stopped adding the component), then the member, or the nested frame root above it, deleted by the instance. The save after the delete put the load's kept unused part back for the gone member and the reload kept none, so save→reload→save differed. `withKeptUnused` now writes a kept part only for a member still live: the instance's delete takes the records with it (seed 3121) Since #2001 S8b the instance record holds this state; the kept stores are deleted.",
     reaches: { op: 4, outcome: 'done' },
     repro: [
       {kind: 'removeComponent', u: [0.8717832013498992, 0.4098781473003328, 0.35788252600468695, 0.36732389219105244, 0.5757638479117304, 0.2722287985961884, 0.7606130202766508, 0.5879398272372782]},
@@ -461,7 +414,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   },
   {
     issue: 1914,
-    what: "#1914 R4 (hunt seeds 3121, 3189, 3256): a removal record an Apply made unused (the template stopped adding the component), then the member, or the nested frame root above it, deleted by the instance. The save after the delete put the load's kept unused part back for the gone member and the reload kept none, so save→reload→save differed. `withKeptUnused` now writes a kept part only for a member still live: the instance's delete takes the records with it (seed 3256)",
+    what: "#1914 R4 (hunt seeds 3121, 3189, 3256): a removal record an Apply made unused (the template stopped adding the component), then the member, or the nested frame root above it, deleted by the instance. The save after the delete put the load's kept unused part back for the gone member and the reload kept none, so save→reload→save differed. `withKeptUnused` now writes a kept part only for a member still live: the instance's delete takes the records with it (seed 3256) Since #2001 S8b the instance record holds this state; the kept stores are deleted.",
     reaches: { op: 4, outcome: 'done', skips: ['prefabEditSave: redo to the end identity', 'prefabEditSave: undo to the start identity'] },
     repro: [
       {kind: 'reparent', u: [0.9342352186795324, 0.11151574295945466, 0.07972302683629096, 0.08700698404572904, 0.7305098192300647, 0.7869342488702387, 0.9138896428048611, 0.2776011188980192]},
@@ -473,7 +426,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   },
   {
     issue: 1914,
-    what: "#1914 R4 (hunt seeds 3121, 3189, 3256): a removal record an Apply made unused (the template stopped adding the component), then the member, or the nested frame root above it, deleted by the instance. The save after the delete put the load's kept unused part back for the gone member and the reload kept none, so save→reload→save differed. `withKeptUnused` now writes a kept part only for a member still live: the instance's delete takes the records with it (seed 3189)",
+    what: "#1914 R4 (hunt seeds 3121, 3189, 3256): a removal record an Apply made unused (the template stopped adding the component), then the member, or the nested frame root above it, deleted by the instance. The save after the delete put the load's kept unused part back for the gone member and the reload kept none, so save→reload→save differed. `withKeptUnused` now writes a kept part only for a member still live: the instance's delete takes the records with it (seed 3189) Since #2001 S8b the instance record holds this state; the kept stores are deleted.",
     reaches: { op: 7, outcome: 'done', skips: ['prefabEditSave: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       {kind: 'removeComponent', u: [0.4861626385245472, 0.6464858329854906, 0.34910731529816985, 0.42416101857088506, 0.08656954485923052, 0.35927806072868407, 0.05044971057213843, 0.6291338850278407]},
@@ -497,7 +450,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   },
   {
     issue: 1914,
-    what: "#1914 R4 (F5, hunt seeds 1163, 1288, 3217, 3275): a prefab edit removes a component from a template member, and the scene's removal record for it (`traitRemovals`) was dropped by the next save. The fold now records a writer's removal statement whose component the member's base lacks (`unusedRemovalsOf`), the load keeps it as an unused override, and every save writes it back (`withKeptUnused`)",
+    what: "#1914 R4 (F5, hunt seeds 1163, 1288, 3217, 3275): a prefab edit removes a component from a template member, and the scene's removal record for it (`traitRemovals`) was dropped by the next save. The fold now records a writer's removal statement whose component the member's base lacks (`unusedRemovalsOf`), the load keeps it as an unused override, and every save writes it back (`withKeptUnused`) Since #2001 S8b the instance record holds this state; the kept stores are deleted.",
     reaches: { op: 2, outcome: 'done', skips: ['prefabEditSave: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       {kind: 'createPrefab', u: [0.05658840108662844, 0.4995983433909714, 0.7227386357262731, 0.09445394272916019, 0.47334896260872483, 0.47485498804599047, 0.9995071166194975, 0.4058611218351871]},
@@ -522,7 +475,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1908,
     what: "#1880 F7d close-out reviewer's hunt seed 7035: Create Prefab of Plain swallowed the Leaf instance, a prefab-edit save then added N368 under Leaf's nested Q row (a template-keyed node, derived through the new prefab's frame), and the walk undid the create. The undo reversed only the renames its stamp recorded, so N368 kept a guid of the removed frame, and T4's no-op rebuild derived it from Leaf. The undo now re-derives what the rename did not put back (`rederiveUntaggedTree`)",
-    reaches: { op: 14, outcome: 'done', skips: ['prefabEditSave: undo refusal forgiven (rest of the walk not run)'] },
+    reaches: { op: 14, outcome: 'done', skips: ['prefabEditSave: redo to the end identity', 'prefabEditSave: undo to the start identity'] },
     repro: [
       { kind: 'delete', u: [0.9922234723344445, 0.25419696839526296, 0.9724069777876139, 0.02157533122226596, 0.8052881832700223, 0.635680423816666, 0.21592384902760386, 0.03853950975462794] },
       { kind: 'duplicate', u: [0.5128551761154085, 0.3704429541248828, 0.8398871638346463, 0.27259831805713475, 0.10714971576817334, 0.2681458839215338, 0.28937951964326203, 0.7071443223394454] },
@@ -552,8 +505,8 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   },
   {
     issue: 1893,
-    what: "#1880 F6 precondition hunt seed 1294: addComponent, Create Prefab (HR's row for QR now states the added Rotate3D), an outside edit of HR, and an undo it refuses. The end-of-run walk undoes and REDOES the Add Rotate3D, and the redo's `reconcileOverrideMarks` unmarked every field equal to the effective base, which HR's row now supplies. A load marks what an enclosing row states whatever its value (I2), so T4's no-op rebuild put the marks back. The reconcile now marks what the enclosing row states, as `takeUnmarkedFromBase` already did",
-    reaches: { op: 3, outcome: 'refused', skips: ['outsideEdit: redo to the end identity', 'outsideEdit: undo op refusal forgiven', 'outsideEdit: undo to the start identity'] },
+    what: "#1880 F6 precondition hunt seed 1294: addComponent, Create Prefab (HR's row for QR now states the added Rotate3D), an outside edit of HR, and an undo it refuses. The end-of-run walk undoes and REDOES the Add Rotate3D, and the redo's `reconcileOverrideMarks` unmarked every field equal to the effective base, which HR's row now supplies. A load marks what an enclosing row states whatever its value (I2), so T4's no-op rebuild put the marks back. The reconcile now marks what the enclosing row states, as `takeUnmarkedFromBase` already did. Since #2001 S8b the walk's undo of the Add Rotate3D is REFUSED before it writes (`requireRowRecords`): the record its rows name went with the Create Prefab, whose undo the outside edit refused. So this repro now pins that refusal, and the walk stops there; the reconcile is held by overrideMarkUndo's #1893 describe",
+    reaches: { op: 3, outcome: 'refused', skips: ['outsideEdit: undo op refusal forgiven', 'outsideEdit: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       { kind: 'addComponent', u: [0.9362869369797409, 0.44597287848591805, 0.2419073861092329, 0.062128879595547915, 0.2224271954037249, 0.8683678451925516, 0.7178896840196103, 0.7713594404049218] },
       { kind: 'createPrefab', u: [0.4144869849551469, 0.4089658232405782, 0.20890062884427607, 0.9231097148731351, 0.3927326067350805, 0.41872269148007035, 0.3743586875498295, 0.5361575500573963] },
@@ -1889,8 +1842,8 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   },
   {
     issue: 2058,
-    what: "#2058 (hunt seed 7395, S7.2's hunt): a duplicate, its nested prefab trashed, a prefab edit entered and left, then a delete of a node of the Missing Prefab ROW: the editor refuses it in the scene too (#2028 close-out: a delete would come back on reload, and the panels toast it), and the harness counted only the under-placeholder child as a scene refusal, so it read the refusal as an op that threw. Mutation: drop 'missing-prefab-row' from editRefusable",
-    reaches: { op: 3, outcome: 'refused', skips: ['assetDelete: undo to the start identity', 'assetDelete: redo to the end identity'] },
+    what: "#2058 (hunt seed 7395, S7.2's hunt): a duplicate, its nested prefab trashed, a prefab edit entered and left, then a delete of the Missing Prefab ROW's placeholder. Refused in the scene too until #2001 S8b (the harness once read that refusal as an op that threw); since S8b the delete runs, the record holds the row's removal, and every check after it holds",
+    reaches: { op: 3, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
     repro: [
       { kind: 'duplicate', u: [0.05223376024514437, 0.11405750131234527, 0.5913086000364274, 0.364982504863292, 0.06482559815049171, 0.6461077849380672, 0.23906716099008918, 0.10373092931695282] },
       { kind: 'trashPrefab', u: [0.6854987577535212, 0.24980279942974448, 0.8638446554541588, 0.73848806344904, 0.4498169731814414, 0.41810061945579946, 0.4251072737388313, 0.9887261465191841] },
@@ -2075,7 +2028,9 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
       { kind: 'duplicate', u: [0.19415016961283982, 0.4474799770396203, 0.9411376256030053, 0.5816613845527172, 0.7377476533874869, 0.5583138961810619, 0.4969835449010134, 0.41582099674269557] },
       { kind: 'fileMutate', u: [0.5606632409617305, 0.2846169436816126, 0.5131777341011912, 0.38927842071279883, 0.8741908387746662, 0.4059190391562879, 0.3794119181111455, 0.9432923083659261] },
       { kind: 'duplicate', u: [0.5552007004152983, 0.20096299168653786, 0.8917422175873071, 0.6357061716262251, 0.2474950491450727, 0.5353377636056393, 0.06109403306618333, 0.7934353048913181] },
-      { kind: 'revert', u: [0.9889315299224108, 0.9169710406567901, 0.011744194896891713, 0.41307879192754626, 0.7000407399609685, 0.15838396083563566, 0.19087399588897824, 0.2469632790889591] },
+      // u[0] re-aimed (0.9889 → 0.6) when the op-3 copy went on records (#2001 S8b): it is reprojected, so it respawns, and
+      // the two R copies swapped places in entity order; 0.6 picks the op-3 copy (R, 10000005-…) the replay was recorded on.
+      { kind: 'revert', u: [0.6, 0.9169710406567901, 0.011744194896891713, 0.41307879192754626, 0.7000407399609685, 0.15838396083563566, 0.19087399588897824, 0.2469632790889591] },
     ],
   },
   {
@@ -2105,6 +2060,102 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
       { kind: 'editField', u: [0.3087176049593836, 0.08641076786443591, 0.48011893942020833, 0.11065501789562404, 0.38283666386269033, 0.6341514706145972, 0.41544443368911743, 0.5414899603929371] },
       { kind: 'apply', u: [0.1346119437366724, 0.8548611195292324, 0.6233382462523878, 0.004290478304028511, 0.4399559604935348, 0.44068856397643685, 0.37521811039187014, 0.42619797331281006] },
       { kind: 'undo', u: [0.727975323330611, 0.14003844745457172, 0.19168123044073582, 0.31353538925759494, 0.3851139785256237, 0.08903217664919794, 0.07624079426750541, 0.3546358032617718] },
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S8b (hunt seed 9457): an Apply's fan-out gave another instance of R a member (the promoted copy of B); its record, kept fresh, did not pin it, as a placement or a load does, so the pin was the live tree's alone. An outside edit then took B out of R, and that instance's written entry lost B's pin, which a save + reload keeps (rule 5; I23). the Apply's fan-out now pins each member it built that the record does not (pinBuiltMembers). Red before the fix.",
+    reaches: { op: 3, outcome: 'done', skips: ['outsideEdit: undo refusal forgiven (rest of the walk not run)'] },
+    repro: [
+      { kind: 'renamePrefab', u: [0.27634194889105856, 0.4577517674770206, 0.790857867570594, 0.17745577450841665, 0.6695008508395404, 0.4683411712758243, 0.7442154081072658, 0.6254070028662682] },
+      { kind: 'duplicate', u: [0.4336226866580546, 0.6469998280517757, 0.6702948119491339, 0.8618352920748293, 0.8541898254770786, 0.43241015123203397, 0.08783161104656756, 0.43009473010897636] },
+      { kind: 'apply', u: [0.48841181420721114, 0.4724172137212008, 0.8885786675382406, 0.4990156914573163, 0.47568632662296295, 0.30489105149172246, 0.8304307223297656, 0.2706578930374235] },
+      { kind: 'outsideEdit', u: [0.38454786175861955, 0.6435880903154612, 0.2443773855920881, 0.460895607015118, 0.25649287388660014, 0.3123049146961421, 0.6324510674457997, 0.11468114634044468], variant: 'removeLeaf' },
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S8b (hunt seed 9414): OR states a component on a node its template ADDED under member A of its nested R, then deletes A; an Apply writes A's removal into O. Rule 3 keeps the statement on OR's record, inert (S8a's Apply lost it), and today's load keeps the row as an orphan. Its key (`a+k`) names R's frame, not A, so the oracle, skipping kept rows under a removed row BY PATH, compared it. It now asks the fold: a row the record does not project and the restore of A does (foldOracle.ts `beneath`). Red before that.",
+    reaches: { op: 3, outcome: 'done', skips: [] },
+    repro: [
+      { kind: 'detach', u: [0.18710970738902688, 0.628009635489434, 0.674500162480399, 0.7497323777060956, 0.5762502304278314, 0.26008391031064093, 0.5780069509055465, 0.4633200247772038] },
+      { kind: 'agentSetTraits', u: [0.5957637161482126, 0.07360243750736117, 0.464351573260501, 0.9149727560579777, 0.11362719349563122, 0.2614142803940922, 0.872935552848503, 0.6078289339784533] },
+      { kind: 'delete', u: [0.3850385178811848, 0.1951310366857797, 0.8565071655903012, 0.21236372808925807, 0.29161099367775023, 0.15440171770751476, 0.621466840384528, 0.25394892669282854] },
+      { kind: 'apply', u: [0.15309442952275276, 0.9558806254062802, 0.8230730760842562, 0.968575372826308, 0.08161300467327237, 0.8787680000532418, 0.4197405877057463, 0.7902135523036122], check: 'rebuild-reload' },
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S8b (hunt seed 9414, second shape): as the entry before, with the statement on B, A's CHILD in the same frame: a member key names its frame and its member, not its parent, so `/R/B` is not under `/R/A` by path either. Red before the fold-based skip.",
+    reaches: { op: 3, outcome: 'done', skips: [] },
+    repro: [
+      { kind: 'detach', u: [0.18710970738902688, 0.628009635489434, 0.674500162480399, 0.7497323777060956, 0.5762502304278314, 0.26008391031064093, 0.5780069509055465, 0.4633200247772038] },
+      { kind: 'agentSetTraits', u: [0.46038467925973237, 0.5883078400511295, 0.024216954596340656, 0.011271236464381218, 0.13640543539077044, 0.1380322161130607, 0.7557368611451238, 0.4307414994109422] },
+      { kind: 'delete', u: [0.3850385178811848, 0.1951310366857797, 0.8565071655903012, 0.21236372808925807, 0.29161099367775023, 0.15440171770751476, 0.621466840384528, 0.25394892669282854] },
+      { kind: 'apply', u: [0.15309442952275276, 0.9558806254062802, 0.8230730760842562, 0.968575372826308, 0.08161300467327237, 0.8787680000532418, 0.4197405877057463, 0.7902135523036122], check: 'rebuild-reload' },
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S8b (hunt seed 9414, third shape, fails on S8a as well, where the record went stale first): a deleted member M of a nested Q keeps its field statement (rule 3); Q is trashed, so the capture holds M's row whole as an orphan. The oracle's translation dropped a removed row's fields as the capture does, except under a removal; a removed row the orphan store keeps under a placeholder is now compared whole (s4Seams.ts `translated`; not every orphan-kept one: an Apply-orphaned removal is written without its fields). Red before that.",
+    reaches: { op: 3, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
+    repro: [
+      { kind: 'editField', u: [0.5501009537838399, 0.9492448738310486, 0.4299872468691319, 0.3526651202701032, 0.714986368548125, 0.07751435716636479, 0.5180341717787087, 0.8029306449461728] },
+      { kind: 'delete', u: [0.5798122053965926, 0.449846449540928, 0.12114322138950229, 0.8214718780945987, 0.35860167583450675, 0.9008636339567602, 0.1693034847266972, 0.6681010210886598] },
+      { kind: 'trashPrefab', u: [0.9746229606680572, 0.8903964899946004, 0.5306317752692848, 0.8764574979431927, 0.29970959411002696, 0.7715321211144328, 0.4397868695668876, 0.4581256357487291] },
+      { kind: 'instantiate', u: [0.3607089591678232, 0.09395119710825384, 0.8714432551059872, 0.773350470000878, 0.3652473215479404, 0.9620979512110353, 0.9156197882257402, 0.08638397674076259] },
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S8b (hunt seed 9451): O's template, edited, adds an instance R2 of P under QR, a member of OR's nested R (a P). A Duplicate of R makes R2 a root of its own in the copy (it is plain content of R's frame, which O added), but the records the copy carried promoted only the OUTERMOST frame in it, so the seat found a root it had no record for and the copy went the stale path; its undo marked every record stale, and the save wrote the placeholder HR's reference node without its rows (save -> reload -> save not byte-identical). A frame root now gets a promoted record unless a copied frame above it holds it as its own documents' node (instanceEdits.ts `copyRecordsOf`). Red before that.",
+    reaches: { op: 3, outcome: 'done', skips: [] },
+    repro: [
+      { kind: 'trashPrefab', u: [0.1770537314005196, 0.48975436529144645, 0.9418331612832844, 0.7450509562622756, 0.02371449046768248, 0.8283546918537468, 0.19024347979575396, 0.20468711713328958] },
+      { kind: 'prefabEdit', u: [0.2559645725414157, 0.0060135978274047375, 0.7591847735457122, 0.46782737295143306, 0.5690745362080634, 0.33512943680398166, 0.6015362122561783, 0.4835512680001557], inner: [{ kind: 'instantiate', u: [0.5119395703077316, 0.9508645772002637, 0.761014349758625, 0.1897711087949574, 0.343705847626552, 0.45632202667184174, 0.9561018205713481, 0.6475788250099868] }] },
+      { kind: 'duplicate', u: [0.24961207015439868, 0.644863088382408, 0.5894869554322213, 0.8286733687855303, 0.08972606388852, 0.7659993844572455, 0.3592096301726997, 0.4930855252314359] },
+      { kind: 'undo', u: [0.6201161332428455, 0.5312256237957627, 0.5569045736920089, 0.3000707433093339, 0.9310300159268081, 0.32806204073131084, 0.1705440510995686, 0.5133145621512085] },
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S8b (hunt seed 9448, an ORACLE false positive): after the delete, the record keeps a field statement (Transform.z) on a template-added `a+k` row that sits under a row the record removes, inert (rule 3; visible-diff (b)). The oracle skipped kept rows under a removed row BY PATH, and an `a+k` key names its frame and member, not the member it hangs under, so it reported the statement as kept-only unused (P1). foldOracle.ts `beneath` finds the row by the fold (the restore of the removed row projects it). Same mechanism as hunt seed 9414, reached through a trashed prefab, a prefab-edit instantiate and agent scene ops. Red before that.",
+    reaches: { op: 4, outcome: 'done', skips: [] },
+    repro: [
+      { kind: 'trashPrefab', u: [0.9210921737831086, 0.5284310865681618, 0.04756392911076546, 0.32094286917708814, 0.5377314786892384, 0.6930611704010516, 0.32338487706147134, 0.852304078405723] },
+      { kind: 'prefabEdit', u: [0.49175792071036994, 0.07748379744589329, 0.16877477918751538, 0.37079001194797456, 0.49312959401868284, 0.29133980674669147, 0.8687605843879282, 0.7445960559416562], inner: [{ kind: 'instantiate', u: [0.0576484112534672, 0.6994264130480587, 0.6478409483097494, 0.4311527486424893, 0.8063530875369906, 0.2600798031780869, 0.68611801113002, 0.7893279851414263] }] },
+      { kind: 'editField', u: [0.7351717229466885, 0.5369920989032835, 0.951515985885635, 0.09113738755695522, 0.16878654365427792, 0.43330493243411183, 0.28439793549478054, 0.07694878801703453] },
+      { kind: 'agentSceneOps', u: [0.5596124301664531, 0.16455457918345928, 0.892976681701839, 0.839920952450484, 0.11916808318346739, 0.13169948616996408, 0.01472170022316277, 0.19015722628682852] },
+      { kind: 'delete', u: [0.3741231912281364, 0.08060833625495434, 0.2816691135521978, 0.22127438709139824, 0.4567587848287076, 0.11830007284879684, 0.5651392848230898, 0.9027724298648536] },
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S8b (hunt seed 8009, an ORACLE false positive): an agent op adds Rotate3D to member A of R, A is deleted, and an Apply writes the removal into P. Rule 3 keeps the statement on R's removed row, and the Apply's reprojection writes the entry from the record, so the orphan store keeps the row WHOLE and the capture reads it back whole. s4Seams.ts `translated` dropped every removed row's statements outside a Missing Prefab placeholder (I25 after the reparent: traits undefined vs Rotate3D). It now compares each channel the kept orphan row states. Red before that.",
+    reaches: { op: 6, outcome: 'done', skips: [] },
+    repro: [
+      { kind: 'trashPrefab', u: [0.2633193025831133, 0.6498579091858119, 0.3929952373728156, 0.9824836121406406, 0.7197198255453259, 0.05524512380361557, 0.42677958705462515, 0.22663832013495266] },
+      { kind: 'agentSceneOps', u: [0.5168025267776102, 0.43439970863983035, 0.8551787801552564, 0.663505133241415, 0.23280071886256337, 0.988640820607543, 0.6343043462838978, 0.8018210772424936] },
+      { kind: 'instantiate', u: [0.7463424417655915, 0.7522928491234779, 0.648608555085957, 0.7063388032838702, 0.7734722748864442, 0.8658107980154455, 0.39233152219094336, 0.9290391616523266] },
+      { kind: 'delete', u: [0.5909653708804399, 0.9422573561314493, 0.654335830360651, 0.18925357097759843, 0.3872544264886528, 0.9159720232710242, 0.8521272337529808, 0.6969722125213593] },
+      { kind: 'delete', u: [0.6360970416571945, 0.8414453112054616, 0.2196008467581123, 0.7632868296932429, 0.3514784260187298, 0.4247536144685, 0.17423226474784315, 0.25778264133259654] },
+      { kind: 'apply', u: [0.23795702727511525, 0.11178856575861573, 0.8813055681530386, 0.013743198942393064, 0.02523534814827144, 0.6077950450126082, 0.6888973258901387, 0.28136357641778886] },
+      { kind: 'reparent', u: [0.3322127640713006, 0.5393436197191477, 0.4296689289622009, 0.9250920345075428, 0.9869077131152153, 0.6186751048080623, 0.5613775688689202, 0.5259729279205203] },
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S8b (hunt seed 8032): R, an instance of P with H nested, is detached; P is trashed; the walk undoes the Detach, then an Apply to H. The Detach's undo relinked R's plain entities to P, which no longer loads (every link resolved, so `requireLinks` asked nothing), and seated its records back; the Apply's undo then took R as projectable and threw rebuilding it from P. Fixed: Detach's undo asks `requireLinks` of every link and refuses while P is gone (the trash taints the segment, `assetDelete`)",
+    reaches: { op: 7, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
+    repro: [
+      { kind: 'duplicate', u: [0.8187255710363388, 0.19689690368250012, 0.715152348857373, 0.7226181295700371, 0.6381371805910021, 0.27476754877716303, 0.6089363573119044, 0.8648644518107176] },
+      { kind: 'cut', u: [0.12369482475332916, 0.05289153312332928, 0.6851326185278594, 0.12307544215582311, 0.6104684870224446, 0.26293619931675494, 0.4840208082459867, 0.9771775000263005] },
+      { kind: 'detach', u: [0.22479889588430524, 0.0030774723272770643, 0.7846913835965097, 0.05376961431466043, 0.5092979448381811, 0.3536405898630619, 0.16879331157542765, 0.3409189824014902] },
+      { kind: 'paste', u: [0.6770369231235236, 0.9751009484753013, 0.4588079941459, 0.7994299770798534, 0.20474239042960107, 0.018068674253299832, 0.1293962704949081, 0.7441993190441281] },
+      { kind: 'apply', u: [0.39667491358704865, 0.020631644874811172, 0.13756049470975995, 0.9264176040887833, 0.29130656248889863, 0.5667395312339067, 0.2667219510767609, 0.06517182546667755] },
+      { kind: 'renamePrefab', u: [0.46644100616686046, 0.9491556943394244, 0.3208945142105222, 0.021118161967024207, 0.7603487404994667, 0.8564518021885306, 0.06807488715276122, 0.2669390744995326] },
+      { kind: 'detach', u: [0.06688332161866128, 0.6946881860494614, 0.2665958320721984, 0.5674304543063045, 0.8620331815909594, 0.9083743314258754, 0.09638037416152656, 0.49108412442728877] },
+      { kind: 'trashPrefab', u: [0.3363701975904405, 0.6394898821599782, 0.11000243900343776, 0.23431037133559585, 0.9473079708404839, 0.25993252359330654, 0.10916272760368884, 0.9273152293171734] },
     ],
   },
 ];

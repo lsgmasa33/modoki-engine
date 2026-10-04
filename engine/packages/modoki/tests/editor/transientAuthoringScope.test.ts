@@ -63,7 +63,9 @@ function deleteEntitiesImpl(ids: number[]) {
   }
 }
 
-vi.mock('../../src/runtime/core/ecs/world', () => ({
+vi.mock('../../src/runtime/core/ecs/world', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  onWorldSwap: () => () => {},
   // #1461: tagEntityTreeAsInstance now stamps member guids, and applyGuidRemap re-indexes each
   // renamed entity. This mock is an explicit list, so a new reachable export must be named here.
   indexEntityGuid: () => {},
@@ -76,7 +78,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   unregisterEntity: (e: any) => index.delete(e.id()),
   destroyEntity: (e: any) => { ((e: any) => index.delete(e.id()))(e); e.destroy(); },
 }));
-vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
+vi.mock('../../src/runtime/core/ecs/entityUtils', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
   getAllEntities: () => getAllEntitiesImpl(),
   findEntity: (id: number) => findEntityImpl(id),
   markStructureDirty: vi.fn(),
@@ -102,13 +105,11 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (n: string) => TRAITS.find((t) => t.name === n),
   getAllTraits: () => TRAITS,
 }));
-vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn() }));
+vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(), getCachedPrefab: () => undefined }));
 
 beforeEach(async () => {
   testWorld = createWorld();
   index.clear();
-  const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
-  clearAllOverrideMarks();
 });
 
 const SRC = 'cccccccc-0000-4000-8000-00000000c0e8';
@@ -255,6 +256,7 @@ describe('a rebuild — #1301', () => {
 
   it('does not invent Transient for an authored instance', async () => {
     const { m, root } = await setup();
+    await placed(root); // the editor drop's door: a durable root guid, and its record (#2001 S8b)
     const { Transient } = await import('../../src/runtime/core/traits/Transient');
     expect(m.refreshInstances(SRC, [root], shipPrefab as never, shipPrefab as never)).toBe(1);
     const newRoot = currentRoot();
@@ -366,3 +368,9 @@ describe('runtimeExcludedMessage — one wording, and only one', () => {
     expect(runtimeExcludedMessage(4)).toContain('4 runtime entities were left out');
   });
 });
+
+async function placed(root: number): Promise<void> {
+  const { ensureGuid } = await import('../../src/editor/undo/entityRef');
+  const { place } = await import('../../src/editor/instance/instanceEdits');
+  ensureGuid(root); place(root);
+}

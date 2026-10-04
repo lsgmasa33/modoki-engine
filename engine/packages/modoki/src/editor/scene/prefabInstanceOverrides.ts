@@ -6,11 +6,11 @@ import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitDataFull } from '../../runtime/core/ecs/entityUtils';
-import { getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
 import { type PrefabFile, valuesEqual } from './prefab';
 import { baseTokenResolver } from './prefabTokens';
 import { instanceMovedMembers } from './prefabMembers';
+import { overrideKeysOf } from '../instance/instanceOverrideView';
 
 /** Get override values: fields that differ from the prefab source.
  *  Returns a nested record keyed by traitName → fieldName → live value. */
@@ -216,8 +216,8 @@ export function withOverridesFolded(prefab: PrefabFile, overrides: Record<number
 /** `diffs` in the ONE key order a save writes (#1896): traits in the order {@link collectComparableTraits} reads them
  *  (the registry's), each trait's fields in the order it read them (the schema's — `writtenTraitKeys`' order for a
  *  plain entity; an AoS trait's live order). {@link recordedOverrides} builds the object in HISTORY order (the record's
- *  insertion order). That order is what the session happened to mark first, and a reload re-seeds marks in file order
- *  with a rotation mark pulling in its whole group (`markOverride`), so a save → reload → save rewrote `{rx,x,ry,rz}` as
+ *  insertion order). That order is what the session happened to record first, and a reload re-reads the record in file
+ *  order with a rotation key pulling in its whole group (`ROTATION_MARKS`), so a save → reload → save rewrote `{rx,x,ry,rz}` as
  *  `{rx,ry,rz,x}` with no value changed. */
 function inCanonicalOrder(
   diffs: Record<string, Record<string, unknown>>,
@@ -275,7 +275,7 @@ export function captureInstanceOverrides(
 
     // The member's record (`recordedOverrides`): only a recorded field is an override, with its live value.
     const diffs = getOverrideValues(localId, currentTraits, base, resolveBase);
-    const recorded = recordedOverrides(diffs, getOverrideMarkSet(entity), rowAt(base, localId), () => movedOf(entity.id(), !!diffs['Transform']), currentTraits);
+    const recorded = recordedOverrides(diffs, overrideKeysOf(entity), rowAt(base, localId), () => movedOf(entity.id(), !!diffs['Transform']), currentTraits);
     if (Object.keys(recorded).length > 0) result[localId] = recorded;
   });
 

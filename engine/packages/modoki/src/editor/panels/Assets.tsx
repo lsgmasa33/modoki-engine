@@ -14,6 +14,7 @@ import { readMetaPreferringPark, getPendingMetaPaths } from '../scene/pendingMet
 import { getDirtyAssetPaths } from '../scene/dirtyAssets';
 import { useEditorStore, type SelectedAsset } from '../store/editorStore';
 import { pushAction } from '../undo/undoManager';
+import { followedBy } from '../undo/compositeAction';
 import { placePrefabFromPath } from '../scene/prefabPlace';
 import { commitPrefabWrite, prefabConflictReason } from '../scene/prefabCommit';
 import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
@@ -1593,12 +1594,7 @@ export default function Assets() {
     if (result.runtimeExcluded > 0) useEditorStore.getState().showToast(runtimeExcludedMessage(result.runtimeExcluded), 'warn');
     refresh();
 
-    const { action } = result;
-    pushAction({
-      label: action.label,
-      undo: async () => { await action.undo(); refresh(); },
-      redo: async () => { await action.redo(); refresh(); },
-    });
+    pushAction(followedBy(result.action, refresh));
   }, [refresh, importFiles]);
 
   // File move handler: drag one or many assets (a multi-selection) between

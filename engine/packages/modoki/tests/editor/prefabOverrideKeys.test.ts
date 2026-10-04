@@ -7,6 +7,7 @@
  *  can't exercise them). Fixture setup mirrors revertOverrides.test.ts. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { record, clearRecorded } from '../helpers/recordedView';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
@@ -60,7 +61,12 @@ function deleteEntitiesImpl(ids: number[]) {
   }
 }
 
+// The record's override list, stated by the test (a fake ECS has no record store): `../helpers/recordedView.ts`.
+vi.mock('../../src/editor/instance/instanceOverrideView', async (orig) =>
+  (await import('../helpers/recordedView')).withRecordedView(await orig()));
+beforeEach(() => clearRecorded());
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  onWorldSwap: () => () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),
@@ -99,8 +105,6 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab
 beforeEach(async () => {
   testWorld = createWorld();
   index.clear();
-  const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
-  clearAllOverrideMarks();
 });
 
 const SRC = 'dddddddd-0000-4000-8000-00000000d0e8';
@@ -134,11 +138,10 @@ describe('key-format helpers', () => {
 describe('collectInstanceOverrideKeys', () => {
   it('finds a field override', async () => {
     const { root } = await setup();
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     const { collectInstanceOverrideKeys } = await import('../../src/editor/scene/prefabOverrideKeys');
 
     const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
-    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
+    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); record(index.get(flameId), 'EngineFlame', 'idleScale');
 
     const prefab = shipPrefab as any;
     const keys = collectInstanceOverrideKeys(root, prefab);
@@ -234,10 +237,9 @@ describe('the keys a caller must NOT be handed blindly (close-out review)', () =
     // It needs a REAL override: with none, `fields` is empty too, and an exclusion that swallowed
     // every key would still pass (#1670).
     const { root } = await setup();
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     const { collectInstanceOverrideKeys } = await import('../../src/editor/scene/prefabOverrideKeys');
     const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
-    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
+    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); record(index.get(flameId), 'EngineFlame', 'idleScale');
     const keys = collectInstanceOverrideKeys(root, shipPrefab as any);
     expect(keys.fields).toEqual(['2.EngineFlame.idleScale']);
     expect(keys.applyExcluded).toEqual([]);
@@ -248,11 +250,10 @@ describe('the keys a caller must NOT be handed blindly (close-out review)', () =
     // (SCENE_ONLY_TEMPLATE_FIELDS), so the agent op reports it as skipped instead of a phantom
     // apply (#1670, #1661). The representable override beside it must stay out of the list.
     const { root } = await setup();
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     const { collectInstanceOverrideKeys } = await import('../../src/editor/scene/prefabOverrideKeys');
     const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
-    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
-    writeTraitFieldImpl(root, TRAITS[2], 'editorFolder', 'Enemies'); markOverride(index.get(root), 'EntityAttributes', 'editorFolder');
+    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); record(index.get(flameId), 'EngineFlame', 'idleScale');
+    writeTraitFieldImpl(root, TRAITS[2], 'editorFolder', 'Enemies'); record(index.get(root), 'EntityAttributes', 'editorFolder');
     const keys = collectInstanceOverrideKeys(root, shipPrefab as any);
     expect(keys.fields).toEqual(expect.arrayContaining(['1.EntityAttributes.editorFolder', '2.EngineFlame.idleScale']));
     expect(keys.applyExcluded).toEqual(['1.EntityAttributes.editorFolder']);
@@ -263,11 +264,10 @@ describe('the keys a caller must NOT be handed blindly (close-out review)', () =
     // editorFolder for Apply, which then skipped it with no word. Revert CAN act on it (reset the folder back to the
     // base), so dropping it there too would hide a real override from the only surface that can undo it.
     const { root } = await setup();
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     const { collectInstanceOverrideListing, listingFor, listingKeys } = await import('../../src/editor/scene/prefabOverrideKeys');
     const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
-    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
-    writeTraitFieldImpl(root, TRAITS[2], 'editorFolder', 'Enemies'); markOverride(index.get(root), 'EntityAttributes', 'editorFolder');
+    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); record(index.get(flameId), 'EngineFlame', 'idleScale');
+    writeTraitFieldImpl(root, TRAITS[2], 'editorFolder', 'Enemies'); record(index.get(root), 'EntityAttributes', 'editorFolder');
     const listing = collectInstanceOverrideListing(root, shipPrefab as any);
     expect(listingKeys(listingFor(listing, 'apply')).sort()).toEqual(['2.EngineFlame.idleScale']);
     expect(listingKeys(listingFor(listing, 'revert')).sort()).toEqual(['1.EntityAttributes.editorFolder', '2.EngineFlame.idleScale']);
